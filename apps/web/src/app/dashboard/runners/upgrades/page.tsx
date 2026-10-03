@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { toast } from "sonner";
 import {
@@ -32,6 +32,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { PageLoading } from "@/components/ui/progress-linear";
 import { subscribePlatformEvents } from "@/lib/platform-events";
+import { createRunnerPlatformController } from "@/lib/runner-platform-ui-state";
 import {
   Tooltip,
   TooltipContent,
@@ -78,18 +79,23 @@ export default function UpgradesPage() {
   const [upgraded, setUpgraded] = useState<Record<EntryKey, boolean>>({});
   const [updateProgress, setUpdateProgress] = useState<Record<EntryKey, string>>({});
   const [upgradingAll, setUpgradingAll] = useState(false);
+  const requests = useRef(createRunnerPlatformController());
 
   const loadNodes = useCallback(async () => {
+    const request = requests.current.begin("upgrade:nodes");
     try {
-      setNodes(await listRuntimeNodes());
+      const result = await listRuntimeNodes();
+      if (request.current()) setNodes(result);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
     }
   }, []);
 
   const loadStatus = useCallback(async () => {
+    const request = requests.current.begin("upgrade:status");
     try {
-      setStatus(await fetchGlobalImageUpdates());
+      const result = await fetchGlobalImageUpdates();
+      if (request.current()) setStatus(result);
     } catch {
       /* 离线或服务不可用：页面仍可用，只是没有镜像检查结果 */
     }

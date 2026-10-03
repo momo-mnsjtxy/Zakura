@@ -27,6 +27,11 @@ export type TenantContentLifecycleCallbacks = {
   stopChannels(tenantId: string): Promise<void>;
   /** Process-local task caches are cleared only when the whole tenant loses access. */
   cleanupTaskState?: (tenantId: string) => Promise<void> | void;
+  /** Stop polling and clear email delivery state for tenant-wide suspension/deletion. */
+  cleanupEmailState?: (
+    tenantId: string,
+    action: "tenant_deleted" | "tenant_suspended",
+  ) => Promise<void> | void;
   /** Agent owner supplies this seam without creating a service dependency cycle. */
   agentLifecycle?: AgentTenantLifecycleCallbacks;
   cleanupSkillFiles(tenantId: string): Promise<void>;
@@ -215,6 +220,17 @@ export class TenantContentLifecycleService {
       (job.action === "tenant_deleted" || job.action === "tenant_suspended")
     ) {
       operations.push(() => this.callbacks.cleanupTaskState!(job.tenantId));
+    }
+    if (
+      this.callbacks.cleanupEmailState &&
+      (job.action === "tenant_deleted" || job.action === "tenant_suspended")
+    ) {
+      const emailAction: "tenant_deleted" | "tenant_suspended" = job.action;
+      // Block and drain inbound delivery before stopping channels, otherwise a
+      // webhook already in flight can create a new run after stopChannels.
+      operations.unshift(() =>
+        this.callbacks.cleanupEmailState!(job.tenantId, emailAction),
+      );
     }
     if (job.action === "tenant_deleted") {
       operations.unshift(() => this.ensureDeleteLease(job.tenantId).then(() => undefined));

@@ -2598,6 +2598,10 @@ export async function createApiApp(deps: {
       cleanupTaskState: (tenantId) => {
         taskStore?.cleanupTenant(tenantId);
       },
+      cleanupEmailState: (tenantId, action) =>
+        emailInbound?.stopTenant(tenantId, {
+          resumeWhenAvailable: action === "tenant_suspended",
+        }) ?? Promise.resolve(),
       agentLifecycle: agentTenantLifecycle.callbacks(),
       cleanupChannelState: (tenantId) => remoteRuntime!.purgeTenantState(tenantId),
       cleanupSkillFiles: (tenantId) => skills?.cleanupTenant(tenantId) ?? Promise.resolve(),
@@ -2708,6 +2712,10 @@ export async function createApiApp(deps: {
         cloudStore,
         cloudRuntime,
         remoteIngress!,
+        {
+          isTenantAvailable: async (tenantId) =>
+            (await checkSessionSuspended(db, { userId: "api-key", tenantId })) === null,
+        },
       );
       emailInbound.start();
     }
@@ -3605,5 +3613,5 @@ export async function createApiApp(deps: {
     });
   }
 
-  return Object.assign(app, { zakurabotGateway, tenantContentLifecycle, automation });
+  return Object.assign(app, { zakurabotGateway, tenantContentLifecycle, automation, emailInbound });
 }

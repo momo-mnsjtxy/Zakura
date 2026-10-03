@@ -92,11 +92,17 @@ describe("durable tenant content lifecycle", () => {
     let connectorCleanups = 0;
     let memoryCleanups = 0;
     let taskCleanups = 0;
+    let emailCleanups = 0;
+    const runtimeOrder: string[] = [];
     let deleteLeases = 0;
     const leaseFinishes: boolean[] = [];
     const lifecycle = new TenantContentLifecycleService(db, {
-      stopChannels: async () => {},
+      stopChannels: async () => { runtimeOrder.push("channels"); },
       cleanupTaskState: async () => { taskCleanups += 1; },
+      cleanupEmailState: async () => {
+        emailCleanups += 1;
+        runtimeOrder.push("email");
+      },
       agentLifecycle: {
         beginTenantDelete: async () => {
           deleteLeases += 1;
@@ -128,6 +134,8 @@ describe("durable tenant content lifecycle", () => {
     assert.equal(connectorCleanups, 1, "independent cleanup should still run");
     assert.equal(memoryCleanups, 1);
     assert.equal(taskCleanups, 1);
+    assert.equal(emailCleanups, 1);
+    assert.deepEqual(runtimeOrder.slice(0, 2), ["email", "channels"]);
     assert.deepEqual(leaseFinishes, [false]);
 
     now = new Date(now.getTime() + 2_000);
@@ -140,6 +148,7 @@ describe("durable tenant content lifecycle", () => {
     assert.equal(deleteLeases, 2);
     assert.deepEqual(leaseFinishes, [false, false]);
     assert.equal(taskCleanups, 2);
+    assert.equal(emailCleanups, 2);
 
     await tenantsService.deleteTenantAsPlatformAdmin(tenantId);
     assert.equal(await db.query.tenants.findFirst({ where: eq(tenants.id, tenantId) }), undefined);
@@ -151,6 +160,7 @@ describe("durable tenant content lifecycle", () => {
     );
     assert.equal(deleteLeases, 3);
     assert.equal(taskCleanups, 2, "completed delete cleanup must remain idempotent");
+    assert.equal(emailCleanups, 2, "completed delete email cleanup must remain idempotent");
     assert.deepEqual(leaseFinishes, [false, false, true]);
     await lifecycle.stop();
     await events.close();
@@ -167,13 +177,14 @@ describe("durable tenant content lifecycle", () => {
     const eventsA = new PlatformEventBus({ transport: hub.create(), instanceId: "events-a" });
     const eventsB = new PlatformEventBus({ transport: hub.create(), instanceId: "events-b" });
     const state = {
-      a: { stopped: 0, suspended: 0, revoked: 0, tasks: 0 },
-      b: { stopped: 0, suspended: 0, revoked: 0, tasks: 0 },
-      late: { stopped: 0, suspended: 0, revoked: 0, tasks: 0 },
+      a: { stopped: 0, suspended: 0, revoked: 0, tasks: 0, email: 0 },
+      b: { stopped: 0, suspended: 0, revoked: 0, tasks: 0, email: 0 },
+      late: { stopped: 0, suspended: 0, revoked: 0, tasks: 0, email: 0 },
     };
     const callbacks = (key: keyof typeof state) => ({
       stopChannels: async () => { state[key].stopped += 1; },
       cleanupTaskState: async () => { state[key].tasks += 1; },
+      cleanupEmailState: async () => { state[key].email += 1; },
       agentLifecycle: {
         beginTenantDelete: async () => ({ finish: async () => {} }),
         suspendTenant: async () => { state[key].suspended += 1; },
@@ -199,13 +210,20 @@ describe("durable tenant content lifecycle", () => {
     await waitFor(() => state.a.stopped > 0 && state.b.stopped > 0);
     await waitFor(() => state.a.suspended > 0 && state.b.suspended > 0);
     await waitFor(() => state.a.tasks > 0 && state.b.tasks > 0);
+    await waitFor(() => state.a.email > 0 && state.b.email > 0);
     const taskCountsAfterSuspend = { a: state.a.tasks, b: state.b.tasks };
+    const emailCountsAfterSuspend = { a: state.a.email, b: state.b.email };
     await a.lifecycleHook().afterMemberRemoved(tenantId, "removed-user");
     await waitFor(() => state.a.revoked > 0 && state.b.revoked > 0);
     assert.deepEqual(
       { a: state.a.tasks, b: state.b.tasks },
       taskCountsAfterSuspend,
       "member revocation must not clear all tenant task state",
+    );
+    assert.deepEqual(
+      { a: state.a.email, b: state.b.email },
+      emailCountsAfterSuspend,
+      "member revocation must not clear all tenant email state",
     );
 
     const eventsLate = new PlatformEventBus({ transport: hub.create(), instanceId: "events-late" });
@@ -216,6 +234,7 @@ describe("durable tenant content lifecycle", () => {
     assert.ok(state.late.stopped > 0, "late replica did not observe durable suspend tombstone");
     assert.ok(state.late.suspended > 0, "late replica did not reconcile agent suspension");
     assert.ok(state.late.tasks > 0, "late replica did not reconcile tenant task cleanup");
+    assert.ok(state.late.email > 0, "late replica did not reconcile tenant email cleanup");
     await Promise.all([a.stop(), b.stop(), late.stop()]);
     await Promise.all([eventsA.close(), eventsB.close(), eventsLate.close()]);
   });

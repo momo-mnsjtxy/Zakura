@@ -1,8 +1,9 @@
 "use client";
 
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { hasImageProbeErrors } from "@zakura/shared";
 import { fetchGlobalImageUpdates, type GlobalImageUpdateStatus } from "@/lib/runners";
+import { createRunnerPlatformController } from "@/lib/runner-platform-ui-state";
 import { cn } from "@/lib/utils";
 
 const POLL_INTERVAL_MS = 5 * 60 * 1000;
@@ -48,10 +49,13 @@ function summarize(status: GlobalImageUpdateStatus | null): ImageUpdateSummary {
  */
 export function ImageUpdateProvider({ children }: { children: React.ReactNode }) {
   const [status, setStatus] = useState<GlobalImageUpdateStatus | null>(null);
+  const requests = useRef(createRunnerPlatformController());
 
   const load = useCallback(async () => {
+    const request = requests.current.begin("image-updates");
     try {
-      setStatus(await fetchGlobalImageUpdates());
+      const result = await fetchGlobalImageUpdates();
+      if (request.current()) setStatus(result);
     } catch {
       // Leave the previous value: a transient fetch failure must not read as
       // "everything is up to date".
@@ -61,7 +65,7 @@ export function ImageUpdateProvider({ children }: { children: React.ReactNode })
   useEffect(() => {
     void load();
     const timer = setInterval(() => void load(), POLL_INTERVAL_MS);
-    return () => clearInterval(timer);
+    return () => { clearInterval(timer); requests.current.invalidate("image-updates"); };
   }, [load]);
 
   const value = useMemo(() => summarize(status), [status]);

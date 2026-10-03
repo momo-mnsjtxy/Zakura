@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { toast } from "sonner";
@@ -17,6 +17,7 @@ import {
   AlertCircle,
   CheckCircle2,
 } from "lucide-react";
+import { createRunnerPlatformController } from "@/lib/runner-platform-ui-state";
 import {
   allocateNodeContainer,
   deleteRuntimeNode,
@@ -81,6 +82,7 @@ export default function RunnerDetailPage() {
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
+  const requests = useRef(createRunnerPlatformController());
   const [installBundle, setInstallBundle] = useState<RunnerInstallBundle | null>(null);
   const [installError, setInstallError] = useState<string | null>(null);
   const [installBusy, setInstallBusy] = useState(false);
@@ -160,10 +162,12 @@ export default function RunnerDetailPage() {
   }, [id]);
 
   const load = useCallback(async () => {
+    const request = requests.current.begin(`runner:${id}`);
     try {
       setLoading(true);
       setInstallError(null);
       const res = await fetchRunnerDetail(id);
+      if (!request.current()) return;
       setNode(res.node);
       setName(res.node.name);
       const preferTs = Boolean(res.node.labels?.enableTailscale);
@@ -186,9 +190,9 @@ export default function RunnerDetailPage() {
         void loadImageUpdates();
       }
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : String(err));
+      if (request.current()) toast.error(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      if (request.current()) setLoading(false);
     }
   }, [id, loadInstall, loadVersion, loadImageUpdates]);
 

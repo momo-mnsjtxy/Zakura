@@ -491,6 +491,7 @@ async function main() {
       imageUpdateChecker.stopAndDrain(),
       telemetry.shutdown(),
       toolCallStore.flush(),
+      apiApp.emailInbound?.stopAndDrain() ?? Promise.resolve(),
     ]);
   });
 }

@@ -68,7 +68,6 @@ export class RunnerRequestLifecycle {
       const timeoutMs = options.timeoutMs;
       if (timeoutMs !== undefined && Number.isFinite(timeoutMs) && timeoutMs > 0) {
         timer = setTimeout(() => settle(() => reject(timeoutError(method, timeoutMs))), timeoutMs);
-        timer.unref?.();
       }
 
       let operation: Promise<T>;

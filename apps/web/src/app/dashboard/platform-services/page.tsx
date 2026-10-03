@@ -24,6 +24,7 @@ import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { PageLoading, ProgressLinear } from "@/components/ui/progress-linear";
 import { cn } from "@/lib/utils";
+import { createRunnerPlatformController } from "@/lib/runner-platform-ui-state";
 
 type LifecycleView = {
   state: string;
@@ -88,6 +89,7 @@ export default function PlatformServicesPage() {
     Record<string, { hostPort: string; image: string }>
   >({});
   const logRefs = useRef<Record<string, HTMLPreElement | null>>({});
+  const requests = useRef(createRunnerPlatformController());
 
   useEffect(() => {
     if (me.multiTenant && !me.isPlatformAdmin) {
@@ -97,8 +99,10 @@ export default function PlatformServicesPage() {
   }, [me.multiTenant, me.isPlatformAdmin, router]);
 
   const load = useCallback(async () => {
+    const request = requests.current.begin("services");
     try {
       const res = await api<ListPayload>("/api/platform-services");
+      if (!request.current()) return;
       setData(res);
       setForbidden(false);
       setDrafts((prev) => {
@@ -123,6 +127,7 @@ export default function PlatformServicesPage() {
         return next;
       });
     } catch (err) {
+      if (!request.current()) return;
       const msg = err instanceof Error ? err.message : String(err);
       if (/403|Forbidden/i.test(msg)) {
         setForbidden(true);
@@ -135,6 +140,7 @@ export default function PlatformServicesPage() {
   useEffect(() => {
     if (me.multiTenant && !me.isPlatformAdmin) return;
     void load();
+    return () => requests.current.invalidate("services");
   }, [load, me.multiTenant, me.isPlatformAdmin]);
 
   useEffect(() => {
@@ -198,7 +204,7 @@ export default function PlatformServicesPage() {
   async function runAction(key: string, path: string) {
     setActionKey(key);
     try {
-      await api(`/api/platform-services/${key}/${path}`, { method: "POST" });
+      await requests.current.runOnce(`service:${key}:${path}`, () => api(`/api/platform-services/${key}/${path}`, { method: "POST" }));
       await load();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
@@ -226,7 +232,7 @@ export default function PlatformServicesPage() {
     setActionKey(key);
     try {
       const hostPort = d.hostPort.trim() ? Number(d.hostPort) : undefined;
-      await api(`/api/platform-services/${key}`, {
+      await requests.current.runOnce(`service:${key}:config`, () => api(`/api/platform-services/${key}`, {
         method: "PATCH",
         json: {
           config: {
@@ -234,7 +240,7 @@ export default function PlatformServicesPage() {
             image: d.image.trim() || undefined,
           },
         },
-      });
+      }));
       toast.success("已保存");
       await load();
     } catch (err) {

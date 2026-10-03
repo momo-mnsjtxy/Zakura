@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Loader2 } from "lucide-react";
 import { api } from "@/lib/api";
@@ -11,6 +11,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { PageLoading } from "@/components/ui/progress-linear";
 import { Switch } from "@/components/ui/switch";
+import { createRunnerPlatformController, mergeServiceDraft } from "@/lib/runner-platform-ui-state";
 
 export type TransactionalEmailConfig = {
   enabled: boolean;
@@ -44,21 +45,25 @@ export function PlatformTransactionalEmailPanel({ onSaved }: { onSaved?: () => v
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [forbidden, setForbidden] = useState(false);
+  const requests = useRef(createRunnerPlatformController());
 
   const load = useCallback(async () => {
+    const request = requests.current.begin("transactional-email");
     setLoading(true);
     setForbidden(false);
     try {
       const res = await api<TransactionalEmailConfig>("/api/settings/email/transactional");
+      if (!request.current()) return;
       setCfg(res);
-      setDraft({
+      setDraft((current) => mergeServiceDraft(current, {
         enabled: res.enabled,
         fromEmail: res.fromEmail,
         baseUrl: res.baseUrl,
         providerId: res.providerId,
         apiToken: "",
-      });
+      }, ["apiToken"]));
     } catch (err) {
+      if (!request.current()) return;
       const msg = err instanceof Error ? err.message : String(err);
       if (/403|平台管理员|Admin|权限/i.test(msg)) {
         setForbidden(true);
@@ -66,12 +71,13 @@ export function PlatformTransactionalEmailPanel({ onSaved }: { onSaved?: () => v
         toast.error(msg);
       }
     } finally {
-      setLoading(false);
+      if (request.current()) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
     void load();
+    return () => requests.current.invalidate("transactional-email");
   }, [load]);
 
   async function onSave() {
@@ -90,10 +96,10 @@ export function PlatformTransactionalEmailPanel({ onSaved }: { onSaved?: () => v
         providerId: draft.providerId.trim(),
       };
       if (draft.apiToken.trim()) body.apiToken = draft.apiToken.trim();
-      const saved = await api<TransactionalEmailConfig>("/api/settings/email/transactional", {
+      const saved = await requests.current.runOnce("transactional-email:save", () => api<TransactionalEmailConfig>("/api/settings/email/transactional", {
         method: "PUT",
         body: JSON.stringify(body),
-      });
+      }));
       setCfg(saved);
       setDraft((d) => ({
         ...d,

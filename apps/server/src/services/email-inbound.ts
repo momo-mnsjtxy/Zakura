@@ -4,6 +4,7 @@ import {
   recordPlatformFault,
   type InstanceHandle,
 } from "@zakura/core";
+import { createHash, timingSafeEqual } from "node:crypto";
 import type { McpToolResult } from "@zakura/shared";
 import { parseCloudAgentConfig } from "@zakura/shared";
 import type { AgentService } from "./agents.js";
@@ -30,6 +31,20 @@ type ReceivedEmail = {
   headers?: Record<string, unknown>;
   attachments?: unknown[];
 };
+
+export type EmailInboundScheduler = {
+  setInterval: typeof setInterval;
+  clearInterval: typeof clearInterval;
+};
+
+export type EmailInboundOptions = {
+  scheduler?: EmailInboundScheduler;
+  now?: () => number;
+  pollEveryMs?: number;
+  isTenantAvailable?: (tenantId: string) => Promise<boolean> | boolean;
+};
+
+const defaultScheduler: EmailInboundScheduler = { setInterval, clearInterval };
 
 function settingsOf(target: EmailTarget): Record<string, unknown> {
   return target.credentials?.settings ?? {};
@@ -61,6 +76,27 @@ function allowedSender(sender: string, allowlist: string[]): boolean {
     if (normalized.startsWith("@")) return address.endsWith(normalized);
     return address === normalized;
   });
+}
+
+function secretMatches(expected: string, supplied: string): boolean {
+  if (!expected || !supplied) return false;
+  const left = createHash("sha256").update(expected).digest();
+  const right = createHash("sha256").update(supplied).digest();
+  return timingSafeEqual(left, right);
+}
+
+function emailEventId(mail: ReceivedEmail): string {
+  const explicit = mail.id?.trim();
+  if (explicit) return explicit;
+  const fingerprint = JSON.stringify([
+    mail.receivedAt ?? "",
+    emailAddress(mail.from ?? ""),
+    emailAddress(mail.to ?? ""),
+    mail.subject ?? "",
+    mail.text ?? "",
+    mail.html ?? "",
+  ]);
+  return `email-sha256:${createHash("sha256").update(fingerprint).digest("hex")}`;
 }
 
 function directHandle(tenantId: string, target: EmailTarget): InstanceHandle {
@@ -123,9 +159,16 @@ function mailContent(mail: ReceivedEmail): string {
 
 export class EmailInboundService {
   private timer: ReturnType<typeof setInterval> | null = null;
-  private running = false;
+  private activePoll: Promise<void> | null = null;
   private readonly lastPoll = new Map<string, number>();
   private readonly webhookIds = new Map<string, number>();
+  private readonly deliveries = new Map<string, Promise<boolean>>();
+  private readonly blockedTenants = new Set<string>();
+  private readonly autoResumeTenants = new Set<string>();
+  private readonly scheduler: EmailInboundScheduler;
+  private readonly now: () => number;
+  private readonly pollEveryMs: number;
+  private readonly availability?: EmailInboundOptions["isTenantAvailable"];
 
   constructor(
     private readonly db: Db,
@@ -134,22 +177,73 @@ export class EmailInboundService {
     private readonly store: CloudAgentSessionStore,
     private readonly runtime: Pick<CloudAgentRuntime, "startTurn">,
     private readonly remoteIngress?: RemoteAgentIngress,
-  ) {}
+    opts: EmailInboundOptions = {},
+  ) {
+    this.scheduler = opts.scheduler ?? defaultScheduler;
+    this.now = opts.now ?? Date.now;
+    this.pollEveryMs = Math.max(250, opts.pollEveryMs ?? 15_000);
+    this.availability = opts.isTenantAvailable;
+  }
 
   start(): void {
     if (this.timer) return;
-    this.timer = setInterval(() => {
-      void this.poll().catch((error) => {
+    this.timer = this.scheduler.setInterval(() => {
+      void this.runOnce().catch((error) => {
         recordPlatformFault("email_inbound.poll", error, { subsystem: "email_inbound" });
       });
-    }, 15_000);
+    }, this.pollEveryMs);
     this.timer.unref?.();
-    void this.poll();
+    void this.runOnce();
   }
 
   stop(): void {
-    if (this.timer) clearInterval(this.timer);
+    if (this.timer) this.scheduler.clearInterval(this.timer);
     this.timer = null;
+  }
+
+  async stopAndDrain(): Promise<void> {
+    this.stop();
+    await this.activePoll?.catch(() => undefined);
+  }
+
+  async stopTenant(
+    tenantId: string,
+    opts: { resumeWhenAvailable?: boolean } = {},
+  ): Promise<void> {
+    this.blockedTenants.add(tenantId);
+    if (opts.resumeWhenAvailable) this.autoResumeTenants.add(tenantId);
+    else this.autoResumeTenants.delete(tenantId);
+    await Promise.allSettled(
+      [...this.deliveries.entries()]
+        .filter(([key]) => key.startsWith(`${tenantId}:`))
+        .map(([, delivery]) => delivery),
+    );
+    this.clearTenantState(tenantId);
+  }
+
+  resumeTenant(tenantId: string): void {
+    this.blockedTenants.delete(tenantId);
+    this.autoResumeTenants.delete(tenantId);
+  }
+
+  private clearTenantState(tenantId: string): void {
+    for (const key of this.lastPoll.keys()) {
+      if (key.startsWith(`${tenantId}:`)) this.lastPoll.delete(key);
+    }
+    for (const key of this.webhookIds.keys()) {
+      if (key.startsWith(`${tenantId}:`)) this.webhookIds.delete(key);
+    }
+  }
+
+  private async tenantAvailable(tenantId: string): Promise<boolean> {
+    if (this.blockedTenants.has(tenantId)) {
+      if (!this.autoResumeTenants.has(tenantId) || !this.availability) return false;
+      const available = Boolean(await this.availability(tenantId));
+      if (!available) return false;
+      this.resumeTenant(tenantId);
+      return true;
+    }
+    return this.availability ? Boolean(await this.availability(tenantId)) : true;
   }
 
   async verifyWebhookSecret(
@@ -162,20 +256,23 @@ export class EmailInboundService {
     return targets.some((target) => {
       if (!isEmailTarget(target) || (connectorRef && target.connectorRef !== connectorRef)) return false;
       const settings = settingsOf(target);
-      return boolValue(settings, "inboundEnabled") && stringValue(settings, "inboundSecret") === supplied;
+      return (
+        boolValue(settings, "inboundEnabled") &&
+        secretMatches(stringValue(settings, "inboundSecret"), supplied)
+      );
     });
   }
 
-  private async poll(): Promise<void> {
-    if (this.running) return;
-    this.running = true;
-    try {
+  async runOnce(): Promise<void> {
+    if (this.activePoll) return this.activePoll;
+    const poll = (async () => {
       const tenants = new Set<string>();
       const targetsByTenant = new Map<string, EmailTarget[]>();
       // listAllDirectConnectorTargets：按各 Agent 安装汇总已就绪邮箱目标。
       const rows = await this.db.select({ id: agents.tenantId }).from(agents);
       for (const row of rows) tenants.add(row.id);
       for (const tenantId of tenants) {
+        if (!(await this.tenantAvailable(tenantId))) continue;
         const targets = (await this.integrationCatalog.listAllDirectConnectorTargets(tenantId)).filter(
           (target) =>
             target.connectorRef.startsWith("email-") &&
@@ -187,15 +284,24 @@ export class EmailInboundService {
 
       for (const [tenantId, targets] of targetsByTenant) {
         for (const target of targets) {
-          await this.pollTarget(tenantId, target);
+          try {
+            await this.pollTarget(tenantId, target);
+          } catch (error) {
+            recordPlatformFault("email_inbound.target", error, { subsystem: "email_inbound" });
+          }
         }
       }
+    })();
+    this.activePoll = poll;
+    try {
+      await poll;
     } finally {
-      this.running = false;
+      if (this.activePoll === poll) this.activePoll = null;
     }
   }
 
   private async pollTarget(tenantId: string, target: EmailTarget): Promise<void> {
+    if (!(await this.tenantAvailable(tenantId))) return;
     const settings = settingsOf(target);
     if (!boolValue(settings, "inboundEnabled")) return;
     const agentId = stringValue(settings, "inboundAgentId");
@@ -207,8 +313,8 @@ export class EmailInboundService {
     if (!agentId || !mailbox || allowlist.length === 0) return;
 
     const interval = Math.min(Math.max(Number(settings.pollIntervalSeconds) || 30, 15), 900);
-    const key = `${tenantId}:${target.capabilityRef}:${mailbox}`;
-    const now = Date.now();
+    const key = `${tenantId}:${target.connectorRef}:${target.capabilityRef}:${mailbox}`;
+    const now = this.now();
     if (now - (this.lastPoll.get(key) ?? 0) < interval * 1000) return;
     this.lastPoll.set(key, now);
 
@@ -226,7 +332,7 @@ export class EmailInboundService {
     if (result.isError) throw new Error(resultJson(result) as string);
 
     for (const mail of extractEmails(resultJson(result))) {
-      await this.deliver(tenantId, mail, agent.id, allowlist, target);
+      await this.deliverOnce(tenantId, mail, agent.id, allowlist, target);
     }
   }
 
@@ -237,6 +343,7 @@ export class EmailInboundService {
     inboundSecret?: string,
     connectorRef?: string,
   ): Promise<boolean> {
+    if (!inboundSecret || !(await this.tenantAvailable(tenantId))) return false;
     const targets = (await this.integrationCatalog.listAllDirectConnectorTargets(tenantId)).filter(
       (target) =>
         isEmailTarget(target) &&
@@ -247,7 +354,7 @@ export class EmailInboundService {
       const settings = settingsOf(item);
       return (
         stringValue(settings, "inboundAgentId") &&
-        (!inboundSecret || stringValue(settings, "inboundSecret") === inboundSecret)
+        secretMatches(stringValue(settings, "inboundSecret"), inboundSecret)
       );
     });
     if (!target) return false;
@@ -261,20 +368,39 @@ export class EmailInboundService {
     if (!agentId || allowlist.length === 0 || !mail.from || !allowedSender(mail.from, allowlist)) {
       return false;
     }
-    const messageId = mail.id?.trim();
-    if (messageId) {
-      const key = `${tenantId}:${messageId}`;
-      const now = Date.now();
-      for (const [id, seenAt] of this.webhookIds) {
-        if (now - seenAt > 86_400_000) this.webhookIds.delete(id);
-      }
-      if (this.webhookIds.has(key)) return true;
-      this.webhookIds.set(key, now);
-    }
     const agent = await this.agentService.get(tenantId, agentId);
     if (!agent) return false;
-    await this.deliver(tenantId, mail, agent.id, allowlist, target);
-    return true;
+    return this.deliverOnce(tenantId, mail, agent.id, allowlist, target);
+  }
+
+  private async deliverOnce(
+    tenantId: string,
+    mail: ReceivedEmail,
+    agentId: string,
+    allowlist: string[],
+    target: EmailTarget,
+  ): Promise<boolean> {
+    const eventId = emailEventId(mail);
+    const key = `${tenantId}:${target.connectorRef}:${target.capabilityRef}:${eventId}`;
+    const now = this.now();
+    for (const [id, seenAt] of this.webhookIds) {
+      if (now - seenAt > 86_400_000) this.webhookIds.delete(id);
+    }
+    if (this.webhookIds.has(key)) return true;
+    const pending = this.deliveries.get(key);
+    if (pending) return pending;
+    const delivery = (async () => {
+      if (!(await this.tenantAvailable(tenantId))) return false;
+      await this.deliver(tenantId, mail, agentId, allowlist, target, eventId);
+      this.webhookIds.set(key, this.now());
+      return true;
+    })();
+    this.deliveries.set(key, delivery);
+    try {
+      return await delivery;
+    } finally {
+      if (this.deliveries.get(key) === delivery) this.deliveries.delete(key);
+    }
   }
 
   private async deliver(
@@ -283,6 +409,7 @@ export class EmailInboundService {
     agentId: string,
     allowlist: string[],
     target?: EmailTarget,
+    eventId?: string,
   ): Promise<void> {
     if (!mail.from || !allowedSender(mail.from, allowlist)) return;
     const agent = await this.agentService.get(tenantId, agentId);
@@ -303,7 +430,7 @@ export class EmailInboundService {
         tenantId,
         bindingId: binding.id,
         platform: "email",
-        externalEventId: mail.id?.trim() || `email:${Date.now()}:${mail.from}:${mail.subject}`,
+        externalEventId: eventId ?? emailEventId(mail),
         externalThreadKey: mail.from ? `email:${mail.from}` : `email:${binding.id}`,
         externalUserKey: mail.from ?? "unknown",
         senderEmail: mail.from,

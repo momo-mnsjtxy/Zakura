@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Loader2 } from "lucide-react";
 import {
@@ -15,6 +15,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { PageLoading } from "@/components/ui/progress-linear";
 import { Switch } from "@/components/ui/switch";
+import { createRunnerPlatformController, mergeServiceDraft } from "@/lib/runner-platform-ui-state";
 
 type Draft = {
   enabled: boolean;
@@ -38,20 +39,24 @@ export function PlatformHeadscalePanel({ onSaved }: { onSaved?: () => void }) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [forbidden, setForbidden] = useState(false);
+  const requests = useRef(createRunnerPlatformController());
 
   const load = useCallback(async () => {
+    const request = requests.current.begin("headscale");
     setLoading(true);
     setForbidden(false);
     try {
       const res = await fetchPlatformHeadscale();
+      if (!request.current()) return;
       setCfg(res);
-      setDraft({
+      setDraft((current) => mergeServiceDraft(current, {
         enabled: res.enabled,
         url: res.url,
         apiKey: "",
         platformAuthKey: "",
-      });
+      }, ["apiKey", "platformAuthKey"]));
     } catch (err) {
+      if (!request.current()) return;
       const msg = err instanceof Error ? err.message : String(err);
       if (/403|平台管理员|Admin|权限/i.test(msg)) {
         setForbidden(true);
@@ -59,12 +64,13 @@ export function PlatformHeadscalePanel({ onSaved }: { onSaved?: () => void }) {
         toast.error(msg);
       }
     } finally {
-      setLoading(false);
+      if (request.current()) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
     void load();
+    return () => requests.current.invalidate("headscale");
   }, [load]);
 
   async function onSave() {
@@ -83,7 +89,7 @@ export function PlatformHeadscalePanel({ onSaved }: { onSaved?: () => void }) {
       if (draft.platformAuthKey.trim()) {
         body.platformAuthKey = draft.platformAuthKey.trim();
       }
-      const saved = await savePlatformHeadscale(body);
+      const saved = await requests.current.runOnce("headscale:save", () => savePlatformHeadscale(body));
       setCfg(saved);
       setDraft((d) => ({ ...d, apiKey: "", platformAuthKey: "", enabled: saved.enabled }));
       toast.success(saved.ready ? "Headscale 已保存并可用" : "已保存（请确认 URL / API Key）");

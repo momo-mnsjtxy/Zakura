@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { toast } from "sonner";
 import {
@@ -48,6 +48,7 @@ import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from "@
 import { PageLoading } from "@/components/ui/progress-linear";
 import { SearchField } from "@/components/ui/search-field";
 import { useFuzzySearch } from "@/hooks/use-fuzzy-search";
+import { createRunnerPlatformController } from "@/lib/runner-platform-ui-state";
 import { cn } from "@/lib/utils";
 
 type AccessMode = "public" | "tailscale" | null;
@@ -79,17 +80,19 @@ export default function RunnersPage() {
     token: string;
     install: RunnerInstallPackage | null;
   } | null>(null);
+  const requests = useRef(createRunnerPlatformController());
 
   const load = useCallback(async (silent = false) => {
+    const request = requests.current.begin("runners");
     try {
       if (silent) setRefreshing(true);
       else setLoading(true);
-      setRows(await listRuntimeNodes());
+      const result = await listRuntimeNodes();
+      if (request.current()) setRows(result);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : String(err));
+      if (request.current()) toast.error(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (request.current()) { setLoading(false); setRefreshing(false); }
     }
   }, []);
 

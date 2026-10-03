@@ -98,8 +98,11 @@ test("generic OAuth callback completes MFA before storing its session", async ({
 test("tenant switch enrollment retries without replacing the current session prematurely", async ({ page }) => {
   const pageErrors = [];
   page.on("pageerror", (error) => pageErrors.push(error));
-  await page.addInitScript(() => localStorage.setItem("zakura_session", "fixture-session"));
   await page.route(/\/api\/(?:agents|spaces)(?:\?.*)?$/, (route) => route.fulfill({ status: 200, contentType: "application/json", body: "[]" }));
+  // Seed only the initial authenticated document. addInitScript runs again on
+  // navigation and would overwrite the newly issued tenant session.
+  await page.goto("http://127.0.0.1:3001/login");
+  await page.evaluate(() => localStorage.setItem("zakura_session", "fixture-session"));
   await page.goto("http://127.0.0.1:3001/dashboard/agents");
   await page.getByText("Fixture Team", { exact: true }).first().click();
   await page.getByRole("menuitem", { name: /Second Team/ }).click();
