@@ -1,12 +1,13 @@
 import { createServer } from "node:http";
 
 const server = createServer(async (request, response) => {
+  const pathname = new URL(request.url ?? "/", "http://fixture").pathname.replace(/\/$/, "") || "/";
   const chunks = [];
   for await (const chunk of request) chunks.push(chunk);
   const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {};
 
   response.setHeader("content-type", "application/json; charset=utf-8");
-  if (request.url === "/api/platform") {
+  if (pathname === "/api/platform") {
     response.end(JSON.stringify({
       edition: "oss",
       passwordLoginEnabled: true,
@@ -15,19 +16,19 @@ const server = createServer(async (request, response) => {
     }));
     return;
   }
-  if (request.url === "/api/auth/sso/discover" && request.method === "POST") {
+  if (pathname === "/api/auth/sso/discover" && request.method === "POST") {
     response.end(JSON.stringify({ sso: false, echoedEmail: body.email }));
     return;
   }
-  if (request.url === "/api/auth/login" && request.method === "POST") {
+  if (pathname === "/api/auth/login" && request.method === "POST") {
     response.end(JSON.stringify({ session: "fixture-session" }));
     return;
   }
-  if (request.url === "/api/tenant/current") {
+  if (pathname === "/api/tenant/current") {
     response.end(JSON.stringify({ onboardingCompleted: true }));
     return;
   }
-  if (request.url === "/api/me") {
+  if (pathname === "/api/me") {
     response.end(JSON.stringify({
       user: { id: "fixture-user", name: "Fixture Member", email: "member@example.test" },
       tenant: { id: "fixture-tenant", name: "Fixture Team", onboardingCompleted: true },
@@ -38,7 +39,7 @@ const server = createServer(async (request, response) => {
     }));
     return;
   }
-  if (request.url === "/api/agents" || request.url === "/api/spaces") {
+  if (pathname === "/api/agents" || pathname === "/api/spaces") {
     response.end("[]");
     return;
   }

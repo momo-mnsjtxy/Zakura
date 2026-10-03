@@ -1,8 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
+import { createLatestRequestGate } from "@/lib/chat-state";
 import { useMe } from "@/components/me-context";
 import { SettingsHeader, SettingsSection, SettingsField } from "@/components/settings-shell";
 import { Button } from "@/components/ui/button";
@@ -45,14 +46,17 @@ export default function IdentitySettingsPage() {
   const [clientSecret, setClientSecret] = useState("");
   const [idpCert, setIdpCert] = useState("");
   const [newToken, setNewToken] = useState<string | null>(null);
+  const loadGate = useRef(createLatestRequestGate());
 
   const load = useCallback(async () => {
     if (!admin) return;
+    const requestId = loadGate.current.begin();
     const [d, s, c] = await Promise.all([
       api<{ domains: Domain[] }>("/api/tenant/identity/domains"),
       api<{ sso: Sso }>("/api/tenant/identity/sso"),
       api<{ endpoint: string; tokens: Array<{ id: string; name: string; tokenPrefix: string }> }>("/api/tenant/identity/scim"),
     ]);
+    if (!loadGate.current.isCurrent(requestId)) return;
     setDomains(d.domains);
     setSso(s.sso);
     setScim(c);

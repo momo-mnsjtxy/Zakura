@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { SettingsHeader, SettingsSection } from "@/components/settings-shell";
 import { Badge } from "@/components/ui/badge";
@@ -14,6 +14,8 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { api } from "@/lib/api";
+import { createLatestRequestGate } from "@/lib/chat-state";
+import { oauthClientGroups } from "@/lib/identity-ui-state";
 
 type InboundClient = {
   id: string;
@@ -56,8 +58,10 @@ export default function OauthClientsPage() {
   const [dcr, setDcr] = useState<OutboundClient[]>([]);
   const [byo, setByo] = useState<OutboundClient[]>([]);
   const [loading, setLoading] = useState(true);
+  const loadGate = useRef(createLatestRequestGate());
 
   const load = useCallback(async () => {
+    const requestId = loadGate.current.begin();
     setLoading(true);
     try {
       const res = await api<{
@@ -65,13 +69,15 @@ export default function OauthClientsPage() {
         dcr: OutboundClient[];
         byo: OutboundClient[];
       }>("/api/oauth/clients");
-      setInbound(res.inbound ?? []);
-      setDcr(res.dcr ?? []);
-      setByo(res.byo ?? []);
+      if (!loadGate.current.isCurrent(requestId)) return;
+      const groups = oauthClientGroups(res);
+      setInbound(groups.inbound);
+      setDcr(groups.dcr);
+      setByo(groups.byo);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      if (loadGate.current.isCurrent(requestId)) setLoading(false);
     }
   }, []);
 

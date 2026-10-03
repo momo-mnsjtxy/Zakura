@@ -5,6 +5,8 @@ import Link from "next/link";
 import { Eye, EyeOff, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
+import { createActionController, createLatestRequestGate } from "@/lib/chat-state";
+import { profilePatch } from "@/lib/identity-ui-state";
 import { describeUserAgent, formatWhen } from "@/lib/device-from-ua";
 import { RecoveryRotateDialog, TotpDisableDialog, TotpSetupDialog } from "@/components/account/totp-dialogs";
 import { SettingsHeader, SettingsRow, SettingsSection } from "@/components/settings-shell";
@@ -79,13 +81,17 @@ export default function AccountSettingsPage() {
   const [passkeyName, setPasskeyName] = useState("");
   const [passkeyBusy, setPasskeyBusy] = useState(false);
   const [verifyBusy, setVerifyBusy] = useState(false);
+  const loadGate = useRef(createLatestRequestGate());
+  const profileAction = useRef(createActionController());
 
   const load = useCallback(async () => {
+    const requestId = loadGate.current.begin();
     const [meRes, mfaRes, sessRes] = await Promise.all([
       api<Me>("/api/me"),
       api<Mfa>("/api/me/mfa"),
       api<{ sessions: SessionRow[] }>("/api/me/sessions"),
     ]);
+    if (!loadGate.current.isCurrent(requestId)) return;
     setMe(meRes);
     setName(meRes.user.name ?? "");
     setTitle(meRes.user.title ?? "");
@@ -105,9 +111,10 @@ export default function AccountSettingsPage() {
   const protectedLogin = mfa.totp || mfa.webauthn;
 
   async function saveProfile() {
+    if (!profileAction.current.begin()) return;
     setSavingProfile(true);
     try {
-      await api("/api/me", { method: "PATCH", json: { name, title, bio } });
+      await api("/api/me", { method: "PATCH", json: profilePatch({ name, title, bio }) });
       setMe((prev) =>
         prev ? { ...prev, user: { ...prev.user, name: name.trim() || null, title: title.trim() || null, bio: bio.trim() || null } } : prev,
       );
@@ -116,6 +123,7 @@ export default function AccountSettingsPage() {
       toast.error(errMessage(err));
     } finally {
       setSavingProfile(false);
+      profileAction.current.finish();
     }
   }
 

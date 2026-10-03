@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
@@ -16,6 +16,8 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { api, setSession } from "@/lib/api";
+import { createActionController, createLatestRequestGate } from "@/lib/chat-state";
+import { teamDestination } from "@/lib/identity-ui-state";
 import { useMe } from "@/components/me-context";
 import { SettingsHeader, SettingsSection } from "@/components/settings-shell";
 import { UserAvatar } from "@/components/user-avatar";
@@ -89,12 +91,15 @@ export default function TeamSettingsPage() {
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState("");
   const [deleteBusy, setDeleteBusy] = useState(false);
+  const loadGate = useRef(createLatestRequestGate());
+  const mutation = useRef(createActionController());
 
   const canManage = team?.role === "owner" || team?.role === "admin";
   const canLoadMembers = canManage && (me.multiTenant || me.edition === "saas");
   const canDelete = team?.role === "owner" && !team.isDefault && teamCount > 1;
 
   const load = useCallback(async () => {
+    const requestId = loadGate.current.begin();
     setLoading(true);
     try {
       // Use me.role to decide upfront whether to fire admin-only calls in
@@ -117,6 +122,7 @@ export default function TeamSettingsPage() {
             : null,
         ]);
 
+      if (!loadGate.current.isCurrent(requestId)) return;
       setTeam(current);
       setName(current.name);
 
@@ -126,7 +132,7 @@ export default function TeamSettingsPage() {
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error));
     } finally {
-      setLoading(false);
+      if (loadGate.current.isCurrent(requestId)) setLoading(false);
     }
   }, [me.role, me.edition, me.multiTenant]);
 
@@ -136,6 +142,7 @@ export default function TeamSettingsPage() {
 
   async function saveTeam() {
     if (!name.trim()) return toast.error("团队名称不能为空");
+    if (!mutation.current.begin()) return;
     setSaving(true);
     try {
       const updated = await api<{ name: string }>("/api/tenant/current", {
@@ -150,11 +157,13 @@ export default function TeamSettingsPage() {
       toast.error(error instanceof Error ? error.message : String(error));
     } finally {
       setSaving(false);
+      mutation.current.finish();
     }
   }
 
   async function createInvite() {
     if (!inviteEmail.trim()) return toast.error("请填写邮箱");
+    if (!mutation.current.begin()) return;
     setInviteBusy(true);
     try {
       const result = await api<{ acceptUrl: string; emailed?: boolean }>("/api/tenant/invites", {
@@ -170,41 +179,52 @@ export default function TeamSettingsPage() {
       toast.error(error instanceof Error ? error.message : String(error));
     } finally {
       setInviteBusy(false);
+      mutation.current.finish();
     }
   }
 
   async function updateMemberRole(id: string, role: "member" | "admin") {
+    if (!mutation.current.begin()) return;
     try {
       await api(`/api/tenant/members/${id}`, { method: "PATCH", json: { role } });
       setMembers((items) => items.map((item) => (item.id === id ? { ...item, role } : item)));
       toast.success("成员角色已更新");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error));
+    } finally {
+      mutation.current.finish();
     }
   }
 
   async function removeMember(id: string) {
+    if (!mutation.current.begin()) return;
     try {
       await api(`/api/tenant/members/${id}`, { method: "DELETE" });
       setMembers((items) => items.filter((item) => item.id !== id));
       toast.success("成员已移除");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error));
+    } finally {
+      mutation.current.finish();
     }
   }
 
   async function revokeInvite(id: string) {
+    if (!mutation.current.begin()) return;
     try {
       await api(`/api/tenant/invites/${id}`, { method: "DELETE" });
       setInvites((items) => items.filter((item) => item.id !== id));
       toast.success("邀请已撤销");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error));
+    } finally {
+      mutation.current.finish();
     }
   }
 
   async function deleteTeam() {
     if (!team || deleteConfirm !== team.name) return;
+    if (!mutation.current.begin()) return;
     setDeleteBusy(true);
     try {
       const result = await api<{
@@ -212,11 +232,11 @@ export default function TeamSettingsPage() {
         team: { onboardingCompleted?: boolean };
       }>("/api/tenant/current", { method: "DELETE" });
       setSession(result.session);
-      window.location.href =
-        result.team.onboardingCompleted === false ? "/onboarding" : "/dashboard/agents";
+      window.location.href = teamDestination(result.team);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error));
       setDeleteBusy(false);
+      mutation.current.finish();
     }
   }
 

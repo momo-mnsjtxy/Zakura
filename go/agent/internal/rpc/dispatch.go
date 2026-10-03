@@ -26,27 +26,3 @@ func (h *Handler) dispatchSystem(ctx context.Context, msg Msg, send func(Msg)) (
 		return false, nil, nil
 	}
 }
-
-func (h *Handler) dispatchFilesystem(msg Msg) (bool, any, error) {
-	var result any
-	var err error
-	switch msg.Method {
-	case "host.fs.stat":
-		result, err = h.fsStat(msg.Params)
-	case "host.fs.list":
-		result, err = h.fsList(msg.Params)
-	case "host.fs.read":
-		result, err = h.fsRead(msg.Params)
-	case "host.fs.write":
-		result, err = h.fsWrite(msg.Params)
-	case "host.fs.mkdir":
-		result, err = h.fsMkdir(msg.Params)
-	case "host.fs.remove":
-		result, err = h.fsRemove(msg.Params)
-	case "host.fs.rename":
-		result, err = h.fsRename(msg.Params)
-	default:
-		return false, nil, nil
-	}
-	return true, result, err
-}
