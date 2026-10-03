@@ -27,6 +27,7 @@ import {
 import type { DockerRuntime } from "../runtime/docker.js";
 import { platformEvents } from "./platform-events.js";
 import type { RuntimeNodeService } from "./runtime-nodes.js";
+import { KeyedLifecycle } from "./keyed-lifecycle.js";
 
 /** 租户能力面板，不走 MCP 服务器自动启动 */
 const CAPABILITY_PROVIDER_IDS = ["web-search", "web-fetch"] as const;
@@ -152,6 +153,7 @@ export type ReconcileSnapshot = {
 };
 
 export class Orchestrator {
+  private readonly instanceLifecycle = new KeyedLifecycle();
   private nodes: RuntimeNodeService | null = null;
   /** 最近一次幽灵实例自检结果（进程内快照，重启后清空） */
   private lastReconcile: ReconcileSnapshot | null = null;
@@ -466,6 +468,12 @@ export class Orchestrator {
   }
 
   async startInstance(tenantId: string, instanceId: string): Promise<InstanceHandle> {
+    return this.instanceLifecycle.run(`start:${tenantId}:${instanceId}`, () =>
+      this.startInstanceOnce(tenantId, instanceId),
+    );
+  }
+
+  private async startInstanceOnce(tenantId: string, instanceId: string): Promise<InstanceHandle> {
     const instance = await this.requireInstance(tenantId, instanceId);
 
     // 幂等：已在运行则直接返回（避免 stdio 容器被重复拉起）
@@ -659,6 +667,12 @@ export class Orchestrator {
   }
 
   async stopInstance(tenantId: string, instanceId: string): Promise<void> {
+    return this.instanceLifecycle.run(`stop:${tenantId}:${instanceId}`, () =>
+      this.stopInstanceOnce(tenantId, instanceId),
+    );
+  }
+
+  private async stopInstanceOnce(tenantId: string, instanceId: string): Promise<void> {
     const instance = await this.requireInstance(tenantId, instanceId);
     const containers = await this.db.query.managedContainers.findMany({
       where: and(

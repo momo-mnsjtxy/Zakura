@@ -12,13 +12,13 @@ import (
 	"zakura.dev/agent/internal/host"
 )
 
-type fakeDockerExecutor struct {
-	productionDockerExecutor
+type fakeOperationExecutor struct {
+	productionOperationExecutor
 	pulls atomic.Int32
 	pull  func(context.Context, string, func(docker.PullEvent)) error
 }
 
-func (f *fakeDockerExecutor) Pull(ctx context.Context, image string, progress func(docker.PullEvent)) error {
+func (f *fakeOperationExecutor) Pull(ctx context.Context, image string, progress func(docker.PullEvent)) error {
 	f.pulls.Add(1)
 	return f.pull(ctx, image, progress)
 }
@@ -30,7 +30,7 @@ func collectDispatch(h *Handler, ctx context.Context, msg Msg) []Msg {
 }
 
 func TestDockerDispatchProgressThenExactlyOneReply(t *testing.T) {
-	fake := &fakeDockerExecutor{pull: func(_ context.Context, image string, progress func(docker.PullEvent)) error {
+	fake := &fakeOperationExecutor{pull: func(_ context.Context, image string, progress func(docker.PullEvent)) error {
 		if image != "example/image:tag" {
 			t.Fatalf("image = %q", image)
 		}
@@ -38,7 +38,7 @@ func TestDockerDispatchProgressThenExactlyOneReply(t *testing.T) {
 		return nil
 	}}
 	h := New("runner", t.TempDir())
-	h.docker = fake
+	h.operations = fake
 	params, _ := json.Marshal(map[string]any{"image": "example/image:tag", "progressStream": "progress-1"})
 	got := collectDispatch(h, context.Background(), Msg{ID: "req-1", Method: "docker.pull", Params: params})
 	if len(got) != 2 {
@@ -61,9 +61,9 @@ func TestDockerDispatchProgressThenExactlyOneReply(t *testing.T) {
 }
 
 func TestDockerDispatchMalformedDoesNotExecuteAndRepliesOnce(t *testing.T) {
-	fake := &fakeDockerExecutor{pull: func(context.Context, string, func(docker.PullEvent)) error { t.Fatal("executor called"); return nil }}
+	fake := &fakeOperationExecutor{pull: func(context.Context, string, func(docker.PullEvent)) error { t.Fatal("executor called"); return nil }}
 	h := New("runner", t.TempDir())
-	h.docker = fake
+	h.operations = fake
 	got := collectDispatch(h, context.Background(), Msg{ID: "bad", Method: "docker.pull", Params: json.RawMessage(`{"image":`)})
 	if len(got) != 1 || got[0].Type != "res" || got[0].OK == nil || *got[0].OK || got[0].Error == "" {
 		t.Fatalf("messages = %#v", got)
@@ -74,9 +74,9 @@ func TestDockerDispatchMalformedDoesNotExecuteAndRepliesOnce(t *testing.T) {
 }
 
 func TestDockerDispatchPropagatesCancellation(t *testing.T) {
-	fake := &fakeDockerExecutor{pull: func(ctx context.Context, _ string, _ func(docker.PullEvent)) error { return ctx.Err() }}
+	fake := &fakeOperationExecutor{pull: func(ctx context.Context, _ string, _ func(docker.PullEvent)) error { return ctx.Err() }}
 	h := New("runner", t.TempDir())
-	h.docker = fake
+	h.operations = fake
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	got := collectDispatch(h, ctx, Msg{ID: "cancel", Method: "docker.pull", Params: json.RawMessage(`{"image":"x"}`)})

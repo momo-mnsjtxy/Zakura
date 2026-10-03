@@ -17,6 +17,7 @@ type Handler struct {
 	jobs        *host.Registry
 	ptys        map[string]*host.LiveStream
 	docker      dockerExecutor
+	operations  operationExecutor
 	mu          sync.Mutex
 }
 
@@ -27,6 +28,7 @@ func New(kind, storageRoot string) *Handler {
 		jobs:        host.NewRegistry(),
 		ptys:        map[string]*host.LiveStream{},
 		docker:      productionDockerExecutor{},
+		operations:  productionOperationExecutor{},
 	}
 }
 
@@ -36,6 +38,10 @@ func (h *Handler) workspace(spaceID string) string {
 
 func (h *Handler) Dispatch(ctx context.Context, msg Msg, send func(Msg)) {
 	if handled, result, err := h.dispatchSystem(ctx, msg, send); handled {
+		h.reply(msg, result, err, send)
+		return
+	}
+	if handled, result, err := h.dispatchOperation(ctx, msg, send); handled {
 		h.reply(msg, result, err, send)
 		return
 	}

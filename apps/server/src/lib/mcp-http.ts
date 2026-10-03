@@ -101,6 +101,21 @@ function annotateGoogleMcpPermission(message: string): string {
 }
 
 const CLIENT_INFO = { name: "zakura", version: "0.4.0" } as const;
+const CONNECT_TIMEOUT_MS = 20_000;
+
+export async function boundedMcpOperation<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new McpHttpError(`MCP operation timed out after ${timeoutMs}ms`, { kind: "network" })), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 type TransportMode = "streamable-http" | "sse-legacy";
 
@@ -205,7 +220,10 @@ async function connectStreamable(
     requestInit: { headers: { ...headers } },
   });
   const client = new Client(CLIENT_INFO, { capabilities: {} });
-  await client.connect(transport);
+  await boundedMcpOperation(client.connect(transport), CONNECT_TIMEOUT_MS).catch(async (error) => {
+    await client.close().catch(() => undefined);
+    throw error;
+  });
   return { client, mode: "streamable-http", mcpUrl: url };
 }
 
@@ -218,7 +236,10 @@ async function connectLegacySse(
     requestInit: { headers: { ...headers } },
   });
   const client = new Client(CLIENT_INFO, { capabilities: {} });
-  await client.connect(transport);
+  await boundedMcpOperation(client.connect(transport), CONNECT_TIMEOUT_MS).catch(async (error) => {
+    await client.close().catch(() => undefined);
+    throw error;
+  });
   return { client, mode: "sse-legacy", mcpUrl: streamableUrl };
 }
 

@@ -1,9 +1,10 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Plus, Trash2, HeartPulse, Star } from "lucide-react";
 import { api } from "@/lib/api";
+import { createActionController, createLatestRequestGate } from "@/lib/chat-state";
 import { PageLoading } from "@/components/ui/progress-linear";
 import {
   EmbeddingConfigFields,
@@ -98,13 +99,17 @@ export default function GlobalMemoryPage() {
   const [apiKey, setApiKey] = useState("");
   const [headerName, setHeaderName] = useState("Authorization");
   const [busy, setBusy] = useState(false);
+  const loadGate = useRef(createLatestRequestGate());
+  const mutation = useRef(createActionController());
 
   const { models: embeddingModels, loading: modelsLoading, reload: reloadModels } =
     useEmbeddingModels();
 
   const load = useCallback(async () => {
+    const requestId = loadGate.current.begin();
     try {
       const res = await api<Payload & { kinds?: KindMeta[] }>("/api/memory-providers");
+      if (!loadGate.current.isCurrent(requestId)) return;
       setData(res);
       if (res.kinds) setKinds(res.kinds);
       else {
@@ -207,6 +212,7 @@ export default function GlobalMemoryPage() {
       toast.error("mem0 需要 Base URL");
       return;
     }
+    if (!mutation.current.begin()) return;
     setBusy(true);
     try {
       if (edit) {
@@ -233,21 +239,26 @@ export default function GlobalMemoryPage() {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
+      mutation.current.finish();
     }
   }
 
   async function remove(id: string) {
     if (!(await confirm({ title: "删除此记忆配置？", description: "已关联的 Agent 会自动切换到默认。", confirmLabel: "删除" }))) return;
+    if (!mutation.current.begin()) return;
     try {
       await api(`/api/memory-providers/${id}`, { method: "DELETE" });
       toast.success("已删除");
       await load();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
+    } finally {
+      mutation.current.finish();
     }
   }
 
   async function health(id: string) {
+    if (!mutation.current.begin()) return;
     try {
       const res = await api<{ status: string; message?: string }>(
         `/api/memory-providers/${id}/health`,
@@ -256,10 +267,13 @@ export default function GlobalMemoryPage() {
       toast.message(`健康检查：${res.status}`, { description: res.message });
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
+    } finally {
+      mutation.current.finish();
     }
   }
 
   async function makeDefault(id: string) {
+    if (!mutation.current.begin()) return;
     try {
       await api(`/api/memory-providers/${id}`, {
         method: "PATCH",
@@ -269,6 +283,8 @@ export default function GlobalMemoryPage() {
       await load();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
+    } finally {
+      mutation.current.finish();
     }
   }
 

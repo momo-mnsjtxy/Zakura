@@ -1,10 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { toast } from "sonner";
 import { Pin, Plus, Search, Trash2 } from "lucide-react";
 import { api } from "@/lib/api";
+import { createActionController, createLatestRequestGate } from "@/lib/chat-state";
 import { useAgentDetail } from "@/components/agent-detail-context";
 import {
   SettingsHeader,
@@ -585,17 +586,20 @@ function BuiltinEmbeddingPanel({
     stats: { total: number; withEmbedding: number; missing: number; stale: number };
   } | null>(initial ?? null);
   const [busy, setBusy] = useState(false);
+  const embeddingLoadGate = useRef(createLatestRequestGate());
+  const reembedAction = useRef(createActionController());
 
   const load = useCallback(async () => {
+    const requestId = embeddingLoadGate.current.begin();
     try {
       const res = await api<{
         enabled: boolean;
         model: string | null;
         stats: { total: number; withEmbedding: number; missing: number; stale: number };
       }>(`/api/agents/${agentId}/memory/embedding-stats`);
-      setInfo(res);
+      if (embeddingLoadGate.current.isCurrent(requestId)) setInfo(res);
     } catch {
-      setInfo(null);
+      if (embeddingLoadGate.current.isCurrent(requestId)) setInfo(null);
     }
   }, [agentId]);
 
@@ -608,6 +612,7 @@ function BuiltinEmbeddingPanel({
   }, [initial, load]);
 
   async function reembed() {
+    if (!reembedAction.current.begin()) return;
     setBusy(true);
     try {
       const res = await api<{
@@ -627,6 +632,7 @@ function BuiltinEmbeddingPanel({
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
+      reembedAction.current.finish();
     }
   }
 

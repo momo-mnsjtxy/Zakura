@@ -499,13 +499,22 @@ function skillPathsFromFiles(files: string[], pluginRoot: string): string[] {
   );
 }
 
+export type MarketplaceJsonLoader = (url: URL) => Promise<unknown>;
+
 export async function parseMarketplaceSource(input: {
   sourceUrl: string;
   format: MarketplaceFormat;
   storeId: McpStoreSourceId;
-}): Promise<{ name: string; description: string; format: Exclude<MarketplaceFormat, "auto">; manifest: unknown; servers: McpStoreServer[] }> {
-  const sourceUrl = await assertMarketplaceUrl(input.sourceUrl);
-  const manifest = await fetchMarketplaceJson(sourceUrl);
+}, loadJson?: MarketplaceJsonLoader): Promise<{
+  name: string;
+  description: string;
+  format: Exclude<MarketplaceFormat, "auto">;
+  manifest: unknown;
+  servers: McpStoreServer[];
+}> {
+  const sourceUrl = loadJson ? new URL(input.sourceUrl) : await assertMarketplaceUrl(input.sourceUrl);
+  const readJson = loadJson ?? fetchMarketplaceJson;
+  const manifest = await readJson(sourceUrl);
   const root = record(manifest);
   const plugins = Array.isArray(root?.plugins) ? root.plugins.map(record).filter((item): item is Record<string, unknown> => !!item) : [];
   if (!root || !plugins.length) throw new Error("无法识别商店清单：缺少 plugins 数组");
@@ -524,18 +533,18 @@ export async function parseMarketplaceSource(input: {
         : [".codex-plugin/plugin.json", ".claude-plugin/plugin.json"];
       for (const path of manifestPaths) {
         try {
-          pluginManifest = record(await fetchMarketplaceJson(new URL(path, rootUrl)));
+          pluginManifest = record(await readJson(new URL(path, rootUrl)));
           if (!config && pluginManifest?.mcpServers) config = pluginManifest.mcpServers;
           if (pluginManifest) break;
         } catch { /* try the other manifest convention */ }
       }
       if (!config) {
-        try { config = await fetchMarketplaceJson(new URL(".mcp.json", rootUrl)); }
+        try { config = await readJson(new URL(".mcp.json", rootUrl)); }
         catch { /* plugin has no MCP contribution */ }
       }
     }
     if (typeof config === "string" && rootUrl) {
-      try { config = await fetchMarketplaceJson(new URL(config, rootUrl)); }
+      try { config = await readJson(new URL(config, rootUrl)); }
       catch { config = undefined; }
     }
 
@@ -548,7 +557,7 @@ export async function parseMarketplaceSource(input: {
     if (!hooks && plugin.hooks) hooks = parseHooksJson(plugin.hooks);
     if (!hooks && rootUrl) {
       try {
-        hooks = parseHooksJson(await fetchMarketplaceJson(new URL("hooks/hooks.json", rootUrl)));
+        hooks = parseHooksJson(await readJson(new URL("hooks/hooks.json", rootUrl)));
       } catch { /* optional */ }
     }
 
@@ -817,12 +826,26 @@ function parseNpxHint(hint: string): { command: string; args: string[] } | null 
 export class McpStoreService {
   private readonly db: Db | null;
   private readonly config: AppConfig;
+  private readonly marketplaceJsonLoader?: MarketplaceJsonLoader;
 
-  constructor(db: Db, config: AppConfig);
-  constructor(config: AppConfig);
-  constructor(dbOrConfig: Db | AppConfig, config?: AppConfig) {
-    this.db = config ? dbOrConfig as Db : null;
-    this.config = config ?? dbOrConfig as AppConfig;
+  constructor(
+    db: Db,
+    config: AppConfig,
+    options?: { marketplaceJsonLoader?: MarketplaceJsonLoader },
+  );
+  constructor(config: AppConfig, options?: { marketplaceJsonLoader?: MarketplaceJsonLoader });
+  constructor(
+    dbOrConfig: Db | AppConfig,
+    configOrOptions?: AppConfig | { marketplaceJsonLoader?: MarketplaceJsonLoader },
+    options?: { marketplaceJsonLoader?: MarketplaceJsonLoader },
+  ) {
+    const hasDb = Boolean(configOrOptions && "databaseUrl" in configOrOptions);
+    this.db = hasDb ? dbOrConfig as Db : null;
+    this.config = (hasDb ? configOrOptions : dbOrConfig) as AppConfig;
+    const resolvedOptions = hasDb
+      ? options
+      : configOrOptions as { marketplaceJsonLoader?: MarketplaceJsonLoader } | undefined;
+    this.marketplaceJsonLoader = resolvedOptions?.marketplaceJsonLoader;
   }
 
   private requireDb(): Db {
@@ -965,7 +988,7 @@ export class McpStoreService {
       sourceUrl: input.sourceUrl,
       format: input.format ?? "auto",
       storeId: `custom:${id}`,
-    });
+    }, this.marketplaceJsonLoader);
     const name = input.name?.trim() || parsed.name;
     if (!name) throw new Error("商店名称不能为空");
     const now = new Date();
@@ -1015,7 +1038,14 @@ export class McpStoreService {
     ));
     if (!row) throw new Error("商店不存在");
     const parsed = row.sourceUrl.endsWith(".json")
-      ? await parseMarketplaceSource({ sourceUrl: row.sourceUrl, format: row.format as MarketplaceFormat, storeId: sourceId })
+      ? await parseMarketplaceSource(
+          {
+            sourceUrl: row.sourceUrl,
+            format: row.format as MarketplaceFormat,
+            storeId: sourceId,
+          },
+          this.marketplaceJsonLoader,
+        )
       : await parseMarketplaceRepository({ repository: row.sourceUrl, storeId: sourceId });
     const now = new Date();
     await this.requireDb().update(mcpStoreSources).set({

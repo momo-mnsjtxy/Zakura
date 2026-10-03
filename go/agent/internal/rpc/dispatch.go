@@ -2,7 +2,6 @@ package rpc
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 
 	"zakura.dev/agent/internal/sys"
@@ -23,20 +22,6 @@ func (h *Handler) dispatchSystem(ctx context.Context, msg Msg, send func(Msg)) (
 			return true, sys.VersionInfo(), nil
 		}
 		return true, sys.Collect(h.Kind, h.StorageRoot), nil
-	case "sys.update":
-		var p sys.UpdateParams
-		if err := json.Unmarshal(msg.Params, &p); err != nil {
-			return true, nil, err
-		}
-		var progress func(sys.UpdateProgress)
-		if p.ProgressStream != "" {
-			progress = func(event sys.UpdateProgress) {
-				data, _ := json.Marshal(event)
-				send(Msg{Type: "stream", Stream: p.ProgressStream, Chan: "progress", Data: base64.StdEncoding.EncodeToString(data)})
-			}
-		}
-		result, err := sys.Apply(ctx, p, progress)
-		return true, result, err
 	default:
 		return false, nil, nil
 	}

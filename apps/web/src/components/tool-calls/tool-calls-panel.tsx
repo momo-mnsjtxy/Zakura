@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { toast } from "sonner";
 import {
@@ -27,6 +27,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
+import { createLatestRequestGate } from "@/lib/chat-state";
 
 export type ToolCallItem = {
   id: string;
@@ -272,6 +273,8 @@ export function ToolCallsPanel({
     () => new Map(),
   );
   const [loading, setLoading] = useState(true);
+  const metaGate = useRef(createLatestRequestGate());
+  const loadGate = useRef(createLatestRequestGate());
   const [offset, setOffset] = useState(0);
   const limit = 40;
 
@@ -295,6 +298,7 @@ export function ToolCallsPanel({
       : "/api/tool-calls/stats";
 
   const loadMeta = useCallback(async () => {
+    const requestId = metaGate.current.begin();
     const tasks: Promise<unknown>[] = [api<KeyOption[]>("/api/api-keys")];
     if (showAgentFilter && !agentId) {
       tasks.push(api<AgentOption[]>("/api/agents"));
@@ -303,24 +307,27 @@ export function ToolCallsPanel({
       KeyOption[],
       AgentOption[] | undefined,
     ];
+    if (!metaGate.current.isCurrent(requestId)) return;
     setKeys(keyRows);
     if (agentRows) setAgents(agentRows);
   }, [agentId, showAgentFilter]);
 
   const load = useCallback(async () => {
+    const requestId = loadGate.current.begin();
     setLoading(true);
     try {
       const [listRes, statsRes] = await Promise.all([
         api<{ items: ToolCallItem[]; total: number }>(listUrl),
         api<ToolCallStats>(statsUrl),
       ]);
+      if (!loadGate.current.isCurrent(requestId)) return;
       setItems(listRes.items);
       setTotal(listRes.total);
       setStats(statsRes);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      if (loadGate.current.isCurrent(requestId)) setLoading(false);
     }
   }, [listUrl, statsUrl]);
 

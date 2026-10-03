@@ -13,7 +13,6 @@ import (
 
 type dockerExecutor interface {
 	Probe() docker.Ping
-	Pull(context.Context, string, func(docker.PullEvent)) error
 	Run(context.Context, docker.RunSpec) (docker.ContainerInfo, error)
 	Stop(context.Context, string, bool) error
 	Inspect(context.Context, string) (docker.ContainerInfo, error)
@@ -21,16 +20,11 @@ type dockerExecutor interface {
 	Logs(context.Context, string, int) (string, error)
 	Copy(context.Context, string, string) error
 	List(context.Context, string) ([]docker.ContainerInfo, error)
-	Images(context.Context, []string) []docker.ImageStatus
-	Recreate(context.Context, string) (docker.RecreateResult, error)
 }
 
 type productionDockerExecutor struct{}
 
 func (productionDockerExecutor) Probe() docker.Ping { return docker.Probe() }
-func (productionDockerExecutor) Pull(ctx context.Context, image string, progress func(docker.PullEvent)) error {
-	return docker.PullWithProgress(ctx, image, progress)
-}
 func (productionDockerExecutor) Run(ctx context.Context, spec docker.RunSpec) (docker.ContainerInfo, error) {
 	return docker.Run(ctx, spec)
 }
@@ -52,13 +46,6 @@ func (productionDockerExecutor) Copy(ctx context.Context, src, dest string) erro
 func (productionDockerExecutor) List(ctx context.Context, label string) ([]docker.ContainerInfo, error) {
 	return docker.List(ctx, label)
 }
-func (productionDockerExecutor) Images(ctx context.Context, images []string) []docker.ImageStatus {
-	return docker.InspectImages(ctx, images)
-}
-func (productionDockerExecutor) Recreate(ctx context.Context, image string) (docker.RecreateResult, error) {
-	return docker.RecreateStale(ctx, image)
-}
-
 func (h *Handler) dispatchDocker(ctx context.Context, msg Msg, send func(Msg)) (bool, any, error) {
 	if !isDockerMethod(msg.Method) {
 		return false, nil, nil
@@ -71,20 +58,6 @@ func (h *Handler) dispatchDocker(ctx context.Context, msg Msg, send func(Msg)) (
 	switch msg.Method {
 	case "docker.ping":
 		return true, h.docker.Probe(), nil
-	case "docker.pull":
-		var p struct{ Image, ProgressStream string }
-		if err := decodeParams(msg.Params, &p); err != nil {
-			return true, nil, err
-		}
-		var progress func(docker.PullEvent)
-		if p.ProgressStream != "" {
-			progress = func(event docker.PullEvent) {
-				data, _ := json.Marshal(event)
-				send(Msg{Type: "stream", Stream: p.ProgressStream, Chan: "progress", Data: base64.StdEncoding.EncodeToString(data)})
-			}
-		}
-		err = h.docker.Pull(ctx, p.Image, progress)
-		result = map[string]string{"image": p.Image}
 	case "docker.run":
 		var p docker.RunSpec
 		if err := decodeParams(msg.Params, &p); err != nil {
@@ -157,22 +130,6 @@ func (h *Handler) dispatchDocker(ctx context.Context, msg Msg, send func(Msg)) (
 			return true, nil, err
 		}
 		result, err = h.docker.List(ctx, p.Label)
-	case "docker.images":
-		var p struct {
-			Images []string `json:"images"`
-		}
-		if err := decodeParams(msg.Params, &p); err != nil {
-			return true, nil, err
-		}
-		result = h.docker.Images(ctx, p.Images)
-	case "docker.recreate":
-		var p struct {
-			Image string `json:"image"`
-		}
-		if err := decodeParams(msg.Params, &p); err != nil {
-			return true, nil, err
-		}
-		result, err = h.docker.Recreate(ctx, p.Image)
 	case "docker.exec.start":
 		result, err = h.dockerStdioStart(msg.Params, send)
 	case "docker.attach":
@@ -189,9 +146,9 @@ func (h *Handler) dispatchDocker(ctx context.Context, msg Msg, send func(Msg)) (
 
 func isDockerMethod(method string) bool {
 	switch method {
-	case "docker.ping", "docker.pull", "docker.run", "docker.stop", "docker.inspect",
-		"docker.exec", "docker.logs", "docker.copy", "docker.list", "docker.images",
-		"docker.recreate", "docker.exec.start", "docker.attach", "docker.exec.write", "docker.exec.close":
+	case "docker.ping", "docker.run", "docker.stop", "docker.inspect",
+		"docker.exec", "docker.logs", "docker.copy", "docker.list",
+		"docker.exec.start", "docker.attach", "docker.exec.write", "docker.exec.close":
 		return true
 	default:
 		return false

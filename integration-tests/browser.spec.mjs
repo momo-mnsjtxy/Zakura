@@ -32,6 +32,6 @@ test("fixture user authenticates and reaches the agent dashboard", async ({ page
   await page.locator("input#password").fill("fixture-password");
   await page.getByRole("button", { name: "登录", exact: true }).click();
   await expect(page).toHaveURL(/\/dashboard\/agents/);
-  await expect(page.getByText("还没有 Agent")).toBeVisible();
+  await expect(page.getByText("Fixture Team").first()).toBeVisible();
   await page.screenshot({ path: "artifacts/e2e/agent-dashboard.png", fullPage: true });
 });
