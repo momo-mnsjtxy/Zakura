@@ -4,7 +4,7 @@ import {
   randomBytes,
   timingSafeEqual,
 } from "node:crypto";
-import { and, asc, eq, inArray, isNull } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull } from "drizzle-orm";
 import { hashApiKey } from "@zakura/core";
 import type { AppConfig } from "../config.js";
 import type { Db } from "../db/client.js";
@@ -206,6 +206,12 @@ export function verifyAccessToken(
 
 function hashToken(raw: string): string {
   return createHash("sha256").update(raw).digest("hex");
+}
+
+// Drizzle's transaction callback type does not distribute across the
+// PGlite/Postgres Db union, although both executors expose the same contract.
+function transactionDb(value: unknown): Db {
+  return value as Db;
 }
 
 function pkceS256(verifier: string): string {
@@ -911,18 +917,39 @@ export class OauthService {
       throw new OauthError("invalid_grant", "PKCE verification failed", 400);
     }
 
-    await this.db
-      .update(oauthAuthCodes)
-      .set({ usedAt: new Date() })
-      .where(eq(oauthAuthCodes.id, row.id));
+    // Consume the code with a database compare-and-set. Reading `usedAt` above is
+    // not sufficient: two replicas can validate the same row before either one
+    // writes it. Only the exchange that transitions the row from unused to used
+    // may mint a token family.
+    return this.db.transaction(async (tx) => {
+      const database = transactionDb(tx);
+      const consumeTime = new Date();
+      const [consumed] = await database
+        .update(oauthAuthCodes)
+        .set({ usedAt: consumeTime })
+        .where(
+          and(
+            eq(oauthAuthCodes.id, row.id),
+            isNull(oauthAuthCodes.usedAt),
+            gt(oauthAuthCodes.expiresAt, consumeTime),
+          ),
+        )
+        .returning();
+      if (!consumed) {
+        throw new OauthError("invalid_grant", "Invalid or expired code", 400);
+      }
 
-    return this.issueTokens({
-      clientId: row.clientId,
-      userId: row.userId,
-      tenantId: row.tenantId,
-      agentId: row.agentId,
-      scope: row.scope,
-      resource: input.resource ?? row.resource,
+      return this.issueTokens(
+        {
+          clientId: row.clientId,
+          userId: row.userId,
+          tenantId: row.tenantId,
+          agentId: row.agentId,
+          scope: row.scope,
+          resource: input.resource ?? row.resource,
+        },
+        database,
+      );
     });
   }
 
@@ -956,30 +983,52 @@ export class OauthService {
       throw new OauthError("invalid_grant", "Invalid refresh token", 400);
     }
 
-    // Rotate refresh token
-    await this.db
-      .update(oauthRefreshTokens)
-      .set({ revokedAt: new Date() })
-      .where(eq(oauthRefreshTokens.id, row.id));
+    // Rotate with the same compare-and-set guarantee as authorization codes.
+    // This prevents concurrent refreshes on separate replicas from forking one
+    // refresh token into multiple independently valid token families.
+    return this.db.transaction(async (tx) => {
+      const database = transactionDb(tx);
+      const rotateTime = new Date();
+      const [rotated] = await database
+        .update(oauthRefreshTokens)
+        .set({ revokedAt: rotateTime })
+        .where(
+          and(
+            eq(oauthRefreshTokens.id, row.id),
+            isNull(oauthRefreshTokens.revokedAt),
+            gt(oauthRefreshTokens.expiresAt, rotateTime),
+          ),
+        )
+        .returning();
+      if (!rotated) {
+        throw new OauthError("invalid_grant", "Invalid refresh token", 400);
+      }
 
-    return this.issueTokens({
-      clientId: row.clientId,
-      userId: row.userId,
-      tenantId: row.tenantId,
-      agentId: row.agentId,
-      scope: row.scope,
-      resource: input.resource ?? row.resource,
+      return this.issueTokens(
+        {
+          clientId: row.clientId,
+          userId: row.userId,
+          tenantId: row.tenantId,
+          agentId: row.agentId,
+          scope: row.scope,
+          resource: input.resource ?? row.resource,
+        },
+        database,
+      );
     });
   }
 
-  private async issueTokens(input: {
-    clientId: string;
-    userId: string;
-    tenantId: string;
-    agentId?: string | null;
-    scope: string;
-    resource?: string | null;
-  }): Promise<{
+  private async issueTokens(
+    input: {
+      clientId: string;
+      userId: string;
+      tenantId: string;
+      agentId?: string | null;
+      scope: string;
+      resource?: string | null;
+    },
+    database: Db = this.db,
+  ): Promise<{
     access_token: string;
     token_type: "Bearer";
     expires_in: number;
@@ -1006,7 +1055,7 @@ export class OauthService {
     });
 
     const refreshRaw = `rcr_${randomBytes(32).toString("base64url")}`;
-    await this.db.insert(oauthRefreshTokens).values({
+    await database.insert(oauthRefreshTokens).values({
       tokenHash: hashToken(refreshRaw),
       clientId: input.clientId,
       userId: input.userId,
@@ -1034,7 +1083,7 @@ export class OauthService {
 
     // OIDC：scope 含 openid 时签发 id_token（ChatGPT siwc / id_token_hint）
     if (scopes.has("openid")) {
-      const user = await this.db.query.users.findFirst({
+      const user = await database.query.users.findFirst({
         where: eq(users.id, input.userId),
       });
       if (user) {

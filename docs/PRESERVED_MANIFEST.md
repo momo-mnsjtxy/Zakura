@@ -6,7 +6,7 @@ This generated ledger lists every baseline-identical file in the rewritten tree.
 
 ## `apps/server`
 
-### Production compatibility implementation (176)
+### Production compatibility implementation (175)
 
 - `apps/server/drizzle.config.ts`
 - `apps/server/scripts/build-stdio-bridge.mjs`
@@ -150,7 +150,6 @@ This generated ledger lists every baseline-identical file in the rewritten tree.
 - `apps/server/src/services/oauth-cimd.ts`
 - `apps/server/src/services/oauth-private-key-jwt.ts`
 - `apps/server/src/services/oauth-signing.ts`
-- `apps/server/src/services/oauth.ts`
 - `apps/server/src/services/onboarding-bootstrap.ts`
 - `apps/server/src/services/platform-headscale.ts`
 - `apps/server/src/services/platform-transactional-email.ts`
@@ -988,4 +987,3 @@ This generated ledger lists every baseline-identical file in the rewritten tree.
 
 - `packages/shared/package.json`
 - `packages/shared/tsconfig.json`
-

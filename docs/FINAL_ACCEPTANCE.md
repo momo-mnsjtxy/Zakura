@@ -13,7 +13,7 @@ The rewrite preserves every baseline file and public contract while replacing bu
 
 ## Implemented and verified capability groups
 
-1. Identity and tenancy: password/OAuth/OIDC/SAML, SCIM, MFA policy/challenge/enrollment, verification/reset/invites, tenant/domain/RBAC/owner invariants, sessions, suspension and cache invalidation, rotating JWKS/JWT validation, audit export/retention, SaaS administration
+1. Identity and tenancy: password/OAuth/OIDC/SAML, SCIM, MFA policy/challenge/enrollment, verification/reset/invites, tenant/domain/RBAC/owner invariants, sessions, suspension and cache invalidation, rotating JWKS/JWT validation, atomic authorization-code consumption and refresh-token rotation, audit export/retention, SaaS administration
 2. Agent and chat: durable sessions/runs/events, cross-replica queue CAS, cancel/interrupt/recovery, tool-result ordering, Spaces/workspaces, projects/shares, automation/heartbeats, tenant drains, CDP/desktop/proxy lifecycle, session search/history, tool audit and post-run memory routing
 3. Models and gateways: weighted route retry/failover, partial-output rollback, cancellation, OpenAI Chat/Responses, Anthropic, Gemini, Bailian, Codex, Cursor and TypeSafe adapters, reasoning/media/tool continuation, gateway keys/sessions, catalog/default transitions, credential refresh/cache invalidation and OAuth client lifecycle
 4. MCP, skills and memory: stdio/HTTP JSON-RPC lifecycle, catalog/install/health, skill source/cache/install rollback and tenant token isolation, memory/vector/graph invariants, encrypted external-provider secrets, tenant-safe bounded task proxies and per-hop validated upstream OAuth
@@ -30,6 +30,7 @@ The exact HTTP inventory is in `ROUTE_ACCEPTANCE.md`; the capability-level matri
 - Full server suite serially with a real Redis service and fresh PGlite migrations
 - Go `test ./...` and `vet ./...`; focused race coverage for dial/host executor lifecycles
 - Real PGlite/Hono workflows for identity, SaaS, sessions, automation, model routes/gateway keys, OAuth clients, MCP catalog/tasks, connectors, migration, cleanup, network/platform services and tool audit
+- Real PGlite/Hono concurrent OAuth exchanges proving exactly one authorization-code exchange and one refresh-token rotation succeed, with replay rejection and a single active refresh-token row
 - Deterministic local fake upstreams/control planes for model providers, connectors, IdPs/JWKS, MCP, email, DNS, Headscale/Tailscale/Cloudflare, Google provisioning, runner/Docker boundaries and external memory
 - Hosted Playwright flows for login, authenticated dashboard, MFA enrollment retry, generic OAuth MFA, tenant-switch enrollment, desktop operational pages and mobile access-governance recovery
 
@@ -60,6 +61,7 @@ All visual checks require loaded content, zero page errors and no error boundary
 - UI input `placeholder` properties and tests checking unresolved templates are not implementation stubs
 - Repository scans must show no committed GitHub token, provider key, OAuth token, private key or local auth configuration
 - Real external providers stayed disabled without user credentials; no paid calls were made
+- The 474-handler route manifest is an inventory and evidence index; it is not represented as 474 positive end-to-end workflows
 
 ## Intentional live-environment gates
 

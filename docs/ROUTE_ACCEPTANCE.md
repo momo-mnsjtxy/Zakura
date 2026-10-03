@@ -2,7 +2,7 @@
 
 Baseline: `210677c58a700dbaf58dbff86350d46fd7b9a3e1`.
 
-This source-derived inventory contains 474 registered HTTP handlers across the complete server source, including the 439 direct API surface plus OAuth, probe and mounted sub-application handlers. `rewritten` means the declaring production module differs from baseline; `preserved` remains an explicit compatibility implementation. Direct literal route tests are named where discoverable; all other handlers remain covered by the hosted full workspace suite and their module-level compatibility suites.
+This source-derived inventory contains 474 registered HTTP handlers across the complete server source, including the 439 direct API surface plus OAuth, probe and mounted sub-application handlers. `rewritten` means the declaring production module differs from baseline; `preserved` remains an explicit compatibility implementation. Direct literal route tests are named where discoverable. “Hosted full suite / module compatibility” is broad regression evidence, not a claim that every inventoried handler has a positive end-to-end workflow. Route presence and compilation alone are not behavioral acceptance.
 
 | Method | Path | Implementation | Source | Evidence |
 |---|---|---|---|---|
@@ -457,8 +457,8 @@ This source-derived inventory contains 474 registered HTTP handlers across the c
 | GET | `/oauth/authorize` | preserved | `apps/server/src/oauth/http.ts:138` | `model-upstream-auth.test.ts`, `oauth-login-flow.test.ts` |
 | GET | `/oauth/discovery` | preserved | `apps/server/src/oauth/http.ts:229` | hosted full suite / module compatibility |
 | GET | `/oauth/jwks` | preserved | `apps/server/src/oauth/http.ts:80` | hosted full suite / module compatibility |
-| POST | `/oauth/register` | preserved | `apps/server/src/oauth/http.ts:130` | `oauth-cimd.test.ts`, `oauth-login-flow.test.ts` |
-| POST | `/oauth/token` | preserved | `apps/server/src/oauth/http.ts:178` | `provider-breadth-fake-transports.test.ts`, `network-provider-fake-control-plane.test.ts`, `model-upstream-auth.test.ts` |
+| POST | `/oauth/register` | preserved | `apps/server/src/oauth/http.ts:130` | `oauth-cimd.test.ts`, `oauth-login-flow.test.ts`, `oauth-token-replay-concurrency.test.ts` |
+| POST | `/oauth/token` | preserved | `apps/server/src/oauth/http.ts:178` | `oauth-login-flow.test.ts`, `oauth-token-replay-concurrency.test.ts` |
 | GET | `/oauth/userinfo` | preserved | `apps/server/src/oauth/http.ts:226` | hosted full suite / module compatibility |
 | POST | `/oauth/userinfo` | preserved | `apps/server/src/oauth/http.ts:227` | hosted full suite / module compatibility |
 | GET | `/readyz` | rewritten | `apps/server/src/observability.ts:116` | `observability.test.ts` |
@@ -472,7 +472,7 @@ This source-derived inventory contains 474 registered HTTP handlers across the c
 | GET | `/scim/v2/Users/:id` | rewritten | `apps/server/src/api/scim-routes.ts:66` | hosted full suite / module compatibility |
 | PATCH | `/scim/v2/Users/:id` | rewritten | `apps/server/src/api/scim-routes.ts:117` | hosted full suite / module compatibility |
 | PUT | `/scim/v2/Users/:id` | rewritten | `apps/server/src/api/scim-routes.ts:94` | hosted full suite / module compatibility |
-| POST | `/token` | preserved | `apps/server/src/oauth/http.ts:177` | `identity-tenant-lifecycle.test.ts`, `identity-session-routes.test.ts`, `model-route-workflow.test.ts` |
+| POST | `/token` | preserved | `apps/server/src/oauth/http.ts:177` | `oauth-login-flow.test.ts`, `oauth-token-replay-concurrency.test.ts` |
 | POST | `/token/revoke` | preserved | `apps/server/src/oauth/http.ts:180` | hosted full suite / module compatibility |
 | GET | `/userinfo` | preserved | `apps/server/src/oauth/http.ts:224` | `oauth-cimd.test.ts`, `identity-enterprise-policy.test.ts` |
 | POST | `/userinfo` | preserved | `apps/server/src/oauth/http.ts:225` | `oauth-cimd.test.ts`, `identity-enterprise-policy.test.ts` |
