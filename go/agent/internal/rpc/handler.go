@@ -4,12 +4,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
-	"io"
 	"strings"
 	"sync"
 
-	"zakura.dev/agent/internal/docker"
 	"zakura.dev/agent/internal/host"
 	"zakura.dev/agent/internal/sys"
 )
@@ -19,6 +16,7 @@ type Handler struct {
 	StorageRoot string
 	jobs        *host.Registry
 	ptys        map[string]*host.LiveStream
+	docker      dockerExecutor
 	mu          sync.Mutex
 }
 
@@ -28,6 +26,7 @@ func New(kind, storageRoot string) *Handler {
 		StorageRoot: storageRoot,
 		jobs:        host.NewRegistry(),
 		ptys:        map[string]*host.LiveStream{},
+		docker:      productionDockerExecutor{},
 	}
 }
 
@@ -44,118 +43,15 @@ func (h *Handler) Dispatch(ctx context.Context, msg Msg, send func(Msg)) {
 		h.reply(msg, result, err, send)
 		return
 	}
-	var err error
-	var result any
-	switch msg.Method {
-	case "host.exec":
-		result, err = h.hostExec(msg.Params)
-	case "host.exec.start":
-		result, err = h.hostExecStart(msg.Params)
-	case "host.exec.get":
-		result, err = h.hostExecGet(msg.Params)
-	case "host.exec.kill":
-		result, err = h.hostExecKill(msg.Params)
-	case "host.pty.start":
-		result, err = h.ptyStart(msg.Params, send)
-	case "host.pty.write":
-		err = h.ptyWrite(msg.Params)
-		result = map[string]bool{"ok": err == nil}
-	case "host.pty.resize":
-		err = h.ptyResize(msg.Params)
-		result = map[string]bool{"ok": err == nil}
-	case "host.pty.close":
-		err = h.ptyClose(msg.Params)
-		result = map[string]bool{"ok": true}
-	case "docker.ping":
-		result = docker.Probe()
-	case "docker.pull":
-		var p struct {
-			Image          string `json:"image"`
-			ProgressStream string `json:"progressStream"`
-		}
-		_ = json.Unmarshal(msg.Params, &p)
-		var progress func(docker.PullEvent)
-		if p.ProgressStream != "" {
-			progress = func(event docker.PullEvent) {
-				data, _ := json.Marshal(event)
-				send(Msg{Type: "stream", Stream: p.ProgressStream, Chan: "progress", Data: base64.StdEncoding.EncodeToString(data)})
-			}
-		}
-		err = docker.PullWithProgress(ctx, p.Image, progress)
-		result = map[string]string{"image": p.Image}
-	case "docker.run":
-		var spec docker.RunSpec
-		_ = json.Unmarshal(msg.Params, &spec)
-		result, err = docker.Run(ctx, spec)
-	case "docker.stop":
-		var p struct {
-			ID     string `json:"id"`
-			Remove bool   `json:"remove"`
-		}
-		_ = json.Unmarshal(msg.Params, &p)
-		err = docker.Stop(ctx, p.ID, p.Remove)
-		result = map[string]bool{"ok": err == nil}
-	case "docker.inspect":
-		var p struct {
-			ID string `json:"id"`
-		}
-		_ = json.Unmarshal(msg.Params, &p)
-		result, err = docker.Inspect(ctx, p.ID)
-	case "docker.exec":
-		result, err = h.dockerExec(ctx, msg.Params)
-	case "docker.logs":
-		var p struct {
-			ID   string `json:"id"`
-			Tail int    `json:"tail"`
-		}
-		_ = json.Unmarshal(msg.Params, &p)
-		if p.Tail == 0 {
-			p.Tail = 200
-		}
-		var logs string
-		logs, err = docker.Logs(ctx, p.ID, p.Tail)
-		result = map[string]string{"logs": logs}
-	case "docker.copy":
-		var p struct {
-			Src  string `json:"src"`
-			Dest string `json:"dest"`
-		}
-		_ = json.Unmarshal(msg.Params, &p)
-		err = docker.Copy(ctx, p.Src, p.Dest)
-		result = map[string]bool{"ok": err == nil}
-	case "docker.list":
-		var p struct {
-			Label string `json:"label"`
-		}
-		_ = json.Unmarshal(msg.Params, &p)
-		result, err = docker.List(ctx, p.Label)
-	case "docker.images":
-		var p struct {
-			Images []string `json:"images"`
-		}
-		_ = json.Unmarshal(msg.Params, &p)
-		result = docker.InspectImages(ctx, p.Images)
-	case "docker.recreate":
-		var p struct {
-			Image string `json:"image"`
-		}
-		_ = json.Unmarshal(msg.Params, &p)
-		result, err = docker.RecreateStale(ctx, p.Image)
-	case "docker.exec.start":
-		result, err = h.dockerStdioStart(msg.Params, send)
-	case "docker.attach":
-		result, err = h.dockerAttach(msg.Params, send)
-	case "docker.exec.write":
-		err = h.ptyWrite(msg.Params)
-		result = map[string]bool{"ok": err == nil}
-	case "docker.exec.close":
-		err = h.ptyClose(msg.Params)
-		result = map[string]bool{"ok": true}
-	default:
-		send(Err(msg.ID, "未知方法: "+msg.Method))
+	if handled, result, err := h.dispatchHost(msg, send); handled {
+		h.reply(msg, result, err, send)
 		return
 	}
-	h.reply(msg, result, err, send)
+	if handled, result, err := h.dispatchDocker(ctx, msg, send); handled {
+		h.reply(msg, result, err, send)
+		return
+	}
+	send(Err(msg.ID, "未知方法: "+msg.Method))
 }
 
 func (h *Handler) reply(msg Msg, result any, err error, send func(Msg)) {
@@ -293,242 +189,4 @@ func (h *Handler) fsRename(raw json.RawMessage) (any, error) {
 		return nil, err
 	}
 	return map[string]any{"ok": true, "path": h.apiPath(p.spacePath, p.NewPath)}, nil
-}
-
-func (h *Handler) hostExec(raw json.RawMessage) (any, error) {
-	var p struct {
-		host.ExecParams
-		SpaceID string `json:"spaceId"`
-	}
-	_ = json.Unmarshal(raw, &p)
-	root := h.StorageRoot
-	if p.SpaceID != "" {
-		root = h.workspace(p.SpaceID)
-		_ = host.EnsureDir(root)
-	}
-	return host.Run(root, p.ExecParams)
-}
-
-func (h *Handler) hostExecStart(raw json.RawMessage) (any, error) {
-	var p struct {
-		host.ExecParams
-		SpaceID string `json:"spaceId"`
-	}
-	_ = json.Unmarshal(raw, &p)
-	root := h.StorageRoot
-	if p.SpaceID != "" {
-		root = h.workspace(p.SpaceID)
-		_ = host.EnsureDir(root)
-	}
-	return h.jobs.Start(root, p.ExecParams)
-}
-
-func (h *Handler) hostExecGet(raw json.RawMessage) (any, error) {
-	var p struct {
-		ID string `json:"id"`
-	}
-	_ = json.Unmarshal(raw, &p)
-	snap := h.jobs.Get(p.ID)
-	if snap == nil {
-		return nil, fmt.Errorf("job 不存在")
-	}
-	return snap, nil
-}
-
-func (h *Handler) hostExecKill(raw json.RawMessage) (any, error) {
-	var p struct {
-		ID string `json:"id"`
-	}
-	_ = json.Unmarshal(raw, &p)
-	snap := h.jobs.Kill(p.ID)
-	if snap == nil {
-		return nil, fmt.Errorf("job 不存在")
-	}
-	return snap, nil
-}
-
-func (h *Handler) ptyStart(raw json.RawMessage, send func(Msg)) (any, error) {
-	var p struct {
-		host.ExecParams
-		SpaceID string `json:"spaceId"`
-		Cols    int    `json:"cols"`
-		Rows    int    `json:"rows"`
-	}
-	_ = json.Unmarshal(raw, &p)
-	root := h.StorageRoot
-	if p.SpaceID != "" {
-		root = h.workspace(p.SpaceID)
-		_ = host.EnsureDir(root)
-	}
-	sess, err := host.StartPty(root, p.ExecParams, p.Cols, p.Rows)
-	if err != nil {
-		return nil, err
-	}
-	h.mu.Lock()
-	h.ptys[sess.ID] = sess
-	h.mu.Unlock()
-	go func() {
-		buf := make([]byte, 4096)
-		for {
-			n, err := sess.Read(buf)
-			if n > 0 {
-				send(Msg{
-					Type:   "stream",
-					Stream: sess.ID,
-					Chan:   "stdout",
-					Data:   base64.StdEncoding.EncodeToString(buf[:n]),
-				})
-			}
-			if err != nil {
-				if err != io.EOF && !strings.Contains(err.Error(), "file already closed") {
-					send(Msg{Type: "stream", Stream: sess.ID, Chan: "stderr", Data: err.Error()})
-				}
-				send(Msg{Type: "stream", Stream: sess.ID, Chan: "exit"})
-				return
-			}
-		}
-	}()
-	return map[string]any{"id": sess.ID, "mode": sess.Mode}, nil
-}
-
-func (h *Handler) ptyWrite(raw json.RawMessage) error {
-	var p struct {
-		ID     string `json:"id"`
-		Base64 string `json:"base64"`
-		Data   string `json:"data"`
-	}
-	_ = json.Unmarshal(raw, &p)
-	h.mu.Lock()
-	s := h.ptys[p.ID]
-	h.mu.Unlock()
-	if s == nil {
-		return fmt.Errorf("pty 不存在")
-	}
-	b := []byte(p.Data)
-	if p.Base64 != "" {
-		var err error
-		b, err = base64.StdEncoding.DecodeString(p.Base64)
-		if err != nil {
-			return err
-		}
-	}
-	_, err := s.Write(b)
-	return err
-}
-
-func (h *Handler) ptyResize(raw json.RawMessage) error {
-	var p struct {
-		ID   string `json:"id"`
-		Cols int    `json:"cols"`
-		Rows int    `json:"rows"`
-	}
-	_ = json.Unmarshal(raw, &p)
-	h.mu.Lock()
-	s := h.ptys[p.ID]
-	h.mu.Unlock()
-	if s == nil {
-		return fmt.Errorf("pty 不存在")
-	}
-	return s.Resize(p.Cols, p.Rows)
-}
-
-func (h *Handler) ptyClose(raw json.RawMessage) error {
-	var p struct {
-		ID string `json:"id"`
-	}
-	_ = json.Unmarshal(raw, &p)
-	h.mu.Lock()
-	s := h.ptys[p.ID]
-	delete(h.ptys, p.ID)
-	h.mu.Unlock()
-	if s != nil {
-		return s.Close()
-	}
-	return nil
-}
-
-func (h *Handler) dockerStdioStart(raw json.RawMessage, send func(Msg)) (any, error) {
-	if err := docker.Require(); err != nil {
-		return nil, err
-	}
-	var p struct {
-		ID         string            `json:"id"`
-		Command    []string          `json:"command"`
-		WorkingDir string            `json:"workingDir"`
-		Env        map[string]string `json:"env"`
-	}
-	_ = json.Unmarshal(raw, &p)
-	if p.ID == "" || len(p.Command) == 0 {
-		return nil, fmt.Errorf("id 与 command 必填")
-	}
-	sess, err := host.StartDockerExec(p.ID, p.Command, p.WorkingDir, p.Env)
-	if err != nil {
-		return nil, err
-	}
-	h.mu.Lock()
-	h.ptys[sess.ID] = sess
-	h.mu.Unlock()
-	go func() {
-		buf := make([]byte, 4096)
-		for {
-			n, err := sess.Read(buf)
-			if n > 0 {
-				send(Msg{Type: "stream", Stream: sess.ID, Chan: "stdout", Data: base64.StdEncoding.EncodeToString(buf[:n])})
-			}
-			if err != nil {
-				send(Msg{Type: "stream", Stream: sess.ID, Chan: "exit"})
-				return
-			}
-		}
-	}()
-	return map[string]any{"id": sess.ID, "mode": sess.Mode}, nil
-}
-
-func (h *Handler) dockerAttach(raw json.RawMessage, send func(Msg)) (any, error) {
-	if err := docker.Require(); err != nil {
-		return nil, err
-	}
-	var p struct {
-		ID string `json:"id"`
-	}
-	_ = json.Unmarshal(raw, &p)
-	if p.ID == "" {
-		return nil, fmt.Errorf("id 必填")
-	}
-	sess, err := host.StartDockerAttach(p.ID)
-	if err != nil {
-		return nil, err
-	}
-	h.mu.Lock()
-	h.ptys[sess.ID] = sess
-	h.mu.Unlock()
-	go func() {
-		buf := make([]byte, 4096)
-		for {
-			n, err := sess.Read(buf)
-			if n > 0 {
-				send(Msg{Type: "stream", Stream: sess.ID, Chan: "stdout", Data: base64.StdEncoding.EncodeToString(buf[:n])})
-			}
-			if err != nil {
-				send(Msg{Type: "stream", Stream: sess.ID, Chan: "exit"})
-				return
-			}
-		}
-	}()
-	return map[string]any{"id": sess.ID, "mode": sess.Mode}, nil
-}
-
-func (h *Handler) dockerExec(ctx context.Context, raw json.RawMessage) (any, error) {
-	var p struct {
-		ID         string            `json:"id"`
-		Command    []string          `json:"command"`
-		WorkingDir string            `json:"workingDir"`
-		Env        map[string]string `json:"env"`
-	}
-	_ = json.Unmarshal(raw, &p)
-	out, errb, code, err := docker.Exec(ctx, p.ID, p.Command, p.WorkingDir, p.Env)
-	if err != nil {
-		return nil, err
-	}
-	return map[string]any{"exitCode": code, "stdout": out, "stderr": errb}, nil
 }

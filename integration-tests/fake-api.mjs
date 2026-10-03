@@ -27,6 +27,17 @@ const server = createServer(async (request, response) => {
     response.end(JSON.stringify({ onboardingCompleted: true }));
     return;
   }
+  if (request.url === "/api/me") {
+    response.end(JSON.stringify({
+      user: { id: "fixture-user", name: "Fixture Member", email: "member@example.test" },
+      tenant: { id: "fixture-tenant", name: "Fixture Team", onboardingCompleted: true },
+      role: "owner",
+      edition: "oss",
+      multiTenant: false,
+      canUseLocalRunner: true,
+    }));
+    return;
+  }
   if (request.url === "/api/agents" || request.url === "/api/spaces") {
     response.end("[]");
     return;

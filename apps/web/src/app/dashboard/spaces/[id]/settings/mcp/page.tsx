@@ -37,6 +37,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { createLatestRequestGate } from "@/lib/chat-state";
+import { buildMcpBindingPatch, deriveMcpBinding } from "@/lib/integration-settings-state";
 import {
   Table,
   TableHeader,
@@ -73,32 +75,33 @@ export default function AgentMcpPage() {
   const [capsBusy, setCapsBusy] = useState(false);
   const [tab, setTab] = useState("bindings");
   const selectedRef = useRef<string[]>([]);
+  const bindingLoadGate = useRef(createLatestRequestGate());
+  const capabilityLoadGate = useRef(createLatestRequestGate());
 
   const loadBindings = useCallback(async () => {
+    const requestId = bindingLoadGate.current.begin();
     try {
       const p = await fetchAgentProviders(id);
+      if (!bindingLoadGate.current.isCurrent(requestId)) return;
       setOpts(p);
-      const selected = p.mcp.instances.filter((i) => i.bound).map((i) => i.id);
-      selectedRef.current = selected;
-      setState({
-        mode: p.mcp.mode,
-        selected,
-        exposeFs: p.mcp.exposeWorkspaceFs !== false,
-      });
+      const next = deriveMcpBinding(p);
+      selectedRef.current = next.selected;
+      setState(next as McpBindingState);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
     }
   }, [id]);
 
   const loadCapabilities = useCallback(async () => {
+    const requestId = capabilityLoadGate.current.begin();
     setCapsBusy(true);
     try {
       const d = await fetchAgent(id);
-      setDetail(d);
+      if (capabilityLoadGate.current.isCurrent(requestId)) setDetail(d);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
-      setCapsBusy(false);
+      if (capabilityLoadGate.current.isCurrent(requestId)) setCapsBusy(false);
     }
   }, [id]);
 
@@ -114,26 +117,15 @@ export default function AgentMcpPage() {
 
   const persist = useCallback(
     async (patch: Partial<McpBindingState>) => {
-      const mode = patch.mode ?? state?.mode ?? "selected";
-      const selected = patch.selected ?? selectedRef.current;
-      const exposeFs = patch.exposeFs ?? state?.exposeFs ?? true;
-      const res = await saveAgentProviders(id, {
-        mcp: {
-          mode,
-          instanceIds: mode === "selected" ? selected : undefined,
-          exposeWorkspaceFs: exposeFs,
-        },
-      });
+      const res = await saveAgentProviders(id, buildMcpBindingPatch(
+        { mode: state?.mode, selected: selectedRef.current, exposeFs: state?.exposeFs },
+        patch,
+      ) as Parameters<typeof saveAgentProviders>[1]);
       setOpts(res.options);
-      const nextSelected = res.options.mcp.instances
-        .filter((i) => i.bound)
-        .map((i) => i.id);
+      const nextState = deriveMcpBinding(res.options);
+      const nextSelected = nextState.selected;
       selectedRef.current = nextSelected;
-      setState({
-        mode: res.options.mcp.mode,
-        selected: nextSelected,
-        exposeFs: res.options.mcp.exposeWorkspaceFs !== false,
-      });
+      setState(nextState as McpBindingState);
       setDetail(null);
     },
     [id, state?.mode, state?.exposeFs],

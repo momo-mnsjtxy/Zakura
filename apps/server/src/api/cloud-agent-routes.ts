@@ -27,6 +27,7 @@ import type { SkillsService } from "../services/skills/index.js";
 import { toComposerCapabilities } from "../services/cloud-agent/composer-capabilities.js";
 import { parseRouteOptions } from "../model-router/types.js";
 import { platformEvents } from "../services/platform-events.js";
+import { registerInteractionRoutes } from "./interaction-routes.js";
 
 function senderOf(session: { userId: string; email: string }) {
   if (!session.userId || session.userId === "api-key") return {};
@@ -175,6 +176,7 @@ export function registerCloudAgentRoutes(
   async function requireAgent(tenantId: string, agentId: string) {
     return agentService.get(tenantId, agentId);
   }
+  registerInteractionRoutes(app, { askUser, toolApproval, requireAgent });
 
   /** 运行中再发消息的模式：请求显式指定优先，否则用 Agent 配置（默认 steer） */
   async function resolveQueueMode(
@@ -904,79 +906,6 @@ export function registerCloudAgentRoutes(
         sessionId: c.req.param("sid"),
       });
       return c.json(result);
-    } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
-    }
-  });
-
-  /** 一等公民：回答 ask_user 卡片 */
-  app.post("/api/agents/:id/sessions/:sid/ask-user", async (c) => {
-    if (!askUser) return c.json({ error: "询问用户未启用" }, 400);
-    const session = c.get("session")!;
-    const agent = await requireAgent(session.tenantId, c.req.param("id"));
-    if (!agent) return c.json({ error: "Agent not found" }, 404);
-    const body = await c.req
-      .json<{ requestId?: string; cancelled?: boolean; selected?: unknown; text?: string }>()
-      .catch(
-        () =>
-          ({}) as {
-            requestId?: string;
-            cancelled?: boolean;
-            selected?: unknown;
-            text?: string;
-          },
-      );
-    const requestId = String(body.requestId ?? "").trim();
-    if (!requestId) return c.json({ error: "requestId required" }, 400);
-    try {
-      await askUser.resolve(session.tenantId, agent.id, c.req.param("sid"), {
-        requestId,
-        cancelled: body.cancelled === true,
-        selected: body.selected,
-        text: typeof body.text === "string" ? body.text : undefined,
-      });
-      return c.json({ ok: true });
-    } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
-    }
-  });
-
-  /** 工具调用审批：用户在审批卡上点允许 / 拒绝 */
-  app.post("/api/agents/:id/sessions/:sid/approvals", async (c) => {
-    if (!toolApproval) return c.json({ error: "工具审批未启用" }, 400);
-    const session = c.get("session")!;
-    const agent = await requireAgent(session.tenantId, c.req.param("id"));
-    if (!agent) return c.json({ error: "Agent not found" }, 404);
-    const body = await c.req
-      .json<{
-        requestId?: string;
-        decision?: string;
-        alwaysAllow?: boolean;
-        cancelled?: boolean;
-      }>()
-      .catch(
-        () =>
-          ({}) as {
-            requestId?: string;
-            decision?: string;
-            alwaysAllow?: boolean;
-            cancelled?: boolean;
-          },
-      );
-    const requestId = String(body.requestId ?? "").trim();
-    if (!requestId) return c.json({ error: "requestId required" }, 400);
-    const decision = body.cancelled === true ? "denied" : body.decision;
-    if (decision !== "approved" && decision !== "denied") {
-      return c.json({ error: "decision must be approved or denied" }, 400);
-    }
-    try {
-      await toolApproval.resolve(session.tenantId, agent.id, c.req.param("sid"), {
-        requestId,
-        decision,
-        alwaysAllow: body.alwaysAllow === true,
-        cancelled: body.cancelled === true,
-      });
-      return c.json({ ok: true });
     } catch (err) {
       return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
     }

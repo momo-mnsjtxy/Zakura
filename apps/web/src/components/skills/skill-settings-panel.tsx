@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
   Building2,
@@ -21,6 +21,8 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { api } from "@/lib/api";
+import { createActionController, createLatestRequestGate } from "@/lib/chat-state";
+import { filterCustomSkillSources } from "@/lib/integration-settings-state";
 import { cn } from "@/lib/utils";
 import {
   checkSkillUpdates,
@@ -82,25 +84,21 @@ function PluginMarketsSection() {
   const [repo, setRepo] = useState("");
   const [adding, setAdding] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const loadGate = useRef(createLatestRequestGate());
+  const mutation = useRef(createActionController());
 
   const load = useCallback(async () => {
+    const requestId = loadGate.current.begin();
     setLoading(true);
     try {
       const res = await api<{ sources: StoreSource[] }>("/api/mcp/store/sources");
       // 只展示可移除的自定义源 + 带 claude/codex 格式的
-      setSources(
-        (res.sources ?? []).filter(
-          (s) =>
-            s.removable ||
-            s.format === "claude" ||
-            s.format === "codex" ||
-            s.id.startsWith("custom:"),
-        ),
-      );
+      if (!loadGate.current.isCurrent(requestId)) return;
+      setSources(filterCustomSkillSources(res.sources) as StoreSource[]);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      if (loadGate.current.isCurrent(requestId)) setLoading(false);
     }
   }, []);
 
@@ -110,7 +108,7 @@ function PluginMarketsSection() {
 
   async function addMarket(input: string, format?: "claude" | "codex" | "auto") {
     const value = input.trim();
-    if (!value) return;
+    if (!value || !mutation.current.begin()) return;
     setAdding(true);
     try {
       await api("/api/mcp/store/sources", {
@@ -127,10 +125,12 @@ function PluginMarketsSection() {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
       setAdding(false);
+      mutation.current.finish();
     }
   }
 
   async function syncSource(id: string) {
+    if (!mutation.current.begin()) return;
     setBusyId(id);
     try {
       await api("/api/mcp/store/sync", {
@@ -143,6 +143,7 @@ function PluginMarketsSection() {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
       setBusyId(null);
+      mutation.current.finish();
     }
   }
 
@@ -153,6 +154,7 @@ function PluginMarketsSection() {
       destructive: true,
     });
     if (!ok) return;
+    if (!mutation.current.begin()) return;
     setBusyId(item.id);
     try {
       await api(`/api/mcp/store/sources/${encodeURIComponent(item.id)}`, {
@@ -164,6 +166,7 @@ function PluginMarketsSection() {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
       setBusyId(null);
+      mutation.current.finish();
     }
   }
 

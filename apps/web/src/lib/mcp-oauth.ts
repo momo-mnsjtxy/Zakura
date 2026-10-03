@@ -92,10 +92,16 @@ export function broadcastMcpOauthResult(msg: McpOauthMessage): void {
 export function listenMcpOauthCallback(
   onResult: (msg: McpOauthMessage) => void,
 ): () => void {
+  let settled = false;
+  const deliver = (msg: McpOauthMessage) => {
+    if (settled) return;
+    settled = true;
+    onResult(msg);
+  };
   const onMessage = (ev: MessageEvent) => {
     if (ev.origin && ev.origin !== window.location.origin) return;
     if (!isMcpOauthMessage(ev.data)) return;
-    onResult(ev.data);
+    deliver(ev.data);
   };
   window.addEventListener("message", onMessage);
 
@@ -105,7 +111,7 @@ export function listenMcpOauthCallback(
       channel = new BroadcastChannel(MCP_OAUTH_CHANNEL);
       channel.onmessage = (ev) => {
         if (!isMcpOauthMessage(ev.data)) return;
-        onResult(ev.data);
+        deliver(ev.data);
       };
     }
   } catch {

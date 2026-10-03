@@ -502,7 +502,7 @@ export class ToolApprovalService {
         resolvedAt: new Date(),
       })
       .where(and(eq(agentToolApprovals.id, row.id), eq(agentToolApprovals.status, "pending")))
-      .returning({ id: agentToolApprovals.id });
+      .returning();
     if (transitioned.length === 0) return;
 
     await this.store.appendEvent({

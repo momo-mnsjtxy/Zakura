@@ -326,7 +326,7 @@ export class AskUserService {
         resolvedAt: new Date(),
       })
       .where(and(eq(agentUserQuestions.id, id), eq(agentUserQuestions.status, "pending")))
-      .returning({ id: agentUserQuestions.id });
+      .returning();
     if (transitioned.length === 0) return;
 
     await this.store.appendEvent({
