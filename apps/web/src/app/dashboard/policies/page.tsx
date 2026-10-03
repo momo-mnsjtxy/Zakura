@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Plus, Trash2 } from "lucide-react";
 import { api } from "@/lib/api";
@@ -26,6 +26,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from "@/components/ui/table";
+import { createAccessGovernanceController, removeAccessRow } from "@/lib/access-governance-ui-state";
 
 type Policy = {
   id: string;
@@ -52,20 +53,28 @@ export default function PoliciesPage() {
   const [allow, setAllow] = useState("");
   const [deny, setDeny] = useState("");
   const [includeBuiltin, setIncludeBuiltin] = useState(false);
+  const requests = useRef(createAccessGovernanceController());
 
   const load = useCallback(async () => {
-    const res = await api<{
-      policies: Policy[];
-      apiKeys: ApiKeyRow[];
-      instances: InstanceRow[];
-    }>("/api/mcp/policies/bootstrap");
-    setRows(res.policies);
-    setKeys(res.apiKeys);
-    setInstances(res.instances);
+    const request = requests.current.begin("policies");
+    try {
+      const res = await api<{
+        policies: Policy[];
+        apiKeys: ApiKeyRow[];
+        instances: InstanceRow[];
+      }>("/api/mcp/policies/bootstrap");
+      if (!request.current()) return;
+      setRows(res.policies);
+      setKeys(res.apiKeys);
+      setInstances(res.instances);
+    } catch (error) {
+      if (request.current()) toast.error(error instanceof Error ? error.message : String(error));
+    }
   }, []);
 
   useEffect(() => {
     void load();
+    return () => requests.current.invalidate("policies");
   }, [load]);
 
   function openCreate() {
@@ -159,7 +168,8 @@ export default function PoliciesPage() {
                     variant="ghost"
                     onClick={async () => {
                       if (!(await confirm({ title: "删除此策略？", confirmLabel: "删除" }))) return;
-                      await api(`/api/mcp/policies/${row.id}`, { method: "DELETE" });
+                      await requests.current.runOnce(`policy:delete:${row.id}`, () => api(`/api/mcp/policies/${row.id}`, { method: "DELETE" }));
+                      setRows((current) => removeAccessRow(current, row.id));
                       toast.success("已删除");
                       await load();
                     }}
@@ -200,12 +210,12 @@ export default function PoliciesPage() {
               };
               try {
                 if (editing) {
-                  await api(`/api/mcp/policies/${editing.id}`, {
+                  await requests.current.runOnce(`policy:save:${editing.id}`, () => api(`/api/mcp/policies/${editing.id}`, {
                     method: "PUT",
                     json: payload,
-                  });
+                  }));
                 } else {
-                  await api("/api/mcp/policies", { method: "POST", json: payload });
+                  await requests.current.runOnce("policy:create", () => api("/api/mcp/policies", { method: "POST", json: payload }));
                 }
                 toast.success("已保存");
                 setOpen(false);

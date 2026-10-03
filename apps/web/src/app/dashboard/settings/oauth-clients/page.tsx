@@ -14,7 +14,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { api } from "@/lib/api";
-import { createLatestRequestGate } from "@/lib/chat-state";
+import { createAccessGovernanceController } from "@/lib/access-governance-ui-state";
 import { oauthClientGroups } from "@/lib/identity-ui-state";
 
 type InboundClient = {
@@ -58,10 +58,10 @@ export default function OauthClientsPage() {
   const [dcr, setDcr] = useState<OutboundClient[]>([]);
   const [byo, setByo] = useState<OutboundClient[]>([]);
   const [loading, setLoading] = useState(true);
-  const loadGate = useRef(createLatestRequestGate());
+  const loadGate = useRef(createAccessGovernanceController());
 
   const load = useCallback(async () => {
-    const requestId = loadGate.current.begin();
+    const request = loadGate.current.begin("oauth-clients");
     setLoading(true);
     try {
       const res = await api<{
@@ -69,20 +69,21 @@ export default function OauthClientsPage() {
         dcr: OutboundClient[];
         byo: OutboundClient[];
       }>("/api/oauth/clients");
-      if (!loadGate.current.isCurrent(requestId)) return;
+      if (!request.current()) return;
       const groups = oauthClientGroups(res);
       setInbound(groups.inbound);
       setDcr(groups.dcr);
       setByo(groups.byo);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : String(err));
+      if (request.current()) toast.error(err instanceof Error ? err.message : String(err));
     } finally {
-      if (loadGate.current.isCurrent(requestId)) setLoading(false);
+      if (request.current()) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
     void load();
+    return () => loadGate.current.invalidate("oauth-clients");
   }, [load]);
 
   const inboundSorted = useMemo(() => {

@@ -14,7 +14,12 @@ import { Mem0Client } from "../mem0-client.js";
 /** 从模型输出中解析记忆提取 JSON（容忍代码围栏与前后杂文） */
 export function parseMemoryExtraction(
   text: string,
-): Array<{ content: string; layer?: string; importance?: number; tags?: string[] }> {
+): Array<{
+  content: string;
+  layer?: string;
+  importance?: number;
+  tags?: string[];
+}> {
   let body = text.trim();
   const fence = body.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (fence?.[1]) body = fence[1].trim();
@@ -32,10 +37,17 @@ export function parseMemoryExtraction(
   }
   const arr = Array.isArray(parsed)
     ? parsed
-    : parsed && typeof parsed === "object" && Array.isArray((parsed as { memories?: unknown }).memories)
-      ? ((parsed as { memories: unknown[] }).memories)
+    : parsed &&
+        typeof parsed === "object" &&
+        Array.isArray((parsed as { memories?: unknown }).memories)
+      ? (parsed as { memories: unknown[] }).memories
       : [];
-  const out: Array<{ content: string; layer?: string; importance?: number; tags?: string[] }> = [];
+  const out: Array<{
+    content: string;
+    layer?: string;
+    importance?: number;
+    tags?: string[];
+  }> = [];
   for (const item of arr) {
     if (out.length >= 5) break;
     if (!item || typeof item !== "object") continue;
@@ -45,11 +57,14 @@ export function parseMemoryExtraction(
     out.push({
       content,
       layer:
-        typeof o.layer === "string" && (MEMORY_LAYERS as readonly string[]).includes(o.layer)
+        typeof o.layer === "string" &&
+        (MEMORY_LAYERS as readonly string[]).includes(o.layer)
           ? o.layer
           : undefined,
       importance:
-        typeof o.importance === "number" && o.importance >= 1 && o.importance <= 5
+        typeof o.importance === "number" &&
+        o.importance >= 1 &&
+        o.importance <= 5
           ? Math.round(o.importance)
           : undefined,
       tags: Array.isArray(o.tags) ? o.tags.map(String).slice(0, 6) : undefined,
@@ -70,6 +85,19 @@ export async function extractAndSaveMemories(
   },
 ): Promise<Array<{ id?: string; content: string; layer?: string }>> {
   const { tenantId, agent, cloud, resolved } = input;
+
+  // OpenViking is browsed through its own tools and has no write API here.
+  // Likewise, a local provider without its store cannot accept writes. Avoid a
+  // model call when there is no valid persistence destination.
+  if (
+    (!resolved.storesLocally && resolved.kind !== "mem0") ||
+    (resolved.storesLocally && !deps.memoryStore)
+  ) {
+    return [];
+  }
+
+  const mem0 =
+    resolved.kind === "mem0" ? Mem0Client.fromConfig(resolved.config) : null;
 
   const res = await deps.modelRouter.chat(
     tenantId,
@@ -103,50 +131,81 @@ export async function extractAndSaveMemories(
   const candidates = parseMemoryExtraction(res.content ?? "");
   if (candidates.length === 0) return [];
 
-  // 去重：与已有记忆内容（规范化后）完全一致的跳过
-  const normalize = (s: string) => s.replace(/\s+/g, "").toLowerCase();
+  // Deduplicate against persisted content and within this extraction batch.
+  // Add a candidate to `seen` before attempting it so one failing duplicate is
+  // not retried nondeterministically later in the same model response.
+  const normalize = (value: string) =>
+    value.normalize("NFKC").replace(/\s+/g, "").toLowerCase();
   const existing = new Set<string>();
   if (resolved.storesLocally && deps.memoryStore) {
-    const rows = await deps.memoryStore.list(tenantId, agent.id, { limit: 200 });
-    for (const r of rows) existing.add(normalize(r.content));
+    const rows = await deps.memoryStore.list(tenantId, agent.id, {
+      limit: 500,
+    });
+    for (const row of rows) existing.add(normalize(row.content));
+  } else if (mem0) {
+    const { memories } = await mem0.list({
+      agentId: agent.id,
+      userId:
+        typeof resolved.config.defaultUserId === "string"
+          ? resolved.config.defaultUserId
+          : "default",
+      limit: 500,
+    });
+    for (const memory of memories) {
+      const content = memory.memory ?? memory.content;
+      if (typeof content === "string" && content.trim())
+        existing.add(normalize(content));
+    }
   }
 
   const saved: Array<{ id?: string; content: string; layer?: string }> = [];
-  for (const cand of candidates) {
-    if (existing.has(normalize(cand.content))) continue;
+  const failures: unknown[] = [];
+  for (const candidate of candidates) {
+    const key = normalize(candidate.content);
+    if (existing.has(key)) continue;
+    existing.add(key);
 
-    if (resolved.storesLocally && deps.memoryStore) {
-      const base = {
-        content: cand.content,
-        layer: cand.layer ?? "fact",
-        importance: cand.importance ?? 3,
-        tags: cand.tags,
-        source: "auto",
-        providerId: resolved.provider.id,
-      };
-      const { input: withEmb } = await withEmbedding(base, resolved.config, {
-        tenantId,
-        modelRouter: deps.modelRouter,
-      });
-      const row = await deps.memoryStore.add(tenantId, agent.id, withEmb);
-      saved.push({ id: row.id, content: row.content, layer: row.layer });
-    } else if (resolved.kind === "mem0") {
-      const client = Mem0Client.fromConfig(resolved.config);
-      const item = await client.add({
-        content: cand.content,
-        agentId: agent.id,
-        userId:
-          typeof resolved.config.defaultUserId === "string"
-            ? resolved.config.defaultUserId
-            : "default",
-        metadata: { source: "auto", layer: cand.layer ?? "fact" },
-      });
-      saved.push({
-        id: typeof item?.id === "string" ? item.id : undefined,
-        content: cand.content,
-        layer: cand.layer,
-      });
+    try {
+      if (resolved.storesLocally && deps.memoryStore) {
+        const base = {
+          content: candidate.content,
+          layer: candidate.layer ?? "fact",
+          importance: candidate.importance ?? 3,
+          tags: candidate.tags,
+          source: "auto",
+          providerId: resolved.provider.id,
+        };
+        const { input: withEmb } = await withEmbedding(base, resolved.config, {
+          tenantId,
+          modelRouter: deps.modelRouter,
+        });
+        const row = await deps.memoryStore.add(tenantId, agent.id, withEmb);
+        saved.push({ id: row.id, content: row.content, layer: row.layer });
+      } else if (mem0) {
+        const item = await mem0.add({
+          content: candidate.content,
+          agentId: agent.id,
+          userId:
+            typeof resolved.config.defaultUserId === "string"
+              ? resolved.config.defaultUserId
+              : "default",
+          metadata: { source: "auto", layer: candidate.layer ?? "fact" },
+        });
+        saved.push({
+          id: typeof item?.id === "string" ? item.id : undefined,
+          content: candidate.content,
+          layer: candidate.layer,
+        });
+      }
+    } catch (error) {
+      failures.push(error);
     }
+  }
+  if (saved.length === 0 && failures.length > 0) {
+    throw new AggregateError(
+      failures,
+      "Every extracted memory failed to persist",
+    );
   }
   return saved;
 }

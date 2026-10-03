@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Loader2, Plus } from "lucide-react";
 import { api } from "@/lib/api";
@@ -20,6 +20,7 @@ import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from "@
 import { PageLoading } from "@/components/ui/progress-linear";
 import { SearchField } from "@/components/ui/search-field";
 import { useFuzzySearch } from "@/hooks/use-fuzzy-search";
+import { closeSecretReveal, createAccessGovernanceController } from "@/lib/access-governance-ui-state";
 
 type KeyRow = {
   id: string;
@@ -37,20 +38,24 @@ export default function KeysPage() {
   const [created, setCreated] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [q, setQ] = useState("");
+  const requests = useRef(createAccessGovernanceController());
   const filtered = useFuzzySearch(rows, q, { keys: ["name", "keyPrefix"] });
 
   const load = useCallback(async () => {
+    const request = requests.current.begin("keys");
     try {
-      setRows(await api<KeyRow[]>("/api/api-keys"));
+      const result = await api<KeyRow[]>("/api/api-keys");
+      if (request.current()) setRows(result);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : String(err));
+      if (request.current()) toast.error(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      if (request.current()) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
     void load();
+    return () => requests.current.invalidate("keys");
   }, [load]);
 
   return (
@@ -118,7 +123,7 @@ export default function KeysPage() {
         </>
       )}
 
-      <Dialog open={open} onOpenChange={setOpen}>
+      <Dialog open={open} onOpenChange={(next) => { setOpen(next); if (!next) { const reset = closeSecretReveal(); setCreated(reset.secret); setName("mcp"); } }}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>{created ? "Key 已创建" : "新建 Key"}</DialogTitle>
@@ -144,10 +149,10 @@ export default function KeysPage() {
                 e.preventDefault();
                 setBusy(true);
                 try {
-                  const res = await api<{ rawKey: string }>("/api/api-keys", {
+                  const res = await requests.current.runOnce("key:create", () => api<{ rawKey: string }>("/api/api-keys", {
                     method: "POST",
                     json: { name: name.trim() || "mcp" },
-                  });
+                  }));
                   setCreated(res.rawKey);
                   await load();
                 } catch (err) {
