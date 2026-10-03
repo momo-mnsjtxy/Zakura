@@ -1,5 +1,7 @@
 import type { ModelUpstreamConfig, ModelUpstreamProtocol } from "@zakura/shared";
 import { Agent, setGlobalDispatcher } from "undici";
+import { executeRetryLifecycle, isAbortError, ModelCallAbortedError } from "./lifecycle.js";
+export { isAbortError, ModelCallAbortedError } from "./lifecycle.js";
 
 /** 上游连接池：复用 TCP/TLS，避免每轮 DeepSeek 冷握手拖 TTFT */
 setGlobalDispatcher(
@@ -51,24 +53,6 @@ export class UpstreamHttpError extends Error {
  * 调用方主动中断（用户取消 Run / 父任务取消）。
  * 与网络瞬时中断区分：绝不重试、绝不故障转移，直接向上冒泡走取消收尾。
  */
-export class ModelCallAbortedError extends Error {
-  readonly aborted = true;
-  constructor(message = "调用已被取消") {
-    super(message);
-    this.name = "ModelCallAbortedError";
-  }
-}
-
-/** 是否为「调用方主动取消」引发的错误（含 cause 链） */
-export function isAbortError(err: unknown): boolean {
-  let cur: unknown = err;
-  for (let i = 0; cur && i < 6; i += 1) {
-    if (cur instanceof ModelCallAbortedError) return true;
-    if ((cur as { aborted?: unknown })?.aborted === true) return true;
-    cur = cur instanceof Error ? cur.cause : null;
-  }
-  return false;
-}
 
 /** 收集 err 及其 cause 链上的全部 message，便于匹配底层网络错误 */
 function errorChainText(err: unknown): string {
@@ -109,8 +93,6 @@ export function isRetryableModelError(err: unknown): boolean {
   return TRANSIENT_NETWORK_RE.test(errorChainText(err));
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
 /**
  * 瞬时错误自动重试：默认最多 attempts 次（含首次），指数退避。
  * shouldRetry 返回 false 时立即抛出（如流已输出增量，重试会导致重复文本）。
@@ -122,27 +104,16 @@ export async function withModelRetries<T>(
     baseDelayMs?: number;
     shouldRetry?: (err: unknown, attempt: number) => boolean;
     onRetry?: (err: unknown, attempt: number) => void;
+    signal?: AbortSignal;
   },
 ): Promise<T> {
-  const attempts = Math.max(1, opts?.attempts ?? 2);
-  const baseDelayMs = opts?.baseDelayMs ?? 300;
-  let lastErr: unknown;
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    try {
-      return await fn(attempt);
-    } catch (err) {
-      lastErr = err;
-      const retryable =
-        attempt < attempts &&
-        (opts?.shouldRetry
-          ? opts.shouldRetry(err, attempt)
-          : isRetryableModelError(err));
-      if (!retryable) throw err;
-      opts?.onRetry?.(err, attempt);
-      await sleep(baseDelayMs * attempt);
-    }
-  }
-  throw lastErr;
+  return executeRetryLifecycle(fn, {
+    attempts: opts?.attempts,
+    baseDelayMs: opts?.baseDelayMs,
+    signal: opts?.signal,
+    shouldRetry: opts?.shouldRetry ?? ((error) => isRetryableModelError(error)),
+    onRetry: opts?.onRetry,
+  });
 }
 
 export async function httpJson<T>(

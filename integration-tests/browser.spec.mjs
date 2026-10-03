@@ -7,7 +7,7 @@ test("login advances through the real UI against the local API fixture", async (
   await page.getByRole("button", { name: "使用邮箱继续" }).click();
   await expect(page.getByRole("textbox", { name: "密码", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "更换方式" }).click();
-  await expect(page.getByDisplayValue("agent@example.test")).toBeVisible();
+  await expect(page.locator("input#email")).toHaveValue("agent@example.test");
 });
 
 test("legacy dashboard aliases preserve navigation", async ({ page }) => {

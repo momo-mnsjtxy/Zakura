@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
@@ -38,6 +38,8 @@ import { useFuzzySearch } from "@/hooks/use-fuzzy-search";
 import { chatAgentHref } from "@/lib/nav";
 import { cn } from "@/lib/utils";
 import { FluidItem, FluidList } from "@/components/ui/fluid-hover";
+import { buildAgentCreateInput, agentAfterClose } from "@/lib/agent-ui-state";
+import { createActionController, createLatestRequestGate } from "@/lib/chat-state";
 
 const AGENT_KEYS = [
   { name: "name", weight: 3 },
@@ -166,6 +168,8 @@ export default function AgentsListPage() {
   const [description, setDescription] = useState("");
   const [busy, setBusy] = useState(false);
   const [q, setQ] = useState("");
+  const loadGate = useRef(createLatestRequestGate());
+  const createAction = useRef(createActionController());
   const filtered = useFuzzySearch(list, q, { keys: AGENT_KEYS });
   const spaceItems = useMemo(
     () => spaces.map((s) => ({ value: s.id, label: s.name })),
@@ -173,9 +177,11 @@ export default function AgentsListPage() {
   );
 
   const load = useCallback(async (silent = false) => {
+    const requestId = loadGate.current.begin();
     if (!silent) setLoading(true);
     try {
       const [agentRows, spaceRows] = await Promise.all([fetchAgents(), fetchSpaces()]);
+      if (!loadGate.current.isCurrent(requestId)) return;
       setList(agentRows);
       setSpaces(spaceRows);
       setSpaceId(
@@ -184,7 +190,7 @@ export default function AgentsListPage() {
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
-      if (!silent) setLoading(false);
+      if (!silent && loadGate.current.isCurrent(requestId)) setLoading(false);
     }
   }, []);
 
@@ -204,30 +210,24 @@ export default function AgentsListPage() {
   }, [list]);
 
   function resetCreate() {
-    setName("");
-    setDescription("");
-    setSpaceId(spaces.find((s) => s.isDefault)?.id ?? spaces[0]?.id ?? "");
+    const reset = agentAfterClose(spaces);
+    setName(reset.name);
+    setDescription(reset.description);
+    setSpaceId(reset.spaceId);
   }
 
   async function create() {
-    if (!name.trim()) {
-      toast.error("请填写名称");
+    const parsed = buildAgentCreateInput({ name, spaceId, description });
+    if (parsed.error) {
+      toast.error(parsed.error);
       return;
     }
-    if (!spaceId) {
-      toast.error("请选择所属空间");
-      return;
-    }
+    if (!createAction.current.begin()) return;
     setBusy(true);
     try {
       const res = await api<AgentListItem>("/api/agents", {
         method: "POST",
-        json: {
-          name: name.trim(),
-          spaceId,
-          description: description.trim() || undefined,
-          createApiKey: false,
-        },
+        json: parsed.value,
       });
       setOpen(false);
       resetCreate();
@@ -236,6 +236,7 @@ export default function AgentsListPage() {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
+      createAction.current.finish();
     }
   }
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
@@ -45,6 +45,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { splitAgentSettingsPatch } from "@/lib/agent-ui-state";
+import { createActionController, createLatestRequestGate } from "@/lib/chat-state";
+import { ErrorRecovery } from "@/components/error-recovery";
 
 const SETTINGS_CATEGORIES = [
   { id: "basic", label: "基本" },
@@ -175,8 +178,13 @@ export default function AgentSettingsPage() {
   const [state, setState] = useState<LocalState | null>(null);
   const [chatModels, setChatModels] = useState<ChatModelOption[]>([]);
   const [deleting, setDeleting] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const loadGate = useRef(createLatestRequestGate());
+  const deleteAction = useRef(createActionController());
 
   const load = useCallback(async () => {
+    const requestId = loadGate.current.begin();
+    setLoadError(null);
     try {
       const [detail, opts, cfg, models] = await Promise.all([
         refresh({ list: false }),
@@ -184,7 +192,7 @@ export default function AgentSettingsPage() {
         getCloudConfig(id),
         listChatModels(),
       ]);
-      if (!detail) return;
+      if (!detail || !loadGate.current.isCurrent(requestId)) return;
       setProviders(opts);
       setChatModels(models);
       const cloudLocal = cloudToLocal(cfg.cloud);
@@ -199,7 +207,9 @@ export default function AgentSettingsPage() {
       });
       setReady(true);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      if (loadGate.current.isCurrent(requestId)) setLoadError(message);
+      toast.error(message);
     }
   }, [id, refresh]);
 
@@ -236,10 +246,8 @@ export default function AgentSettingsPage() {
 
   const persist = useCallback(
     async (patch: SavePatch) => {
-      const agentPatch: Record<string, unknown> = {};
-      if (patch.name !== undefined) agentPatch.name = patch.name.trim() || undefined;
-      if (patch.description !== undefined) agentPatch.description = patch.description;
-      if (patch.enableMemory !== undefined) agentPatch.enableMemory = patch.enableMemory;
+      const parts = splitAgentSettingsPatch(patch);
+      const agentPatch = parts.agent as unknown as Record<string, unknown>;
 
       if (Object.keys(agentPatch).length > 0) {
         await api(`/api/agents/${id}`, {
@@ -257,86 +265,13 @@ export default function AgentSettingsPage() {
         });
       }
 
-      const providerPatch: Parameters<typeof saveAgentProviders>[1] = {};
-      if (patch.webSearchEnabled !== undefined) {
-        providerPatch.webSearch = { enabled: patch.webSearchEnabled };
-      }
-      if (patch.webFetchEnabled !== undefined) {
-        providerPatch.webFetch = { enabled: patch.webFetchEnabled };
-      }
-      if (patch.exposeWorkspaceFs !== undefined) {
-        providerPatch.mcp = { exposeWorkspaceFs: patch.exposeWorkspaceFs };
-      }
+      const providerPatch = parts.providers as Parameters<typeof saveAgentProviders>[1];
       if (Object.keys(providerPatch).length > 0) {
         const res = await saveAgentProviders(id, providerPatch);
         setProviders(res.options);
       }
 
-      const cloudPatch: Parameters<typeof saveCloudConfig>[1] = {};
-      if (patch.systemPrompt !== undefined) cloudPatch.systemPrompt = patch.systemPrompt;
-      if (patch.model !== undefined) cloudPatch.model = patch.model || null;
-      if (patch.modelRouteId !== undefined) {
-        cloudPatch.modelRouteId = patch.modelRouteId || null;
-      }
-      if (patch.compactModel !== undefined) {
-        cloudPatch.compactModel = patch.compactModel || null;
-      }
-      if (patch.compactModelRouteId !== undefined) {
-        cloudPatch.compactModelRouteId = patch.compactModelRouteId || null;
-      }
-      if (patch.autoCompact !== undefined) cloudPatch.autoCompact = patch.autoCompact;
-      if (patch.compactThresholdChars !== undefined) {
-        const n = Number(patch.compactThresholdChars);
-        cloudPatch.compactThresholdChars =
-          patch.compactThresholdChars.trim() === "" || !Number.isFinite(n) || n < 8_000
-            ? null
-            : Math.floor(n);
-      }
-      if (patch.compactSoftThresholdChars !== undefined) {
-        const n = Number(patch.compactSoftThresholdChars);
-        cloudPatch.compactSoftThresholdChars =
-          patch.compactSoftThresholdChars.trim() === "" ||
-          !Number.isFinite(n) ||
-          n < 4_000
-            ? null
-            : Math.floor(n);
-      }
-      if (patch.compactKeepRecent !== undefined) {
-        const n = Number(patch.compactKeepRecent);
-        cloudPatch.compactKeepRecent =
-          patch.compactKeepRecent.trim() === "" || !Number.isFinite(n) || n < 4
-            ? null
-            : Math.min(Math.floor(n), 64);
-      }
-      if (patch.compactKeepRecentChars !== undefined) {
-        const n = Number(patch.compactKeepRecentChars);
-        cloudPatch.compactKeepRecentChars =
-          patch.compactKeepRecentChars.trim() === "" || !Number.isFinite(n) || n < 4_000
-            ? null
-            : Math.min(Math.floor(n), 200_000);
-      }
-      if (patch.maxToolResultChars !== undefined) {
-        const n = Number(patch.maxToolResultChars);
-        cloudPatch.maxToolResultChars =
-          patch.maxToolResultChars.trim() === "" || !Number.isFinite(n) || n < 1_000
-            ? null
-            : Math.min(Math.floor(n), 80_000);
-      }
-      if (patch.enableTools !== undefined) cloudPatch.enableTools = patch.enableTools;
-      if (patch.autoMemory !== undefined) cloudPatch.autoMemory = patch.autoMemory;
-      if (patch.autoTitle !== undefined) cloudPatch.autoTitle = patch.autoTitle;
-      if (patch.maxToolRounds !== undefined) {
-        const n = Number(patch.maxToolRounds);
-        cloudPatch.maxToolRounds =
-          patch.maxToolRounds.trim() === "" || !Number.isFinite(n) || n <= 0
-            ? null
-            : Math.floor(n);
-      }
-      if (patch.maxSubagentDepth !== undefined) {
-        const n = Number(patch.maxSubagentDepth);
-        cloudPatch.maxSubagentDepth =
-          Number.isFinite(n) && n >= 1 ? Math.min(Math.floor(n), 5) : null;
-      }
+      const cloudPatch = parts.cloud as Parameters<typeof saveCloudConfig>[1];
       if (Object.keys(cloudPatch).length > 0) {
         await saveCloudConfig(id, cloudPatch);
       }
@@ -427,7 +362,7 @@ export default function AgentSettingsPage() {
     : "__follow__";
 
   async function removeAgent() {
-    if (!agent) return;
+    if (!agent || !deleteAction.current.begin()) return;
     if (
       !(await confirm({
         title: `删除 ${agent.name}？`,
@@ -435,6 +370,7 @@ export default function AgentSettingsPage() {
         confirmLabel: "删除",
       }))
     ) {
+      deleteAction.current.finish();
       return;
     }
     const purge = await confirm({
@@ -453,7 +389,18 @@ export default function AgentSettingsPage() {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
       setDeleting(false);
+      deleteAction.current.finish();
     }
+  }
+
+  if (loadError) {
+    return (
+      <ErrorRecovery
+        title="Agent 设置加载失败"
+        message={loadError}
+        onRetry={() => void load()}
+      />
+    );
   }
 
   if (!agent || !state || !ready) {

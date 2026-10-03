@@ -6,12 +6,14 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import { toast } from "sonner";
 import type { AgentDetail, AgentListItem } from "@/lib/agents";
 import { fetchAgent, fetchAgents } from "@/lib/agents";
 import { invalidateApiCache } from "@/lib/api";
+import { createLatestRequestGate } from "@/lib/chat-state";
 
 type AgentDetailContextValue = {
   id: string;
@@ -36,10 +38,12 @@ export function AgentDetailProvider({
   const [agent, setAgent] = useState<AgentDetail | null>(null);
   const [list, setList] = useState<AgentListItem[]>([]);
   const [loading, setLoading] = useState(true);
+  const loadGate = useRef(createLatestRequestGate());
 
   const refresh = useCallback(
     async (opts?: { list?: boolean }) => {
       const withList = opts?.list !== false;
+      const requestId = loadGate.current.begin();
       setLoading(true);
       try {
         invalidateApiCache(`/api/agents/${id}`);
@@ -48,6 +52,7 @@ export function AgentDetailProvider({
           fetchAgent(id),
           withList ? fetchAgents() : Promise.resolve(null),
         ]);
+        if (!loadGate.current.isCurrent(requestId)) return null;
         setAgent(detail);
         if (rows) setList(rows);
         return detail;
@@ -55,7 +60,7 @@ export function AgentDetailProvider({
         toast.error(err instanceof Error ? err.message : String(err));
         return null;
       } finally {
-        setLoading(false);
+        if (loadGate.current.isCurrent(requestId)) setLoading(false);
       }
     },
     [id],
