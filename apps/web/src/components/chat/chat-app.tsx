@@ -136,6 +136,8 @@ import {
   mergeOrderedEvent,
   prependUniqueHistory,
 } from "@/lib/chat-state";
+import { buildProjectCreateInput, removeProjectFromChatState } from "@/lib/chat-project-state";
+import { buildChatSettingsPatch } from "@/lib/chat-settings-state";
 import {
   activeSessionIds,
   othersOnProject,
@@ -1670,19 +1672,19 @@ export function ChatApp() {
 
   async function submitNewProject() {
     if (!agentId) return;
-    const name = newProjectName.trim();
-    if (!name) {
-      toast.error("请填写项目名");
+    const parsed = buildProjectCreateInput({
+      name: newProjectName,
+      description: newProjectDesc,
+      gitUrl: newProjectGit,
+      withWorkspace: newProjectWithWorkspace,
+    });
+    if (parsed.error) {
+      toast.error(parsed.error);
       return;
     }
     setNewProjectBusy(true);
     try {
-      const res = await createAgentProject(agentId, {
-        name,
-        description: newProjectDesc.trim() || undefined,
-        withWorkspace: newProjectWithWorkspace || Boolean(newProjectGit.trim()),
-        ...(newProjectGit.trim() ? { gitUrl: newProjectGit.trim() } : {}),
-      });
+      const res = await createAgentProject(agentId, parsed.value!);
       if (res.cloneError) toast.error(`项目已创建，克隆失败：${res.cloneError}`);
       else toast.success("已创建项目");
       setNewProjectOpen(false);
@@ -1713,13 +1715,15 @@ export function ChatApp() {
     if (!ok) return;
     try {
       await deleteAgentProject(agentId, slug);
-      setProjects((prev) => prev.filter((p) => p.slug !== slug));
-      setSessions((prev) => prev.map((s) => (s.project === slug ? { ...s, project: null } : s)));
-      if (activeProject === slug) setActiveProject(null);
-      if (settingsProject === slug) {
-        setSettingsProject(null);
-        setMainPane("projects");
-      }
+      const next = removeProjectFromChatState(
+        { projects, sessions, activeProject, settingsProject, mainPane },
+        slug,
+      );
+      setProjects(next.projects);
+      setSessions(next.sessions);
+      setActiveProject(next.activeProject);
+      setSettingsProject(next.settingsProject);
+      setMainPane(next.mainPane);
       toast.success("已删除项目");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
@@ -2271,21 +2275,7 @@ export function ChatApp() {
   const persistChatSettings = useCallback(
     async (patch: ChatSettingsPatch) => {
       if (!agentId) return;
-      const body: Parameters<typeof saveCloudConfig>[1] = {};
-      if (patch.systemPrompt !== undefined) body.systemPrompt = patch.systemPrompt;
-      if (patch.enableTools !== undefined) body.enableTools = patch.enableTools;
-      if (patch.autoMemory !== undefined) body.autoMemory = patch.autoMemory;
-      if (patch.autoTitle !== undefined) body.autoTitle = patch.autoTitle;
-      if (patch.followUpMode !== undefined) body.followUpMode = patch.followUpMode;
-      if (patch.maxSubagentDepth !== undefined) {
-        const n = Number(patch.maxSubagentDepth);
-        body.maxSubagentDepth =
-          Number.isFinite(n) && n >= 1 ? Math.min(Math.floor(n), 5) : null;
-      }
-      if (patch.approvalsPolicy !== undefined) {
-        // 只带 policy：服务端按 key 合并，不覆盖规则 / AI 门控
-        body.approvals = { policy: patch.approvalsPolicy };
-      }
+      const body = buildChatSettingsPatch(patch) as Parameters<typeof saveCloudConfig>[1];
       await saveCloudConfig(agentId, body);
     },
     [agentId],

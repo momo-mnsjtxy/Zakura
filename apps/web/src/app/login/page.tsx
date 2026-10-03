@@ -10,6 +10,12 @@ import { AuthField, AuthFooter, AuthScreen } from "@/components/auth-screen";
 import { OauthProviderIcon } from "@/components/oauth-provider-icon";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  createActionLock,
+  loginCapabilities,
+  readLoginIntent,
+  resolveEmailDiscovery,
+} from "@/lib/auth-flow";
 
 type OauthProvider = { id: string; name: string; enabled: boolean };
 type Mode = "signin" | "register";
@@ -48,26 +54,24 @@ export default function LoginPage() {
   const [highlightedMethod, setHighlightedMethod] = useState("auto");
   const [platformReady, setPlatformReady] = useState(false);
   const passkeyTried = useRef(false);
+  const emailAction = useRef(createActionLock());
 
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    if (params.get("suspended") === "1") {
-      setSuspendNotice(params.get("reason")?.trim() || "账号已被封禁");
-    }
-    const preset = params.get("email")?.trim();
-    if (preset) setEmail(preset);
-    if (params.get("mode") === "register") setMode("register");
+    const intent = readLoginIntent(window.location.search);
+    setSuspendNotice(intent.suspendedReason);
+    if (intent.email) setEmail(intent.email);
+    setMode(intent.mode as Mode);
   }, []);
 
   useEffect(() => {
     void api<PlatformInfo>("/api/platform")
       .then((p) => {
-        setOauthProviders((p.oauthProviders ?? []).filter((x) => x.enabled));
-        const pwd = p.passwordLoginEnabled !== false;
-        setPasswordLoginEnabled(pwd);
-        setRegistrationEnabled(!!(p.registrationEnabled || (p.edition === "saas" && pwd)));
-        setHighlightedMethod(p.highlightedLoginMethod || "auto");
-        if (!(p.registrationEnabled || (p.edition === "saas" && pwd))) {
+        const capabilities = loginCapabilities(p);
+        setOauthProviders(capabilities.oauthProviders);
+        setPasswordLoginEnabled(capabilities.passwordLoginEnabled);
+        setRegistrationEnabled(capabilities.registrationEnabled);
+        setHighlightedMethod(capabilities.highlightedMethod);
+        if (!capabilities.registrationEnabled) {
           setMode((current) => (current === "register" ? "signin" : current));
         }
       })
@@ -122,7 +126,7 @@ export default function LoginPage() {
 
   async function continueFromEmail() {
     const trimmed = email.trim();
-    if (!trimmed) return;
+    if (!trimmed || !emailAction.current.acquire()) return;
     setLoading(true);
     setNotice(null);
     try {
@@ -130,25 +134,14 @@ export default function LoginPage() {
         method: "POST",
         json: { email: trimmed },
       });
-      const hint = found.sso && found.protocol
-        ? { protocol: found.protocol, tenantSlug: found.tenantSlug }
-        : null;
-      setSsoHint(hint);
-
-      if (found.required && hint) {
-        await startSso(hint);
+      const decision = resolveEmailDiscovery(found, { passwordLoginEnabled, oauthProviders });
+      setSsoHint(decision.hint);
+      if (decision.action === "sso" && decision.hint) {
+        await startSso(decision.hint);
         return;
       }
-      if (found.required && !hint) {
-        setNotice("该邮箱需通过公司 SSO 登录，请联系管理员完成配置。");
-        return;
-      }
-      if (hint && !passwordLoginEnabled) {
-        await startSso(hint);
-        return;
-      }
-      if (!passwordLoginEnabled && !hint) {
-        setNotice(oauthProviders.length ? "请使用上方方式登录。" : "当前没有可用的登录方式，请联系管理员。");
+      if (decision.action === "notice") {
+        setNotice(decision.message ?? null);
         return;
       }
       go("password");
@@ -157,6 +150,7 @@ export default function LoginPage() {
       else toast.error("无法确认登录方式，请稍后重试");
     } finally {
       setLoading(false);
+      emailAction.current.release();
     }
   }
 

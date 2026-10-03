@@ -159,3 +159,5 @@ export type {
 } from "./observability/index.js";
 
 export * from "./docker-mux.js";
+
+export * from "./runner-stream.js";

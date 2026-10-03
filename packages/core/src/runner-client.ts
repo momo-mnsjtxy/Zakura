@@ -16,6 +16,7 @@ import type {
   WorkspaceFsEntry,
 } from "./workspace-fs.js";
 import type { ShellJobSnapshot } from "./shell-job.js";
+import { openRunnerDuplex } from "./runner-stream.js";
 
 export type HubRpc = {
   rpc<T = unknown>(method: string, params?: unknown, timeoutMs?: number): Promise<T>;
@@ -516,70 +517,22 @@ export class RunnerClient {
   async startStdio(
     spaceId: string,
     command: string[],
-    opts?: { workingDir?: string; env?: Record<string, string>; dockerId?: string; attach?: boolean },
-  ): Promise<{
-    writable: WritableStream<Uint8Array>;
-    readable: ReadableStream<Uint8Array>;
-    kill: () => Promise<void>;
-    onStderr: (fn: (chunk: string) => void) => () => void;
-  }> {
+    opts?: { workingDir?: string; env?: Record<string, string>; dockerId?: string; attach?: boolean; signal?: AbortSignal; timeoutMs?: number },
+  ) {
     let dockerId = opts?.dockerId;
     if (!dockerId && this.workspaceKind !== "host") {
       dockerId = (await this.getWorkspace(spaceId))?.dockerId;
       if (!dockerId) throw new Error("工作区容器未运行");
     }
-    const method = opts?.attach
-      ? "docker.attach"
-      : dockerId
-        ? "docker.exec.start"
-        : "host.pty.start";
-    const started = await this.rpc<{ id: string }>(method, {
-      id: dockerId,
-      spaceId,
-      command,
-      workingDir: opts?.workingDir,
-      env: opts?.env,
+    return openRunnerDuplex({
+      hub: this.hub,
+      startMethod: opts?.attach ? "docker.attach" : dockerId ? "docker.exec.start" : "host.pty.start",
+      startParams: { id: dockerId, spaceId, command, workingDir: opts?.workingDir, env: opts?.env },
+      writeMethod: dockerId ? "docker.exec.write" : "host.pty.write",
+      closeMethod: dockerId ? "docker.exec.close" : "host.pty.close",
+      signal: opts?.signal,
+      timeoutMs: opts?.timeoutMs,
     });
-    const streamId = started.id;
-    const stderrListeners = new Set<(chunk: string) => void>();
-    let closed = false;
-    const readable = new ReadableStream<Uint8Array>({
-      start: (controller) => {
-        this.hub.onStream?.(streamId, (chan, data) => {
-          if (chan === "stdout" && data.length) controller.enqueue(new Uint8Array(data));
-          if (chan === "stderr" && data.length) {
-            const text = data.toString("utf8");
-            for (const fn of stderrListeners) fn(text);
-          }
-          if (chan === "exit" && !closed) {
-            closed = true;
-            try {
-              controller.close();
-            } catch {
-              /* ignore */
-            }
-          }
-        });
-      },
-    });
-    const writeMethod = dockerId ? "docker.exec.write" : "host.pty.write";
-    const closeMethod = dockerId ? "docker.exec.close" : "host.pty.close";
-    const writable = new WritableStream<Uint8Array>({
-      write: async (chunk) => {
-        await this.rpc(writeMethod, { id: streamId, base64: Buffer.from(chunk).toString("base64") });
-      },
-    });
-    return {
-      writable,
-      readable,
-      kill: async () => {
-        await this.rpc(closeMethod, { id: streamId }).catch(() => undefined);
-      },
-      onStderr: (fn) => {
-        stderrListeners.add(fn);
-        return () => stderrListeners.delete(fn);
-      },
-    };
   }
 
   async listDetailed(spaceId: string, path: string): Promise<ListDetailedResult> {

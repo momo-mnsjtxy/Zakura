@@ -315,10 +315,16 @@ export class PlatformEventBus {
       set = new Set();
       this.listeners.set(tenantId, set);
     }
-    set.add(listener);
+    // One logical subscription gets one unique entry even when a caller reuses
+    // the same callback. This keeps local delivery and Redis ref-counts aligned.
+    const subscription: Listener = (event) => listener(event);
+    set.add(subscription);
     void this.ensureRemote(tenantId);
+    let active = true;
     return () => {
-      set!.delete(listener);
+      if (!active) return;
+      active = false;
+      set!.delete(subscription);
       if (set!.size === 0) this.listeners.delete(tenantId);
       void this.releaseRemote(tenantId);
     };

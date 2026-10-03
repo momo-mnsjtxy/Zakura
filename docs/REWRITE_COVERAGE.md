@@ -31,13 +31,13 @@ Generated build output is excluded. These counts prevent a carried-over compatib
 
 | Scope | Baseline-identical files | Changed files | Added files | Missing files |
 |---|---:|---:|---:|---:|
-| `apps/server` | 521 | 2 | 9 | 0 |
-| `packages/saas` | 13 | 0 | 4 | 0 |
-| `apps/web` | 292 | 6 | 17 | 0 |
-| `packages/core` | 40 | 3 | 5 | 0 |
+| `apps/server` | 516 | 7 | 11 | 0 |
+| `packages/saas` | 13 | 0 | 3 | 0 |
+| `apps/web` | 290 | 8 | 22 | 0 |
+| `packages/core` | 39 | 4 | 6 | 0 |
 | `go` | 43 | 3 | 3 | 0 |
 | `apps/oauth-bridge` | 1 | 3 | 8 | 0 |
 | `mcps` | 128 | 0 | 0 | 0 |
-| `packages/shared` | 53 | 0 | 4 | 0 |
+| `packages/shared` | 53 | 0 | 3 | 0 |
 
 The large baseline-identical counts mean the repository is currently a compatibility-preserving foundation plus targeted architectural rewrites. It is not yet a complete rewrite of all business logic. Follow `MIGRATION_PLAN.md` stage by stage until the remaining logic has been replaced and every acceptance gate is green.

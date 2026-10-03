@@ -8,6 +8,7 @@
 | Host workspace confinement | `internal/host/jail.go` validates control-plane `spaceId`; RPC roots can no longer be supplied by callers | traversal/root-override regression in `internal/rpc/fs_paths_test.go` |
 | OAuth process architecture | `apps/oauth-bridge/src/app.ts`, `state.ts`, and `index.ts` separate HTTP protocol, expiring state, and socket lifecycle | TypeScript typecheck/build; 4/4 local OAuth/state tests passed |
 | OAuth authorization safety | Downstream PKCE S256, callback policy, delayed one-time-code consumption | `apps/oauth-bridge/test/oauth-bridge.test.ts` and `state.test.ts` |
+| Runner duplex lifecycle | `packages/core/src/runner-stream.ts` owns start/write/exit/cancel/kill, idempotent close, subscription cleanup, late-start recovery, timeout forwarding, and binary wire encoding | core typecheck/build; 5/5 deterministic fake-hub lifecycle tests |
 | Core Docker transport | `packages/core/src/docker-mux.ts` isolates fragmented text frames and binary-safe frames; old export remains compatible | core typecheck/build; 17 focused shell-job/stdio transport tests passed via the tsx loader; direct mux checks passed |
 
 ## Intentionally preserved for compatibility

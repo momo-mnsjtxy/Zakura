@@ -5,13 +5,13 @@
 import { and, eq } from "drizzle-orm";
 import {
   AGENT_PROJECTS_DIR,
-  isValidProjectSlug,
   projectSlugsFromList,
   projectWorkspacePath,
 } from "@zakura/shared";
 import type { WorkspaceFs } from "@zakura/core";
 import type { Db } from "../db/client.js";
 import { newId, spaceProjects, type SpaceProjectRow } from "../db/schema.js";
+import { planProjectWorkspaceReconciliation } from "./project-reconciliation.js";
 
 export type AgentProjectDto = {
   slug: string;
@@ -138,33 +138,15 @@ export async function syncProjectsFromWorkspace(
   slugs: string[],
 ): Promise<void> {
   const rows = await listSpaceProjectRows(db, spaceId);
-  const have = new Set(rows.map((r) => r.slug));
-  const disk = new Set(slugs);
-  for (const slug of slugs) {
-    if (!isValidProjectSlug(slug)) continue;
-    if (!have.has(slug)) {
-      await upsertSpaceProject(db, {
-        tenantId,
-        spaceId,
-        slug,
-        hasWorkspace: true,
-      });
-    } else {
-      const row = rows.find((r) => r.slug === slug);
-      if (row && !row.hasWorkspace) {
-        await upsertSpaceProject(db, { tenantId, spaceId, slug, hasWorkspace: true });
-      }
-    }
+  const plan = planProjectWorkspaceReconciliation(rows, slugs);
+  for (const slug of plan.create) {
+    await upsertSpaceProject(db, { tenantId, spaceId, slug, hasWorkspace: true });
   }
-  for (const row of rows) {
-    if (row.hasWorkspace && !disk.has(row.slug)) {
-      await upsertSpaceProject(db, {
-        tenantId,
-        spaceId,
-        slug: row.slug,
-        hasWorkspace: false,
-      });
-    }
+  for (const slug of plan.enable) {
+    await upsertSpaceProject(db, { tenantId, spaceId, slug, hasWorkspace: true });
+  }
+  for (const slug of plan.disable) {
+    await upsertSpaceProject(db, { tenantId, spaceId, slug, hasWorkspace: false });
   }
 }
 

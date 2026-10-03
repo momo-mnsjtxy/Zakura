@@ -53,6 +53,25 @@ describe("platformEvents bus", () => {
     unsub();
     assert.equal(platformEvents.hasListeners("tenant-d"), false);
   });
+
+  it("tracks duplicate callbacks as independent idempotent subscriptions", () => {
+    const got: PlatformEvent[] = [];
+    const listener = (event: PlatformEvent) => got.push(event);
+    const first = platformEvents.subscribe("tenant-duplicate", listener);
+    const second = platformEvents.subscribe("tenant-duplicate", listener);
+
+    platformEvents.publish("tenant-duplicate", { type: "runner_node", nodeId: "n1" });
+    assert.equal(got.length, 2);
+
+    first();
+    first();
+    assert.equal(platformEvents.hasListeners("tenant-duplicate"), true);
+    platformEvents.publish("tenant-duplicate", { type: "runner_node", nodeId: "n2" });
+    assert.equal(got.length, 3);
+
+    second();
+    assert.equal(platformEvents.hasListeners("tenant-duplicate"), false);
+  });
 });
 
 describe("agent progress publishing", () => {

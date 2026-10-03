@@ -15,6 +15,7 @@ import { api, setSession } from "@/lib/api";
 import { fetchAgentProviders, saveAgentProviders } from "@/lib/agents";
 import { cn } from "@/lib/utils";
 import { BrandMark } from "@/components/brand-mark";
+import { isUnauthorizedOnboardingError, moveOnboarding } from "@/lib/onboarding-flow";
 
 const START_PROMPT = "请简要介绍你能为我做什么，以及现在已经具备哪些能力。";
 
@@ -104,7 +105,7 @@ export default function TenantOnboardingPage() {
       setConfiguredUpstream(chatRoute?.upstream ?? null);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      if (message.toLowerCase().includes("unauthorized") || message.includes("401")) {
+      if (isUnauthorizedOnboardingError(err)) {
         setSession(null);
         router.replace("/login");
         return;
@@ -126,8 +127,9 @@ export default function TenantOnboardingPage() {
   }, [router]);
 
   function moveTo(next: OnboardingStep, direction: "forward" | "back" = "forward") {
-    setStepDirection(direction);
-    setStep(next);
+    const transition = moveOnboarding({ step, direction: stepDirection }, next, direction);
+    setStepDirection(transition.direction);
+    setStep(transition.step);
   }
 
   const finishOnboarding = useCallback(
