@@ -14,7 +14,7 @@
 | **SaaS 托管** | 付费租户 | Zakura 已验证的窄 scope App |
 | **公开匿名** | ❌ 不推荐 | — |
 
-## 最小 API（草图）
+## API
 
 ```
 GET  /.well-known/oauth-authorization-server
@@ -29,9 +29,7 @@ GET  /health
 
 ```
 BRIDGE_PUBLIC_URL=https://oauth-bridge.example.com
-BRIDGE_SECRET=...                       # 签名 state / 会话
-
-# BYO（默认）：每个租户在请求时带自己的凭证；或
+# BYO / 单租户部署使用预注册凭证
 GOOGLE_CLIENT_ID=
 GOOGLE_CLIENT_SECRET=
 GOOGLE_SCOPES=openid email https://www.googleapis.com/auth/drive.readonly
@@ -44,7 +42,9 @@ GOOGLE_SCOPES=openid email https://www.googleapis.com/auth/drive.readonly
 1. Zakura 上游 OAuth 的 `authorization_servers` 指向本服务（或安装流直接跳转 bridge）
 2. Bridge 完成 Google 授权后，把 access_token 写回 Zakura 实例（callback 到 Zakura）或作为代理持有 token
 
-当前仓库仅提供可运行骨架；完整 Google 验证与 token 代理属后续合规专项。
+适配器实现了上游 PKCE、下游 PKCE S256、一次性授权码、state 过期清理和安全回调地址校验。自动测试使用本地请求，不调用 Google。真实 Google 授权仍需部署者配置自己的 OAuth App，并完成 Google 所需的验证；仓库测试不代表真实凭证或生产部署已验证。
+
+当前 state 与授权码存储在进程内，适合单实例 BYO 部署。多实例部署前应接入共享的加密短期存储。
 
 ## 本地启动
 

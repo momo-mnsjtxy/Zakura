@@ -7,40 +7,42 @@ import postgres from "postgres";
 import { drizzle as drizzlePg } from "drizzle-orm/postgres-js";
 import { migrate as migratePg } from "drizzle-orm/postgres-js/migrator";
 import { log } from "@zakura/core";
-import { resolveDbKind } from "./client.js";
 import { createPglite } from "./pglite.js";
+import { resolveDatabaseTarget } from "./location.js";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const migrationsFolder = resolve(root, "drizzle");
 
 export async function runMigrations(databaseUrl: string): Promise<void> {
-  const kind = resolveDbKind(databaseUrl);
+  const target = resolveDatabaseTarget(databaseUrl, resolve(root, "../../data"));
+  const kind = target.kind;
   log.info("db.migrate_start", { db_kind: kind });
 
   if (kind === "pglite") {
-    let dir = databaseUrl.replace(/^pglite:/i, "").replace(/^file:/i, "");
-    if (!dir || dir === ":memory:") {
-      dir = resolve(root, "../../data/pglite");
-    } else {
-      dir = resolve(dir);
-    }
+    const dir = target.dataDir;
     mkdirSync(dir, { recursive: true });
     const client = await createPglite(dir);
-    const db = drizzle(client);
-    await migrate(db, { migrationsFolder });
-    await client.close();
+    try {
+      const db = drizzle(client);
+      await migrate(db, { migrationsFolder });
+    } finally {
+      await client.close();
+    }
   } else {
-    const sql = postgres(databaseUrl, { max: 1 });
-    await sql`CREATE EXTENSION IF NOT EXISTS vector`.catch(() => {
-      log.warn("db.extension_unavailable", { extension: "vector" });
-    });
-    // 会话标题模糊搜索用；装不上（托管库未提供 / 权限不足）时搜索自动回退 ILIKE
-    await sql`CREATE EXTENSION IF NOT EXISTS pg_trgm`.catch(() => {
-      log.warn("db.extension_unavailable", { extension: "pg_trgm" });
-    });
-    const db = drizzlePg(sql);
-    await migratePg(db, { migrationsFolder });
-    await sql.end({ timeout: 5 });
+    const sql = postgres(target.url, { max: 1 });
+    try {
+      await sql`CREATE EXTENSION IF NOT EXISTS vector`.catch(() => {
+        log.warn("db.extension_unavailable", { extension: "vector" });
+      });
+      // 会话标题模糊搜索用；装不上（托管库未提供 / 权限不足）时搜索自动回退 ILIKE
+      await sql`CREATE EXTENSION IF NOT EXISTS pg_trgm`.catch(() => {
+        log.warn("db.extension_unavailable", { extension: "pg_trgm" });
+      });
+      const db = drizzlePg(sql);
+      await migratePg(db, { migrationsFolder });
+    } finally {
+      await sql.end({ timeout: 5 });
+    }
   }
 
   log.info("db.migrate_ok", { db_kind: kind });

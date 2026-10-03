@@ -47,3 +47,27 @@ func TestWorkspaceFsPathAliases(t *testing.T) {
 		}
 	}
 }
+
+func TestWorkspaceFsRejectsSpaceIDTraversalAndRootOverride(t *testing.T) {
+	storage := t.TempDir()
+	h := New("computer", storage)
+	outside := filepath.Join(storage, "outside.txt")
+	params, _ := json.Marshal(map[string]string{
+		"spaceId": "../../..",
+		"root":    filepath.Dir(outside),
+		"path":    filepath.Base(outside),
+		"content": "escaped",
+	})
+	var response Msg
+	h.Dispatch(context.Background(), Msg{ID: "fs", Method: "host.fs.write", Params: params}, func(msg Msg) { response = msg })
+	if response.Error != "" {
+		t.Fatalf("safe invalid workspace should remain usable: %s", response.Error)
+	}
+	if _, err := os.Stat(outside); !os.IsNotExist(err) {
+		t.Fatalf("untrusted spaceId/root escaped storage jail: %v", err)
+	}
+	safe := filepath.Join(storage, "spaces", "_invalid-space-id_", "workspace", "outside.txt")
+	if data, err := os.ReadFile(safe); err != nil || string(data) != "escaped" {
+		t.Fatalf("invalid ID was not contained in quarantine workspace: %q, %v", data, err)
+	}
+}

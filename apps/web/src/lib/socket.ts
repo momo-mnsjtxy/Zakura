@@ -16,6 +16,7 @@
  * onopen 时重新求值，因此 token 轮换、首帧尚无 token 的场景都能自愈。
  */
 import { io, type Socket } from "socket.io-client";
+import { getSession, SESSION_CHANGED_EVENT } from "./api-session";
 
 /** 最后一个持有者归还后的宽限期：避免路由切换 / StrictMode 双挂载反复重连 */
 const IDLE_GRACE_MS = 5_000;
@@ -26,8 +27,7 @@ let idleTimer: ReturnType<typeof setTimeout> | null = null;
 let listenersBound = false;
 
 function getToken(): string {
-  if (typeof window === "undefined") return "";
-  return localStorage.getItem("zakura_session") ?? "";
+  return getSession() ?? "";
 }
 
 function bindGlobalListeners() {
@@ -35,7 +35,7 @@ function bindGlobalListeners() {
   listenersBound = true;
 
   // 登录/登出换 token：断开即可，auth 是函数形式，重连时自动读到新 token
-  window.addEventListener("zakura_session_changed", () => {
+  window.addEventListener(SESSION_CHANGED_EVENT, () => {
     if (!socket) return;
     socket.disconnect();
     if (refCount > 0) socket.connect();

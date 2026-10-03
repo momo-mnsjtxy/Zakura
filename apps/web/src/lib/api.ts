@@ -1,5 +1,10 @@
 "use client";
 
+import { requestJson } from "./api-transport";
+
+export { ApiError } from "./api-error";
+export { getSession, setSession } from "./api-session";
+
 const API_BASE = "";
 
 export type PlatformInfo = {
@@ -35,30 +40,6 @@ const inflight = new Map<string, Promise<unknown>>();
 const responseCache = new Map<string, CacheEntry>();
 const DEFAULT_GET_TTL_MS = 2000;
 
-export function getSession(): string | null {
-  if (typeof window === "undefined") return null;
-  return localStorage.getItem("zakura_session");
-}
-
-export function setSession(token: string | null) {
-  if (token) localStorage.setItem("zakura_session", token);
-  else localStorage.removeItem("zakura_session");
-  if (typeof window !== "undefined") {
-    window.dispatchEvent(new Event("zakura_session_changed"));
-  }
-}
-
-export class ApiError extends Error {
-  constructor(
-    message: string,
-    public readonly status: number,
-    public readonly body: Record<string, unknown> = {},
-  ) {
-    super(message);
-    this.name = "ApiError";
-  }
-}
-
 /** 清除 GET 响应缓存。传 path 前缀时仅清除匹配项（如 `/api/agents`）。 */
 export function invalidateApiCache(pathPrefix?: string) {
   if (!pathPrefix) {
@@ -75,47 +56,8 @@ function requestKey(method: string, path: string) {
 }
 
 async function executeRequest<T>(path: string, init?: ApiInit): Promise<T> {
-  const headers = new Headers(init?.headers);
-  headers.set("Accept", "application/json");
-  const session = getSession();
-  if (session) headers.set("Authorization", `Bearer ${session}`);
-  let body = init?.body;
-  if (init?.json !== undefined) {
-    headers.set("Content-Type", "application/json");
-    body = JSON.stringify(init.json);
-  }
   const { json: _json, cacheTtlMs: _ttl, ...fetchInit } = init ?? {};
-  const res = await fetch(`${API_BASE}${path}`, { ...fetchInit, headers, body });
-  const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-  if (!res.ok) {
-    // 封号后旧会话仍能过签名校验，但中间件会回 403；清掉本地 token 并踢回登录页。
-    if (
-      typeof window !== "undefined" &&
-      res.status === 403 &&
-      data.code === "account_suspended" &&
-      !window.location.pathname.startsWith("/login")
-    ) {
-      setSession(null);
-      const reason =
-        typeof data.error === "string" ? data.error : "账号或所在团队已被封禁";
-      const next = `/login?suspended=1&reason=${encodeURIComponent(reason)}`;
-      window.location.replace(next);
-    }
-    if (res.status >= 500 && typeof window !== "undefined") {
-      void import("./otel").then(({ reportClientError }) => {
-        reportClientError("client.api", typeof data.error === "string" ? data.error : `HTTP ${res.status}`, {
-          kind: "api",
-          status_class: "5xx",
-        });
-      });
-    }
-    throw new ApiError(
-      typeof data.error === "string" ? data.error : `HTTP ${res.status}`,
-      res.status,
-      data,
-    );
-  }
-  return data as T;
+  return requestJson<T>(`${API_BASE}${path}`, { ...fetchInit, json: init?.json });
 }
 
 export async function api<T = unknown>(path: string, init?: ApiInit): Promise<T> {

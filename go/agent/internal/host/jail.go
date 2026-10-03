@@ -68,7 +68,30 @@ func ScrubHostPathsInMessage(root, message string) string {
 }
 
 func SpaceWorkspace(storageRoot, spaceID string) string {
+	// spaceID crosses the control-plane/agent trust boundary.  Never let it
+	// participate in path resolution: a compromised or buggy control plane must
+	// not be able to turn "../../..." into an arbitrary host filesystem root.
+	// Valid IDs are deliberately conservative and match the IDs emitted by the
+	// server.  Invalid values are mapped to a harmless, non-colliding directory;
+	// callers will see normal not-found errors without learning host paths.
+	if !safeSpaceID(spaceID) {
+		spaceID = "_invalid-space-id_"
+	}
 	return filepath.Join(storageRoot, "spaces", spaceID, "workspace")
+}
+
+func safeSpaceID(value string) bool {
+	if value == "" || len(value) > 128 {
+		return false
+	}
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '-' || r == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func EnsureDir(path string) error {

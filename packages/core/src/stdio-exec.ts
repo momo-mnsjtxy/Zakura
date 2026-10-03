@@ -2,7 +2,7 @@
  * 非 TTY、双向 stdin/stdout：给 ACP JSON-RPC 用。
  * stdout/stderr 走 Docker multiplex；stdin 可写。
  */
-import { DockerMuxBinaryParser } from "./shell-job.js";
+import { DockerMuxBinaryParser } from "./docker-mux.js";
 
 export type StdioInspect = () => Promise<{ ExitCode?: number | null; Running?: boolean; Pid?: number }>;
 

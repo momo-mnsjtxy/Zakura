@@ -1,11 +1,12 @@
 import { mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname } from "node:path";
 import { drizzle as drizzlePglite } from "drizzle-orm/pglite";
 import { drizzle as drizzlePg } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
 import * as schema from "./schema.js";
 import { log } from "@zakura/core";
 import { createPglite } from "./pglite.js";
+import { resolveDatabaseTarget } from "./location.js";
 
 export type Db =
   | ReturnType<typeof drizzlePglite<typeof schema>>
@@ -30,37 +31,23 @@ export interface DbHandle {
  * - `postgresql://...` | `postgres://...` → remote Postgres
  */
 export function resolveDbKind(databaseUrl: string): DbKind {
-  const url = databaseUrl.trim();
-  if (!url || url.startsWith("pglite:") || url.startsWith("file:")) {
-    return "pglite";
-  }
-  if (/^postgres(ql)?:\/\//i.test(url)) {
-    return "postgres";
-  }
-  throw new Error(
-    `Unsupported DATABASE_URL. Use pglite:/path, file:/path, or postgresql://... Got: ${url.slice(0, 48)}`,
-  );
+  return resolveDatabaseTarget(databaseUrl, ".").kind;
 }
 
-function pgliteDataDir(databaseUrl: string, fallbackDataDir: string): string {
-  const url = databaseUrl.trim();
-  if (url.startsWith("pglite:") || url.startsWith("file:")) {
-    const raw = url.replace(/^(pglite|file):/i, "");
-    if (raw && raw !== ":memory:") {
-      return resolve(raw.replace(/^\/\//, ""));
-    }
-  }
-  return resolve(fallbackDataDir, "pglite");
+function onceAsync(action: () => Promise<void>): () => Promise<void> {
+  let closing: Promise<void> | undefined;
+  return () => (closing ??= action());
 }
 
 export async function createDb(opts: {
   databaseUrl: string;
   dataDir: string;
 }): Promise<DbHandle> {
-  const kind = resolveDbKind(opts.databaseUrl);
+  const target = resolveDatabaseTarget(opts.databaseUrl, opts.dataDir);
+  const kind = target.kind;
 
   if (kind === "pglite") {
-    const dir = pgliteDataDir(opts.databaseUrl, opts.dataDir);
+    const dir = target.dataDir;
     mkdirSync(dirname(dir), { recursive: true });
     mkdirSync(dir, { recursive: true });
     const client = await createPglite(dir);
@@ -68,13 +55,11 @@ export async function createDb(opts: {
     return {
       db,
       kind,
-      close: async () => {
-        await client.close();
-      },
+      close: onceAsync(() => client.close()),
     };
   }
 
-  const sql = postgres(opts.databaseUrl, { max: 10, connect_timeout: 10 });
+  const sql = postgres(target.url, { max: 10, connect_timeout: 10 });
   // Ensure pgvector is available on managed Postgres (no-op if already installed)
   await sql`CREATE EXTENSION IF NOT EXISTS vector`.catch(() => {
     log.warn("db.extension_unavailable", { extension: "vector" });
@@ -83,9 +68,7 @@ export async function createDb(opts: {
   return {
     db,
     kind,
-    close: async () => {
-      await sql.end({ timeout: 5 });
-    },
+    close: onceAsync(() => sql.end({ timeout: 5 })),
   };
 }
 

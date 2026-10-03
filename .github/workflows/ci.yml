@@ -1,0 +1,73 @@
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      REDIS_URL: redis://127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+  go-agent:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go/agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/agent/go.mod
+          cache-dependency-path: go/agent/go.sum
+      - run: go test ./...
+      - run: go vet ./...
+  browser-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @zakura/shared build
+      - run: pnpm --filter @zakura/web build
+      - run: pnpm dlx playwright@1.58.2 install --with-deps chromium
+      - name: Start local fixture and web app
+        run: |
+          node integration-tests/fake-api.mjs > /tmp/zakura-fake-api.log 2>&1 &
+          ZAKURA_API_URL=http://127.0.0.1:8787 pnpm --filter @zakura/web start > /tmp/zakura-web.log 2>&1 &
+          for i in {1..60}; do
+            curl -fsS http://127.0.0.1:3001/login >/dev/null && exit 0
+            sleep 1
+          done
+          cat /tmp/zakura-fake-api.log /tmp/zakura-web.log
+          exit 1
+      - run: pnpm dlx playwright@1.58.2 test integration-tests/browser.spec.mjs --workers=1 --reporter=line

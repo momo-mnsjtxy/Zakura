@@ -36,46 +36,17 @@ func (h *Handler) workspace(spaceID string) string {
 }
 
 func (h *Handler) Dispatch(ctx context.Context, msg Msg, send func(Msg)) {
+	if handled, result, err := h.dispatchSystem(ctx, msg, send); handled {
+		h.reply(msg, result, err, send)
+		return
+	}
+	if handled, result, err := h.dispatchFilesystem(msg); handled {
+		h.reply(msg, result, err, send)
+		return
+	}
 	var err error
 	var result any
 	switch msg.Method {
-	case "sys.info":
-		var p struct {
-			Light bool `json:"light"`
-		}
-		_ = json.Unmarshal(msg.Params, &p)
-		if p.Light {
-			result = sys.VersionInfo()
-		} else {
-			result = sys.Collect(h.Kind, h.StorageRoot)
-		}
-	case "sys.update":
-		var p sys.UpdateParams
-		if err = json.Unmarshal(msg.Params, &p); err != nil {
-			break
-		}
-		var progress func(sys.UpdateProgress)
-		if p.ProgressStream != "" {
-			progress = func(event sys.UpdateProgress) {
-				data, _ := json.Marshal(event)
-				send(Msg{Type: "stream", Stream: p.ProgressStream, Chan: "progress", Data: base64.StdEncoding.EncodeToString(data)})
-			}
-		}
-		result, err = sys.Apply(ctx, p, progress)
-	case "host.fs.stat":
-		result, err = h.fsStat(msg.Params)
-	case "host.fs.list":
-		result, err = h.fsList(msg.Params)
-	case "host.fs.read":
-		result, err = h.fsRead(msg.Params)
-	case "host.fs.write":
-		result, err = h.fsWrite(msg.Params)
-	case "host.fs.mkdir":
-		result, err = h.fsMkdir(msg.Params)
-	case "host.fs.remove":
-		result, err = h.fsRemove(msg.Params)
-	case "host.fs.rename":
-		result, err = h.fsRename(msg.Params)
 	case "host.exec":
 		result, err = h.hostExec(msg.Params)
 	case "host.exec.start":
@@ -184,6 +155,10 @@ func (h *Handler) Dispatch(ctx context.Context, msg Msg, send func(Msg)) {
 		send(Err(msg.ID, "未知方法: "+msg.Method))
 		return
 	}
+	h.reply(msg, result, err, send)
+}
+
+func (h *Handler) reply(msg Msg, result any, err error, send func(Msg)) {
 	if err != nil {
 		message := err.Error()
 		if strings.HasPrefix(msg.Method, "host.fs.") {
@@ -203,13 +178,9 @@ func (h *Handler) Dispatch(ctx context.Context, msg Msg, send func(Msg)) {
 type spacePath struct {
 	SpaceID string `json:"spaceId"`
 	Path    string `json:"path"`
-	Root    string `json:"root,omitempty"`
 }
 
 func (h *Handler) rootOf(p spacePath) string {
-	if p.Root != "" {
-		return p.Root
-	}
 	if p.SpaceID != "" {
 		return h.workspace(p.SpaceID)
 	}

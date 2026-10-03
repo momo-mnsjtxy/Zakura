@@ -4,11 +4,13 @@
   "license": "AGPL-3.0",
   "author": "Sunwuyuan <wuyuan.dev>",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "next dev -p 3001",
     "build": "next build",
     "start": "next start -p 3001",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.6.0",

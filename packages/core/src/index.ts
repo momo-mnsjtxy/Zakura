@@ -157,3 +157,5 @@ export type {
   OtlpLogsConfig,
   ParsedOtlpRecord,
 } from "./observability/index.js";
+
+export * from "./docker-mux.js";

@@ -1,11 +1,11 @@
-# Zakura
+# Zakura Rewrite
 
-协同提升 Agent 的智能。
+A from-scratch implementation of Zakura, an AI environment orchestrator and unified MCP gateway.
 
-## License
+This rewrite targets behavioral compatibility with Moonrend/Zakura at upstream commit `210677c58a700dbaf58dbff86350d46fd7b9a3e1`.
 
-[GNU Affero General Public License v3.0](./LICENSE)
-Copyright (C) 2026 `Sunwuyuan <wuyuan.dev>`
+## License and attribution
 
+Copyright (C) 2026 Sunwuyuan <wuyuan.dev> and rewrite contributors.
 
-此项目曾在 [LINUX DO](https://linux.do/) 推广过。
+Licensed under the GNU Affero General Public License v3.0. See [LICENSE](LICENSE). Source used for compatibility research: https://github.com/Moonrend/Zakura.

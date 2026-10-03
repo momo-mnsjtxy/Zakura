@@ -132,6 +132,11 @@ import { UserAvatar } from "@/components/user-avatar";
 import { useTenantPresence } from "@/lib/sync/presence";
 import { useSessionDoc } from "@/lib/sync/session-doc";
 import {
+  createLatestRequestGate,
+  mergeOrderedEvent,
+  prependUniqueHistory,
+} from "@/lib/chat-state";
+import {
   activeSessionIds,
   othersOnProject,
   othersOnSession,
@@ -213,7 +218,7 @@ export function ChatApp() {
    * existing ordering guarantees.
    */
   const [pendingSessionId, setPendingSessionId] = useState<string | null>(null);
-  const pendingSessionRequestRef = useRef(0);
+  const sessionRequestGateRef = useRef(createLatestRequestGate());
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [agentReady, setAgentReady] = useState(false);
@@ -650,13 +655,7 @@ export function ChatApp() {
   const mergeEvent = useCallback(
     (ev: CloudAgentEvent) => {
       setRealtimeOffline(false);
-      setEvents((prev) => {
-        // 事件基本按 seq 顺序到达：尾部追加是 O(1)，只有乱序才走排序兜底。
-        const last = prev[prev.length - 1];
-        if (!last || ev.seq > last.seq) return [...prev, ev];
-        if (prev.some((e) => e.id === ev.id || e.seq === ev.seq)) return prev;
-        return [...prev, ev].sort((a, b) => a.seq - b.seq);
-      });
+      setEvents((prev) => mergeOrderedEvent(prev, ev) as CloudAgentEvent[]);
       if (ev.seq > seqRef.current) seqRef.current = ev.seq;
       // 服务端队列快照：全量替换（只认更新的 seq，重放不回退）
       if (ev.type === "queue_update") {
@@ -758,7 +757,7 @@ export function ChatApp() {
   const loadSessionInner = useCallback(
     async (aid: string, sid: string, requestId: number) => {
       const res = await getCloudSession(aid, sid, 0);
-      if (requestId !== pendingSessionRequestRef.current) return;
+      if (!sessionRequestGateRef.current.isCurrent(requestId)) return;
       const prevSid = sessionIdRef.current;
       setSessionId(sid);
       sessionIdRef.current = sid;
@@ -909,19 +908,19 @@ export function ChatApp() {
    */
   const loadSession = useCallback(
     async (aid: string, sid: string) => {
-      const requestId = ++pendingSessionRequestRef.current;
+      const requestId = sessionRequestGateRef.current.begin();
       setPendingSessionId(sid);
       setMainPane("chat");
       try {
         await loadSessionInner(aid, sid, requestId);
       } catch (err) {
-        if (requestId === pendingSessionRequestRef.current) {
+        if (sessionRequestGateRef.current.isCurrent(requestId)) {
           toast.error(
             `会话加载失败：${err instanceof Error ? err.message : String(err)}`,
           );
         }
       } finally {
-        if (requestId === pendingSessionRequestRef.current) {
+        if (sessionRequestGateRef.current.isCurrent(requestId)) {
           setPendingSessionId(null);
         }
       }
@@ -946,14 +945,12 @@ export function ChatApp() {
       setHasMoreHistory(hasMore);
       if (res.events.length === 0) return;
       setEvents((prev) => {
-        const seen = new Set(prev.map((e) => e.seq));
-        const older = res.events.filter((e) => !seen.has(e.seq));
-        if (older.length === 0) {
+        const merged = prependUniqueHistory(res.events, prev) as CloudAgentEvent[];
+        if (merged.length === prev.length) {
           hasMoreHistoryRef.current = false;
           setHasMoreHistory(false);
           return prev;
         }
-        const merged = [...older, ...prev];
         oldestSeqRef.current = merged[0]?.seq ?? beforeSeq;
         return merged;
       });
@@ -1458,7 +1455,7 @@ export function ChatApp() {
     if (sid && current?.kind === "acp" && !events.some((e) => e.type === "user_message")) {
       void discardUnusedAcpDraft(agentId, sid);
     }
-    pendingSessionRequestRef.current += 1;
+    sessionRequestGateRef.current.invalidate();
     setPendingSessionId(null);
     setAcpPreparingProfileId(null);
     setSessionId(null);

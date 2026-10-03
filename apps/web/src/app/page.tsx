@@ -3,15 +3,20 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { api, type PlatformInfo, setSession } from "@/lib/api";
+import { ErrorRecovery } from "@/components/error-recovery";
 
 export default function HomePage() {
   const router = useRouter();
   const [error, setError] = useState<string | null>(null);
+  const [retryKey, setRetryKey] = useState(0);
 
   useEffect(() => {
+    let active = true;
+    setError(null);
     (async () => {
       try {
         const platform = await api<PlatformInfo>("/api/platform");
+        if (!active) return;
         if (!platform.setupCompleted) {
           router.replace("/setup");
           return;
@@ -21,9 +26,10 @@ export default function HomePage() {
           router.replace("/login");
           return;
         }
-          try {
+        try {
           await api("/api/me");
           const current = await api<{ onboardingCompleted?: boolean }>("/api/tenant/current");
+          if (!active) return;
           if (current.onboardingCompleted === false) {
             router.replace("/onboarding");
           } else {
@@ -34,18 +40,22 @@ export default function HomePage() {
           router.replace("/login");
         }
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
+        if (active) setError(err instanceof Error ? err.message : String(err));
       }
     })();
-  }, [router]);
+    return () => {
+      active = false;
+    };
+  }, [router, retryKey]);
 
   if (error) {
     return (
       <div className="grid min-h-screen place-items-center p-6 text-sm">
-        <div className="space-y-1 text-center">
-          <p className="font-medium">无法连接 API</p>
-          <p className="text-muted-foreground">{error}</p>
-        </div>
+        <ErrorRecovery
+          title="无法连接 API"
+          message={error}
+          onRetry={() => setRetryKey((value) => value + 1)}
+        />
       </div>
     );
   }
