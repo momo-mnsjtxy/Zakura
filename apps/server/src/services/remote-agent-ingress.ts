@@ -273,7 +273,7 @@ export class RemoteAgentIngress {
             eq(agentChannelBindings.configEnc, binding.configEnc),
           ),
         )
-        .returning({ id: agentChannelBindings.id });
+        .returning();
       if (updated.length) return;
     }
     throw new Error("远程连接凭据并发更新过多，请重试");

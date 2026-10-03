@@ -245,7 +245,7 @@ export class ConnectorAuthService {
               eq(connectorAuthProfiles.configEnc, row.configEnc),
             ),
           )
-          .returning({ id: connectorAuthProfiles.id });
+          .returning();
         if (updated.length) return;
       }
       throw new Error("凭据档案并发更新过多，请重试");
@@ -348,7 +348,7 @@ export class ConnectorAuthService {
             .onConflictDoNothing({
               target: [connectorAuthProfiles.scopeKey, connectorAuthProfiles.profileKey],
             })
-            .returning({ id: connectorAuthProfiles.id });
+            .returning();
           if (inserted.length) return;
           continue;
         }
@@ -361,7 +361,7 @@ export class ConnectorAuthService {
               eq(connectorAuthProfiles.configEnc, existing.configEnc),
             ),
           )
-          .returning({ id: connectorAuthProfiles.id });
+          .returning();
         if (updated.length) return;
       }
       throw new Error("凭据档案并发更新过多，请重试");
@@ -458,7 +458,7 @@ export class ConnectorAuthService {
             .insert(connectorSettings)
             .values({ id: newId(), scopeKey, connectorRef, configEnc: nextEnc, createdAt: now, updatedAt: now })
             .onConflictDoNothing({ target: [connectorSettings.scopeKey, connectorSettings.connectorRef] })
-            .returning({ id: connectorSettings.id });
+            .returning();
           if (inserted.length) return;
           continue;
         }
@@ -466,7 +466,7 @@ export class ConnectorAuthService {
           .update(connectorSettings)
           .set({ configEnc: nextEnc, updatedAt: now })
           .where(and(eq(connectorSettings.id, existing.id), eq(connectorSettings.configEnc, existing.configEnc)))
-          .returning({ id: connectorSettings.id });
+          .returning();
         if (updated.length) return;
       }
       throw new Error("连接器授权并发更新过多，请重试");
@@ -513,7 +513,7 @@ export class ConnectorAuthService {
             .onConflictDoNothing({
               target: [connectorSettings.scopeKey, connectorSettings.connectorRef],
             })
-            .returning({ id: connectorSettings.id });
+            .returning();
           if (inserted.length) return current;
           continue;
         }
@@ -526,7 +526,7 @@ export class ConnectorAuthService {
               eq(connectorSettings.configEnc, existing.configEnc),
             ),
           )
-          .returning({ id: connectorSettings.id });
+          .returning();
         if (updated.length) return current;
       }
       throw new Error("连接器设置并发更新过多，请重试");
@@ -673,7 +673,7 @@ export class ConnectorAuthService {
               eq(agentConnectorInstallations.configEnc, row.configEnc),
             ),
           )
-          .returning({ id: agentConnectorInstallations.id });
+          .returning();
         if (updated.length) return;
       }
       throw new Error("连接器授权并发更新过多，请重试");
