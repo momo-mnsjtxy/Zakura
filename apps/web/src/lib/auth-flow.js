@@ -60,3 +60,15 @@ export function createActionLock() {
     },
   };
 }
+
+export function registrationRedirect(search) {
+  const email = new URLSearchParams(search).get("email")?.trim();
+  return email
+    ? `/login?mode=register&email=${encodeURIComponent(email)}`
+    : "/login?mode=register";
+}
+
+export function loginReturnHref(email) {
+  const normalized = email.trim();
+  return normalized ? `/login?email=${encodeURIComponent(normalized)}` : "/login";
+}

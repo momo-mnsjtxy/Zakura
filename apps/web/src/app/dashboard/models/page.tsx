@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { toast } from "sonner";
@@ -24,6 +24,7 @@ import { PageLoading } from "@/components/ui/progress-linear";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
+import { createLatestRequestGate } from "@/lib/chat-state";
 import {
   Sheet,
   SheetContent,
@@ -218,6 +219,7 @@ function ModelRoutesPageInner() {
   const [editDep, setEditDep] = useState<Deployment | null>(null);
   const [busy, setBusy] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const loadGate = useRef(createLatestRequestGate());
 
   const [upstreamId, setUpstreamId] = useState("");
   const [nativeModel, setNativeModel] = useState("");
@@ -277,6 +279,7 @@ function ModelRoutesPageInner() {
   }, [formReasoningPresets, reasoningPreset]);
 
   const load = useCallback(async () => {
+    const requestId = loadGate.current.begin();
     setDefaultsLoading(true);
     try {
       // Fire upstream, model, and all per-capability default-model calls in a
@@ -294,6 +297,7 @@ function ModelRoutesPageInner() {
           return [capability, models] as const;
         }),
       ]);
+      if (!loadGate.current.isCurrent(requestId)) return;
       setUpstreams(upRes.upstreams);
       setGroups(modelRes.models);
       setSelected(new Set());
@@ -304,7 +308,7 @@ function ModelRoutesPageInner() {
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
-      setDefaultsLoading(false);
+      if (loadGate.current.isCurrent(requestId)) setDefaultsLoading(false);
     }
   }, [capFilter]);
 

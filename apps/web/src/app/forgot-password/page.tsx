@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useState } from "react";
+import { Suspense, useRef, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Loader2 } from "lucide-react";
@@ -10,13 +10,15 @@ import { AuthField, AuthFooter, AuthScreen } from "@/components/auth-screen";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { PageLoading } from "@/components/ui/progress-linear";
+import { createActionLock, loginReturnHref } from "@/lib/auth-flow";
 
 function ForgotInner() {
   const preset = useSearchParams().get("email") ?? "";
   const [email, setEmail] = useState(preset);
   const [sent, setSent] = useState(false);
   const [loading, setLoading] = useState(false);
-  const back = email.trim() ? `/login?email=${encodeURIComponent(email.trim())}` : "/login";
+  const action = useRef(createActionLock());
+  const back = loginReturnHref(email);
 
   return (
     <AuthScreen
@@ -39,6 +41,7 @@ function ForgotInner() {
           className="space-y-4"
           onSubmit={async (e) => {
             e.preventDefault();
+            if (!action.current.acquire()) return;
             setLoading(true);
             try {
               await api("/api/auth/forgot-password", { method: "POST", json: { email } });
@@ -47,6 +50,7 @@ function ForgotInner() {
               toast.error(err instanceof Error ? err.message : String(err));
             } finally {
               setLoading(false);
+              action.current.release();
             }
           }}
         >

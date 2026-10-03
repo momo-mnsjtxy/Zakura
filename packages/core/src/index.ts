@@ -161,3 +161,4 @@ export type {
 export * from "./docker-mux.js";
 
 export * from "./runner-stream.js";
+export * from "./runner-workspace-fs.js";

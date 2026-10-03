@@ -13,10 +13,10 @@ import type {
   ListDetailedResult,
   ReadTextResult,
   WorkspaceFs,
-  WorkspaceFsEntry,
 } from "./workspace-fs.js";
 import type { ShellJobSnapshot } from "./shell-job.js";
 import { openRunnerDuplex } from "./runner-stream.js";
+import { createRunnerWorkspaceFs } from "./runner-workspace-fs.js";
 
 export type HubRpc = {
   rpc<T = unknown>(method: string, params?: unknown, timeoutMs?: number): Promise<T>;
@@ -644,92 +644,19 @@ export class RunnerClient {
   async stopExposure(_exposureId: string): Promise<void> {}
 
   workspaceFs(spaceId: string): WorkspaceFs {
-    const client = this;
-    return {
-      async stat(path: string) {
-        const s = await client.rpc<WorkspaceFsEntry>("host.fs.stat", { spaceId, path });
-        return { path: s.path, type: s.isDir ? ("dir" as const) : ("file" as const), size: s.size, mtime: s.modTime };
-      },
-      async statDetailed(path: string) {
-        return client.rpc("host.fs.stat", { spaceId, path });
-      },
-      async list(path: string) {
-        const d = await client.listDetailed(spaceId, path);
-        return {
-          path: d.path,
-          entries: d.entries.map((e) => ({
-            name: e.name,
-            type: e.isDir ? ("dir" as const) : ("file" as const),
-            size: e.size,
-          })),
-          truncated: false,
-        };
-      },
-      async listDetailed(path: string) {
-        return client.listDetailed(spaceId, path);
-      },
-      async read(path: string) {
-        const t = await client.readText(spaceId, path);
-        const lines = t.content.split("\n");
-        return { path: t.path, content: t.content, truncated: false, totalLines: lines.length, startLine: 1 };
-      },
-      async readText(path: string) {
-        return client.readText(spaceId, path);
-      },
-      async write(path: string, content: string) {
-        const r = await client.writeText(spaceId, path, content);
-        return { path: r.path, bytes: content.length };
-      },
-      async writeText(path: string, content: string, expectedRevision?: string | null) {
-        return client.writeText(spaceId, path, content, expectedRevision);
-      },
-      async edit(path: string, oldText: string, newText: string) {
-        const cur = await client.readText(spaceId, path);
-        if (!cur.content.includes(oldText)) throw new Error("oldText 未找到");
-        await client.writeText(spaceId, path, cur.content.replace(oldText, newText));
-        return { path, ok: true as const };
-      },
-      async mkdir(path: string) {
-        return client.mkdir(spaceId, path);
-      },
-      async mkdirApi(path: string) {
-        return client.mkdir(spaceId, path);
-      },
-      async delete(path: string, recursive?: boolean) {
-        return client.delete(spaceId, path, recursive);
-      },
-      async deleteApi(path: string, recursive?: boolean) {
-        return client.delete(spaceId, path, recursive);
-      },
-      async move(from: string, to: string) {
-        await client.rename(spaceId, from, to);
-        return { from, to };
-      },
-      async renameApi(oldPath: string, newPath: string) {
-        return client.rename(spaceId, oldPath, newPath);
-      },
-      async exists(path: string) {
-        try {
-          await client.rpc("host.fs.stat", { spaceId, path });
-          return true;
-        } catch {
-          return false;
-        }
-      },
-      async readBytes(path: string) {
-        const r = await client.downloadBytes(spaceId, path);
-        return { path, data: r.data, size: r.size, name: r.name };
-      },
-      async writeBytes(path: string, data: Buffer) {
-        return client.uploadBytes(spaceId, path, data);
-      },
-      async archive(paths: string[]) {
-        return client.archivePaths(spaceId, paths);
-      },
-      async extract(archivePath: string, destPath?: string) {
-        return client.extractArchive(spaceId, archivePath, destPath);
-      },
-    };
+    return createRunnerWorkspaceFs({
+      rpc: <T>(method: string, params?: unknown) => this.rpc<T>(method, params),
+      listDetailed: this.listDetailed.bind(this),
+      readText: this.readText.bind(this),
+      writeText: this.writeText.bind(this),
+      mkdir: this.mkdir.bind(this),
+      delete: this.delete.bind(this),
+      rename: this.rename.bind(this),
+      downloadBytes: this.downloadBytes.bind(this),
+      uploadBytes: this.uploadBytes.bind(this),
+      archivePaths: this.archivePaths.bind(this),
+      extractArchive: this.extractArchive.bind(this),
+    }, spaceId);
   }
 
   async ensureAcpSidecar(body: {

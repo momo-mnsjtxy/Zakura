@@ -4,12 +4,6 @@
     "lib": ["ES2022"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "baseUrl": ".",
-    "paths": {
-      "@zakura/shared": ["packages/shared/src/index.ts"],
-      "@zakura/core": ["packages/core/src/index.ts"],
-      "@zakura/saas": ["packages/saas/src/index.ts"]
-    },
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { HeartPulse, Plus, Trash2 } from "lucide-react";
 import { api } from "@/lib/api";
@@ -44,6 +44,14 @@ import {
   isAgentSubscriptionProtocol,
   type ModelUpstreamProtocol,
 } from "@zakura/shared";
+import { createActionLock, } from "@/lib/auth-flow";
+import { createLatestRequestGate } from "@/lib/chat-state";
+import {
+  buildUpstreamConfig,
+  fieldsForProtocol,
+  normalizeProtocolCatalog,
+  validateUpstreamForm,
+} from "@/lib/model-settings-state";
 
 type FormField =
   | "apiKey"
@@ -91,9 +99,7 @@ const REGION_ITEMS: { value: string; label: string }[] = [
 ];
 
 function fieldsFor(protocol: string, protocols: ProtocolMeta[]): FormField[] {
-  return (
-    protocols.find((p) => p.protocol === protocol)?.fields ?? ["baseUrl", "apiKey"]
-  );
+  return fieldsForProtocol(protocol, protocols) as FormField[];
 }
 
 function defaultBaseUrlFor(protocol: string, region = "cn"): string {
@@ -119,6 +125,8 @@ export default function ModelUpstreamsPage() {
   const [syncKey, setSyncKey] = useState(0);
   const [busy, setBusy] = useState(false);
   const [selectedUpstreams, setSelectedUpstreams] = useState<Set<string>>(new Set());
+  const loadGate = useRef(createLatestRequestGate());
+  const saveLock = useRef(createActionLock());
 
   const [name, setName] = useState("");
   const [protocol, setProtocol] = useState("openai");
@@ -152,30 +160,16 @@ export default function ModelUpstreamsPage() {
     upstreams.length > 0 && upstreams.every((u) => selectedUpstreams.has(u.id));
 
   const load = useCallback(async () => {
+    const requestId = loadGate.current.begin();
     try {
       const res = await api<{ upstreams: Upstream[]; protocols: ProtocolMeta[] }>(
         "/api/model-upstreams",
       );
+      if (!loadGate.current.isCurrent(requestId)) return;
       setUpstreams(res.upstreams);
       setSelectedUpstreams(new Set());
       if (res.protocols?.length) {
-        setProtocols(
-          res.protocols.map((p) => {
-            const isAgent = p.group === "agent";
-            const rawFields = Array.isArray(p.fields) ? p.fields : undefined;
-            const fields = new Set<FormField>(
-              rawFields && (rawFields.length > 0 || isAgent)
-                ? (rawFields as FormField[])
-                : ["baseUrl", "apiKey"],
-            );
-            fields.add("baseUrl");
-            return {
-              ...p,
-              fields: [...fields],
-              keywords: p.keywords,
-            };
-          }),
-        );
+        setProtocols(normalizeProtocolCatalog(res.protocols) as ProtocolMeta[]);
       }
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
@@ -216,38 +210,26 @@ export default function ModelUpstreamsPage() {
 
   function buildConfig(): Record<string, unknown> {
     const fields = fieldsFor(protocol, protocols);
-    const config: Record<string, unknown> = {};
-    if (fields.includes("apiKey") && apiKey.trim()) config.apiKey = apiKey.trim();
-    config.baseUrl = baseUrl.trim() || defaultBaseUrlFor(protocol, region);
-    if (fields.includes("apiVersion")) config.apiVersion = apiVersion.trim();
-    if (fields.includes("anthropicVersion")) {
-      config.anthropicVersion = anthropicVersion.trim() || "2023-06-01";
-    }
-    if (fields.includes("deploymentId") && deploymentId.trim()) {
-      config.deploymentId = deploymentId.trim();
-    }
-    if (fields.includes("rerankBaseUrl") && rerankBaseUrl.trim()) {
-      config.rerankBaseUrl = rerankBaseUrl.trim();
-    }
-    if (fields.includes("region")) config.region = region;
-    return config;
+    return buildUpstreamConfig(
+      { apiKey, baseUrl, apiVersion, anthropicVersion, deploymentId, rerankBaseUrl, region },
+      fields,
+      defaultBaseUrlFor(protocol, region),
+    ) as unknown as Record<string, unknown>;
   }
 
   async function save() {
-    if (!name.trim()) {
-      toast.error("请填写名称");
-      return;
-    }
     const fields = fieldsFor(protocol, protocols);
     const agent = isAgentSubscriptionProtocol(protocol);
-    if (!edit && fields.includes("apiKey") && !apiKey.trim() && protocol !== "custom" && !agent) {
-      toast.error("请填写 API Key");
+    const error = validateUpstreamForm({
+      name, protocol, apiKey, baseUrl,
+      defaultBaseUrl: defaultBaseUrlFor(protocol, region), fields,
+      editing: Boolean(edit), agent,
+    });
+    if (error) {
+      toast.error(error);
       return;
     }
-    if (!baseUrl.trim() && !defaultBaseUrlFor(protocol, region)) {
-      toast.error("请填写 API 地址");
-      return;
-    }
+    if (!saveLock.current.acquire()) return;
     setBusy(true);
     try {
       const config = buildConfig();
@@ -291,6 +273,7 @@ export default function ModelUpstreamsPage() {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
+      saveLock.current.release();
     }
   }
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useState } from "react";
+import { Suspense, useRef, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Loader2 } from "lucide-react";
@@ -10,12 +10,14 @@ import { AuthField, AuthFooter, AuthScreen } from "@/components/auth-screen";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { PageLoading } from "@/components/ui/progress-linear";
+import { createActionLock } from "@/lib/auth-flow";
 
 function ResetInner() {
   const token = useSearchParams().get("token") ?? "";
   const [password, setPassword] = useState("");
   const [done, setDone] = useState(false);
   const [loading, setLoading] = useState(false);
+  const action = useRef(createActionLock());
 
   return (
     <AuthScreen
@@ -38,6 +40,7 @@ function ResetInner() {
           className="space-y-4"
           onSubmit={async (e) => {
             e.preventDefault();
+            if (!token || !action.current.acquire()) return;
             setLoading(true);
             try {
               await api("/api/auth/reset-password", { method: "POST", json: { token, password } });
@@ -46,6 +49,7 @@ function ResetInner() {
               toast.error(err instanceof Error ? err.message : String(err));
             } finally {
               setLoading(false);
+              action.current.release();
             }
           }}
         >

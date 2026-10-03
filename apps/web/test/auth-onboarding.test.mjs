@@ -4,7 +4,9 @@ import test from "node:test";
 import {
   createActionLock,
   loginCapabilities,
+  loginReturnHref,
   readLoginIntent,
+  registrationRedirect,
   resolveEmailDiscovery,
 } from "../src/lib/auth-flow.js";
 import { isUnauthorizedOnboardingError, moveOnboarding } from "../src/lib/onboarding-flow.js";
@@ -15,6 +17,8 @@ test("login deep links restore safe intent", () => {
     email: "a@b.test",
     mode: "register",
   });
+  assert.equal(registrationRedirect("?email=a%2Bb%40example.test"), "/login?mode=register&email=a%2Bb%40example.test");
+  assert.equal(loginReturnHref("  a+b@example.test "), "/login?email=a%2Bb%40example.test");
 });
 
 test("capabilities and SSO discovery choose the available path", () => {

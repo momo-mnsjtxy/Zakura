@@ -26,6 +26,7 @@ import {
   type CloudAgentSession,
 } from "../db/schema.js";
 import { platformEvents } from "./platform-events.js";
+import { RunCancellationRegistry } from "./run-cancellation.js";
 import { recordUserUsage } from "./user-usage.js";
 import { sliceEventsPreferringUserMessage, slimToolEventsForUi } from "./cloud-agent/ui-history.js";
 import {
@@ -195,10 +196,9 @@ export class CloudAgentSessionStore {
   private readonly memQueueNext = new Map<string, CloudAgentQueuedMessage>();
   /** sessionId → 队列读改写串行链（本实例内避免并发丢更新） */
   private readonly queueChains = new Map<string, Promise<unknown>>();
-  /** 已收到取消信号的 Run（本地快速判定，免打 DB） */
-  private readonly cancelledRuns = new Set<string>();
-  /** runId → 取消回调（loop 注册，收到信号立即 abort 上游流） */
-  private readonly cancelListeners = new Map<string, Set<() => void>>();
+  private readonly cancellations = new RunCancellationRegistry((err) =>
+    recordPlatformFault("cloud_agent.cancel_listener", err, { subsystem: "cloud_agent", dep: "redis" }),
+  );
   /** 全局取消频道订阅（懒启动，跨实例即时传导） */
   private cancelSubReady: Promise<void> | null = null;
 
@@ -1773,7 +1773,7 @@ export class CloudAgentSessionStore {
   }
 
   async isCancelRequested(runId: string): Promise<boolean> {
-    if (this.cancelledRuns.has(runId)) return true;
+    if (this.cancellations.isCancelled(runId)) return true;
     const run = await this.getRun(runId);
     return Boolean(run?.cancelRequested);
   }
@@ -1783,43 +1783,13 @@ export class CloudAgentSessionStore {
    * 已处于取消态则同步触发一次；返回注销函数。
    */
   onRunCancel(runId: string, listener: () => void): () => void {
-    if (this.cancelledRuns.has(runId)) {
-      try {
-        listener();
-      } catch {
-        /* ignore */
-      }
-      return () => {};
-    }
-    let set = this.cancelListeners.get(runId);
-    if (!set) {
-      set = new Set();
-      this.cancelListeners.set(runId, set);
-    }
-    set.add(listener);
+    const unsubscribe = this.cancellations.subscribe(runId, listener);
     void this.ensureCancelSubscription();
-    return () => {
-      const cur = this.cancelListeners.get(runId);
-      cur?.delete(listener);
-      if (cur && cur.size === 0) this.cancelListeners.delete(runId);
-    };
+    return unsubscribe;
   }
 
   private fireRunCancel(runId: string): void {
-    this.cancelledRuns.add(runId);
-    const set = this.cancelListeners.get(runId);
-    if (!set) return;
-    this.cancelListeners.delete(runId);
-    for (const fn of set) {
-      try {
-        fn();
-      } catch (err) {
-        recordPlatformFault("cloud_agent.cancel_listener", err, {
-          subsystem: "cloud_agent",
-          dep: "redis",
-        });
-      }
-    }
+    this.cancellations.cancel(runId);
   }
 
   /** 订阅全局取消频道（一次即可）；其它实例 requestCancel 时本实例的 loop 也能即时收到 */
@@ -1927,8 +1897,7 @@ export class CloudAgentSessionStore {
       })
       .where(and(eq(cloudAgentSessions.id, sessionId), eq(cloudAgentSessions.activeRunId, runId)));
     // 会话队列跨 Run 存续（服务端权威）；只清理该 Run 的取消状态
-    this.cancelledRuns.delete(runId);
-    this.cancelListeners.delete(runId);
+    this.cancellations.clear(runId);
     try {
       const session = await this.db.query.cloudAgentSessions.findFirst({
         where: eq(cloudAgentSessions.id, sessionId),

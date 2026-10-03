@@ -17,9 +17,17 @@ function VerifyInner() {
       setStatus("err");
       return;
     }
+    let active = true;
     void api("/api/auth/verify-email", { method: "POST", json: { token } })
-      .then(() => setStatus("ok"))
-      .catch(() => setStatus("err"));
+      .then(() => {
+        if (active) setStatus("ok");
+      })
+      .catch(() => {
+        if (active) setStatus("err");
+      });
+    return () => {
+      active = false;
+    };
   }, [token]);
 
   return (

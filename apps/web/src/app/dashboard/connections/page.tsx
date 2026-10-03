@@ -3,6 +3,7 @@
 import { Suspense, useEffect } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { PageLoading } from "@/components/ui/progress-linear";
+import { legacyConnectionDestination } from "@/lib/connection-navigation";
 
 /** 统一连接中心已拆回 MCP / Skills / 凭据独立入口 */
 function ConnectionsRedirectInner() {
@@ -10,32 +11,7 @@ function ConnectionsRedirectInner() {
   const searchParams = useSearchParams();
 
   useEffect(() => {
-    const tab = searchParams.get("tab");
-    const source = searchParams.get("source") ?? "";
-    if (tab === "credentials") {
-      router.replace("/dashboard/settings/oauth-clients");
-      return;
-    }
-    if (tab === "store") {
-      if (
-        source.startsWith("skill") ||
-        source.includes("claude") ||
-        source.includes("codex") ||
-        source.includes("plugin") ||
-        source.includes("openai")
-      ) {
-        router.replace("/dashboard/skills");
-        return;
-      }
-      if (source.includes("official") || source === "mcp-official") {
-        router.replace("/dashboard/mcp/store");
-        return;
-      }
-      router.replace("/dashboard/mcp/store?tab=community");
-      return;
-    }
-    // 旧「统一连接中心」默认入口 → agents（连接器已移入 agent 级）
-    router.replace("/dashboard/agents");
+    router.replace(legacyConnectionDestination(searchParams.toString()));
   }, [router, searchParams]);
 
   return <PageLoading />;
