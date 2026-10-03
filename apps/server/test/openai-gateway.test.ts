@@ -135,8 +135,14 @@ describe("OpenAI gateway session continuation", () => {
         warmSession: async () => {},
         updateSession: async () => null,
       } as unknown as CloudAgentSessionStore,
+      gatewaySessionCache: {
+        // An unavailable optional cache must not block the durable lookup.
+        read: async () => new Promise<string | null>(() => {}),
+        write: async () => {},
+      },
     });
 
+    const startedAt = Date.now();
     const context = await service.prepare(
       "tenant-1",
       "agent-1",
@@ -145,6 +151,7 @@ describe("OpenAI gateway session continuation", () => {
     );
     assert.equal(context.sessionId, "zakura-session-1");
     assert.equal(created, 0);
+    assert.ok(Date.now() - startedAt < 1_000, "optional cache lookup must be bounded");
   });
 
   it("merges by user-message fingerprint even when assistant text diverges", () => {

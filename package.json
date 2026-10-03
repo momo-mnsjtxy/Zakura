@@ -10,7 +10,7 @@
   "scripts": {
     "dev": "pnpm -r --parallel --if-present dev",
     "build": "pnpm -r --if-present build",
-    "typecheck": "pnpm -r --if-present typecheck",
+    "typecheck": "pnpm --filter @zakura/shared build && pnpm --filter @zakura/core build && pnpm -r --if-present typecheck",
     "test": "pnpm -r --if-present test && pnpm test:integration",
     "test:integration": "node --test integration-tests/*.test.mjs",
     "check": "pnpm typecheck && pnpm test && pnpm build"

@@ -363,6 +363,8 @@ export class OpenAiGatewayService {
       agentService: AgentService;
       modelRouter: ModelRouterService;
       store: CloudAgentSessionStore;
+      /** Optional durable-cache facade for hermetic tests and alternate runtimes. */
+      gatewaySessionCache?: GatewaySessionCache;
     },
   ) {}
 
@@ -753,7 +755,7 @@ export class OpenAiGatewayService {
     const apiKeyId = cleanSessionKey(input.apiKeyId);
 
     if (key) {
-      const cachedId = await readGwClientSession(input.agent.id, key);
+      const cachedId = await this.readGatewaySessionCache(input.agent.id, key);
       if (cachedId) {
         const cached = await this.deps.store.getSession(
           input.tenantId,
@@ -765,7 +767,7 @@ export class OpenAiGatewayService {
 
       const byId = await this.deps.store.getSession(input.tenantId, input.agent.id, key);
       if (byId && this.isGatewayOrigin(byId.originJson)) {
-        void writeGwClientSession(input.agent.id, key, byId.id);
+        this.writeGatewaySessionCache(input.agent.id, key, byId.id);
         return byId;
       }
 
@@ -775,7 +777,7 @@ export class OpenAiGatewayService {
         (origin) => origin.clientSessionKey === key,
       );
       if (byClientKey) {
-        void writeGwClientSession(input.agent.id, key, byClientKey.id);
+        this.writeGatewaySessionCache(input.agent.id, key, byClientKey.id);
         return byClientKey;
       }
 
@@ -792,7 +794,7 @@ export class OpenAiGatewayService {
         },
         model: input.model ?? null,
       });
-      void writeGwClientSession(input.agent.id, key, created.id);
+      this.writeGatewaySessionCache(input.agent.id, key, created.id);
       return created;
     }
 
@@ -837,6 +839,21 @@ export class OpenAiGatewayService {
     });
   }
 
+  private async readGatewaySessionCache(agentId: string, key: string): Promise<string | null> {
+    const read = this.deps.gatewaySessionCache?.read ?? readGwClientSession;
+    // Cache availability must never block the durable session store. Redis may
+    // be intentionally absent during bootstrap or in hermetic API tests.
+    return Promise.race([
+      read(agentId, key).catch(() => null),
+      new Promise<null>((resolve) => setTimeout(resolve, 250)),
+    ]);
+  }
+
+  private writeGatewaySessionCache(agentId: string, key: string, sessionId: string): void {
+    const write = this.deps.gatewaySessionCache?.write ?? writeGwClientSession;
+    void write(agentId, key, sessionId).catch(() => undefined);
+  }
+
   private isGatewayOrigin(originJson: string | null | undefined): boolean {
     try {
       const origin = JSON.parse(originJson || "{}") as Record<string, unknown>;
@@ -869,3 +886,8 @@ export class OpenAiGatewayService {
     return null;
   }
 }
+
+export type GatewaySessionCache = {
+  read(agentId: string, clientKey: string): Promise<string | null>;
+  write(agentId: string, clientKey: string, sessionId: string): Promise<void>;
+};
