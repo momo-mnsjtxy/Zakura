@@ -66,14 +66,22 @@ export async function openRunnerDuplex(input: {
   const closeRemote = (): Promise<void> => {
     if (closePromise) return closePromise;
     closePromise = (async () => {
-      if (!remoteExited) {
-        await input.hub.rpc(input.closeMethod, { id: started.id }, input.timeoutMs).catch(() => undefined);
+      try {
+        if (!remoteExited) {
+          await input.hub.rpc(input.closeMethod, { id: started.id }, input.timeoutMs);
+        }
+      } finally {
+        finishReadable();
       }
-      finishReadable();
-    })();
+    })().catch((error) => {
+      // Cleanup failures are observable, and a later explicit kill may retry
+      // the remote close even though local listeners are already detached.
+      closePromise = undefined;
+      throw error;
+    });
     return closePromise;
   };
-  const onAbort = () => { void closeRemote(); };
+  const onAbort = () => { void closeRemote().catch(() => undefined); };
 
   const readable = new ReadableStream<Uint8Array>({
     start(c) {

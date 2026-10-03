@@ -99,3 +99,18 @@ test("abort during start closes a stream allocated after cancellation", async ()
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.deepEqual(calls, ["host.pty.start", "host.pty.close"]);
 });
+
+test("remote close failure is observable and a later kill retries", async () => {
+  const hub = new FakeHub();
+  let closes = 0;
+  const original = hub.rpc.bind(hub);
+  hub.rpc = async <T>(method: string, params?: unknown, timeout?: number): Promise<T> => {
+    if (method === "host.pty.close" && ++closes === 1) throw new Error("close interrupted");
+    return original<T>(method, params, timeout);
+  };
+  const stream = await open(hub);
+  await assert.rejects(stream.kill(), /close interrupted/);
+  await stream.kill();
+  assert.equal(closes, 2);
+  assert.equal(hub.unsubscribed, 1);
+});

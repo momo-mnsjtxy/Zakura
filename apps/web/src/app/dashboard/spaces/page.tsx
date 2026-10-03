@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
@@ -27,6 +27,8 @@ import {
   type SpaceItem,
 } from "@/lib/spaces";
 import { cn } from "@/lib/utils";
+import { buildSpaceCreateInput } from "@/lib/space-ui-state";
+import { createActionController, createLatestRequestGate } from "@/lib/chat-state";
 
 function statusTone(status: string | undefined): string {
   if (status === "ready") return "default";
@@ -42,15 +44,19 @@ export default function SpacesListPage() {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [busy, setBusy] = useState(false);
+  const loadGate = useRef(createLatestRequestGate());
+  const createAction = useRef(createActionController());
 
   const load = useCallback(async (silent = false) => {
+    const requestId = loadGate.current.begin();
     if (!silent) setLoading(true);
     try {
-      setList(await fetchSpaces());
+      const spaces = await fetchSpaces();
+      if (loadGate.current.isCurrent(requestId)) setList(spaces);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
-      if (!silent) setLoading(false);
+      if (!silent && loadGate.current.isCurrent(requestId)) setLoading(false);
     }
   }, []);
 
@@ -67,16 +73,15 @@ export default function SpacesListPage() {
   }
 
   async function create() {
-    if (!name.trim()) {
-      toast.error("请填写名称");
+    const parsed = buildSpaceCreateInput({ name, description });
+    if (parsed.error) {
+      toast.error(parsed.error);
       return;
     }
+    if (!createAction.current.begin()) return;
     setBusy(true);
     try {
-      const res = await createSpace({
-        name: name.trim(),
-        description: description.trim() || undefined,
-      });
+      const res = await createSpace(parsed.value!);
       setOpen(false);
       resetCreate();
       router.push(`/dashboard/spaces/${res.id}`);
@@ -84,6 +89,7 @@ export default function SpacesListPage() {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
+      createAction.current.finish();
     }
   }
 

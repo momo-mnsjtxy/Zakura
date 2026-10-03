@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   createLatestRequestGate,
   createActionController,
+  createGenerationGuard,
   mergeOrderedEvent,
   nextHistoryState,
   prependUniqueHistory,
@@ -53,9 +54,27 @@ test("history state closes pagination when replay adds no rows", () => {
   assert.equal(next.oldestSeq, 2);
 });
 
+test("duplicate-only overlap keeps pagination when its cursor advances", () => {
+  const current = [{ seq: 1 }, { seq: 2 }, { seq: 3 }];
+  const next = nextHistoryState({ current, incoming: [{ seq: 1 }], serverHasMore: true, beforeSeq: 2 });
+  assert.equal(next.events, current);
+  assert.equal(next.hasMore, true);
+  assert.equal(next.oldestSeq, 1);
+  const stuck = nextHistoryState({ current, incoming: [{ seq: 1 }], serverHasMore: true, beforeSeq: 1 });
+  assert.equal(stuck.hasMore, false);
+});
+
 test("realtime error recovers on subscription ready or the next event", () => {
   const offline = realtimeTransition({ status: "online", error: null }, { type: "error", message: "lost" });
   assert.deepEqual(offline, { status: "offline", error: "lost" });
   assert.deepEqual(realtimeTransition(offline, "ready"), { status: "online", error: null });
   assert.deepEqual(realtimeTransition(offline, "event"), { status: "online", error: null });
+});
+
+test("late events from a stale session generation are suppressed", () => {
+  const guard = createGenerationGuard();
+  const oldSession = guard.next();
+  const currentSession = guard.next();
+  assert.equal(guard.isCurrent(oldSession), false);
+  assert.equal(guard.isCurrent(currentSession), true);
 });

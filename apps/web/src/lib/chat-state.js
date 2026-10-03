@@ -71,10 +71,15 @@ export function createActionController() {
 export function nextHistoryState({ current, incoming, serverHasMore, beforeSeq }) {
   const events = prependUniqueHistory(incoming, current);
   const changed = events.length !== current.length;
+  const incomingOldest = incoming.reduce(
+    (min, event) => Math.min(min, event.seq),
+    Number.POSITIVE_INFINITY,
+  );
+  const advancedCursor = Number.isFinite(incomingOldest) && incomingOldest < beforeSeq;
   return {
     events: changed ? events : current,
-    hasMore: changed && Boolean(serverHasMore),
-    oldestSeq: events[0]?.seq ?? beforeSeq,
+    hasMore: Boolean(serverHasMore) && (changed || advancedCursor),
+    oldestSeq: advancedCursor ? incomingOldest : (events[0]?.seq ?? beforeSeq),
   };
 }
 
@@ -84,4 +89,17 @@ export function realtimeTransition(state, event) {
     return { status: "offline", error: event.message };
   }
   return state;
+}
+
+export function createGenerationGuard() {
+  let generation = 0;
+  return {
+    next() {
+      generation += 1;
+      return generation;
+    },
+    isCurrent(value) {
+      return value === generation;
+    },
+  };
 }

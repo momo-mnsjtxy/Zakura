@@ -36,6 +36,7 @@ import type { AgentWithSpace } from "./agent-view.js";
 import { agentToolApprovals, agents, newId } from "../db/schema.js";
 import type { CloudAgentSessionStore } from "./cloud-agent-session.js";
 import type { ModelRouterService } from "./model-router.js";
+import { PendingLifecycle } from "./pending-lifecycle.js";
 
 export type ToolApprovalGateInput = {
   tenantId: string;
@@ -59,7 +60,6 @@ export type ToolApprovalGateResult =
   | { action: "allow" }
   | { action: "deny"; message: string };
 
-type Pending = { resolve: (decision: PendingDecision) => void };
 type PendingDecision = "approved" | "denied" | "timeout" | "cancelled";
 
 const TICK_MS = 5_000;
@@ -175,7 +175,7 @@ export class TypesafeHttpError extends Error {
 /* ------------------------------------------------------------------ */
 
 export class ToolApprovalService {
-  private readonly pending = new Map<string, Pending>();
+  private readonly pending = new PendingLifecycle<PendingDecision>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private ticking = false;
 
@@ -357,7 +357,8 @@ export class ToolApprovalService {
         eq(agentToolApprovals.agentId, agentId),
       ),
     });
-    if (!row || row.status !== "pending") throw new Error("没有等待中的审批");
+    if (!row) throw new Error("没有等待中的审批");
+    if (row.status !== "pending") return;
     const decision: PendingDecision = input.cancelled ? "cancelled" : input.decision;
     await this.settle(row, decision, {
       alwaysAllow: decision === "approved" && input.alwaysAllow === true,
@@ -460,46 +461,23 @@ export class ToolApprovalService {
   }
 
   private wait(id: string, runId: string, expiresAt: Date | null): Promise<PendingDecision> {
-    return new Promise((resolve) => {
-      const finish = (value: PendingDecision) => {
-        uncancel();
-        if (timer) clearTimeout(timer);
-        this.pending.delete(id);
-        resolve(value);
-      };
-      this.pending.set(id, { resolve: finish });
-      const uncancel = this.store.onRunCancel(runId, () => {
+    const settleFromDb = (decision: PendingDecision) => {
         void (async () => {
           const row = await this.db.query.agentToolApprovals.findFirst({
             where: eq(agentToolApprovals.id, id),
           });
-          if (row && row.status === "pending") await this.settle(row, "cancelled");
+          if (row && row.status === "pending") await this.settle(row, decision);
         })().catch((err) =>
           recordPlatformFault("tool_approval.wait_cancel", err, {
             subsystem: "tool_approval",
           }),
         );
-      });
-      const ms = expiresAt ? expiresAt.getTime() - Date.now() : 0;
-      if (expiresAt && ms <= 0) {
-        void (async () => {
-          const row = await this.db.query.agentToolApprovals.findFirst({
-            where: eq(agentToolApprovals.id, id),
-          });
-          if (row && row.status === "pending") await this.settle(row, "timeout");
-        })();
-      }
-      const timer =
-        expiresAt && ms > 0
-          ? setTimeout(() => {
-              void (async () => {
-                const row = await this.db.query.agentToolApprovals.findFirst({
-                  where: eq(agentToolApprovals.id, id),
-                });
-                if (row && row.status === "pending") await this.settle(row, "timeout");
-              })();
-            }, ms + 20)
-          : null;
+    };
+    return this.pending.wait(id, {
+      expiresAt,
+      subscribeCancel: (listener) => this.store.onRunCancel(runId, listener),
+      onCancel: () => settleFromDb("cancelled"),
+      onExpire: () => settleFromDb("timeout"),
     });
   }
 
@@ -515,7 +493,7 @@ export class ToolApprovalService {
         : decision === "cancelled"
           ? "cancel"
           : "user";
-    await this.db
+    const transitioned = await this.db
       .update(agentToolApprovals)
       .set({
         status: decision === "approved" ? "approved" : decision,
@@ -523,7 +501,9 @@ export class ToolApprovalService {
         alwaysAllow: opts.alwaysAllow === true,
         resolvedAt: new Date(),
       })
-      .where(eq(agentToolApprovals.id, row.id));
+      .where(and(eq(agentToolApprovals.id, row.id), eq(agentToolApprovals.status, "pending")))
+      .returning({ id: agentToolApprovals.id });
+    if (transitioned.length === 0) return;
 
     await this.store.appendEvent({
       sessionId: row.sessionId,
@@ -538,11 +518,7 @@ export class ToolApprovalService {
       },
     });
 
-    const pending = this.pending.get(row.id);
-    if (pending) {
-      pending.resolve(decision);
-      this.pending.delete(row.id);
-    }
+    this.pending.settle(row.id, decision);
 
     if (opts.alwaysAllow && row.qualifiedName) {
       await this.persistAlwaysAllow(row.tenantId, row.agentId, row.qualifiedName).catch((err) =>

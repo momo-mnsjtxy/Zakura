@@ -19,6 +19,18 @@ const server = createServer(async (request, response) => {
     response.end(JSON.stringify({ sso: false, echoedEmail: body.email }));
     return;
   }
+  if (request.url === "/api/auth/login" && request.method === "POST") {
+    response.end(JSON.stringify({ session: "fixture-session" }));
+    return;
+  }
+  if (request.url === "/api/tenant/current") {
+    response.end(JSON.stringify({ onboardingCompleted: true }));
+    return;
+  }
+  if (request.url === "/api/agents" || request.url === "/api/spaces") {
+    response.end("[]");
+    return;
+  }
   response.statusCode = 404;
   response.end(JSON.stringify({ error: "fixture route not found" }));
 });
@@ -26,4 +38,3 @@ const server = createServer(async (request, response) => {
 server.listen(8787, "127.0.0.1", () => {
   process.stdout.write("fake-api-ready\n");
 });
-

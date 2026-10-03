@@ -1,11 +1,12 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { RadioGroup, RadioItem } from "@/components/ui/radio-group";
 import { cn } from "@/lib/utils";
 import type { TimelineItem } from "@/lib/cloud-agent";
+import { createResolutionController, normalizeAskAnswer, resolveWithRetry } from "@/lib/interaction-ui-state";
 
 function remainingLabel(expiresAt?: string | null): string | null {
   if (!expiresAt) return null;
@@ -27,13 +28,20 @@ export function AskUserCard({
     cancelled?: boolean;
     selected?: string[];
     text?: string;
-  }) => void;
+  }) => void | Promise<unknown>;
 }) {
   const [selected, setSelected] = useState<string[]>(item.defaultOptionIds ?? []);
   const [text, setText] = useState("");
   const [tick, setTick] = useState(0);
   const options = item.options ?? [];
   const single = !item.allowMultiple;
+  const resolution = useRef(createResolutionController());
+
+  useEffect(() => {
+    setSelected(item.defaultOptionIds ?? []);
+    setText("");
+    resolution.current.replayResolved(item.requestId);
+  }, [item.requestId]);
 
   useEffect(() => {
     if (!item.expiresAt || item.resolved) return;
@@ -146,13 +154,13 @@ export function AskUserCard({
             <Button
               type="button"
               size="sm"
-              onClick={() =>
-                onResolve?.({
+              onClick={() => {
+                void resolveWithRetry(resolution.current, item.requestId, () => onResolve?.(normalizeAskAnswer({
                   requestId: item.requestId,
                   selected,
-                  text: text.trim() || undefined,
-                })
-              }
+                  text,
+                }) as { requestId: string; cancelled?: boolean; selected?: string[]; text?: string })).catch(() => undefined);
+              }}
             >
               提交
             </Button>
@@ -160,7 +168,9 @@ export function AskUserCard({
               type="button"
               size="sm"
               variant="ghost"
-              onClick={() => onResolve?.({ requestId: item.requestId, cancelled: true })}
+              onClick={() => {
+                void resolveWithRetry(resolution.current, item.requestId, () => onResolve?.(normalizeAskAnswer({ requestId: item.requestId, cancelled: true }) as { requestId: string; cancelled?: boolean; selected?: string[]; text?: string })).catch(() => undefined);
+              }}
             >
               跳过
             </Button>

@@ -10,6 +10,7 @@ import { SettingsHeader } from "@/components/settings-shell";
 import { AutomationPanel } from "@/components/chat/automation-panel";
 import { PageLoading } from "@/components/ui/progress-linear";
 import { listAgentProjects } from "@/lib/agent-fs";
+import { automationPrompt } from "@/lib/space-ui-state";
 
 export default function AgentAutomationPage() {
   const router = useRouter();
@@ -46,12 +47,7 @@ export default function AgentAutomationPage() {
           projects={projects}
           className="max-h-[min(70vh,36rem)]"
           onAskAgentCreate={(goal) => {
-            const prompt = [
-              "请用 create_routine 为我创建定时或事件任务（Routine）。",
-              "根据下面描述自行决定名称、触发方式（cron 或 listener）和任务意图，创建后用一两句话确认。",
-              "",
-              goal.trim(),
-            ].join("\n");
+            const prompt = automationPrompt(goal);
             try {
               sessionStorage.setItem("zakura_pending_prompt", prompt);
             } catch {

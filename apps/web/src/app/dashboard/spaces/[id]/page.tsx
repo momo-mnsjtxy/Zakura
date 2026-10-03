@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { toast } from "sonner";
@@ -30,6 +30,8 @@ import {
   type SpaceItem,
 } from "@/lib/spaces";
 import { chatAgentHref } from "@/lib/nav";
+import { buildSpaceUpdateInput, filterSpaceAgents } from "@/lib/space-ui-state";
+import { createActionController, createLatestRequestGate } from "@/lib/chat-state";
 
 function statusTone(status: string | undefined): "default" | "destructive" | "secondary" {
   if (status === "ready") return "default";
@@ -52,20 +54,26 @@ export default function SpaceDetailPage() {
   const [editDesc, setEditDesc] = useState("");
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const loadGate = useRef(createLatestRequestGate());
+  const saveAction = useRef(createActionController());
+  const deleteAction = useRef(createActionController());
+  const createAgentAction = useRef(createActionController());
 
   const load = useCallback(
     async (silent = false) => {
+      const requestId = loadGate.current.begin();
       if (!silent) setLoading(true);
       try {
         const [s, agentRows] = await Promise.all([fetchSpace(id), fetchAgents()]);
+        if (!loadGate.current.isCurrent(requestId)) return;
         setSpace(s);
-        setAgents(agentRows.filter((a) => (a as AgentListItem & { spaceId?: string }).spaceId === s.id));
+        setAgents(filterSpaceAgents(agentRows, s.id) as AgentListItem[]);
       } catch (err) {
         const status = (err as { status?: number }).status;
         if (status === 404) setNotFound(true);
         else toast.error(err instanceof Error ? err.message : String(err));
       } finally {
-        if (!silent) setLoading(false);
+        if (!silent && loadGate.current.isCurrent(requestId)) setLoading(false);
       }
     },
     [id],
@@ -83,16 +91,16 @@ export default function SpaceDetailPage() {
   }
 
   async function saveSettings() {
-    if (!space || !editName.trim()) {
-      toast.error("请填写名称");
+    if (!space) return;
+    const parsed = buildSpaceUpdateInput({ name: editName, description: editDesc });
+    if (parsed.error) {
+      toast.error(parsed.error);
       return;
     }
+    if (!saveAction.current.begin()) return;
     setBusy(true);
     try {
-      const updated = await updateSpace(space.id, {
-        name: editName.trim(),
-        description: editDesc.trim(),
-      });
+      const updated = await updateSpace(space.id, parsed.value!);
       setSpace(updated);
       setSettingsOpen(false);
       toast.success("已保存");
@@ -100,11 +108,12 @@ export default function SpaceDetailPage() {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
+      saveAction.current.finish();
     }
   }
 
   async function removeSpace() {
-    if (!space) return;
+    if (!space || !deleteAction.current.begin()) return;
     setBusy(true);
     try {
       await deleteSpace(space.id);
@@ -112,6 +121,7 @@ export default function SpaceDetailPage() {
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
       setBusy(false);
+      deleteAction.current.finish();
     }
   }
 
@@ -120,6 +130,7 @@ export default function SpaceDetailPage() {
       toast.error("请填写名称");
       return;
     }
+    if (!createAgentAction.current.begin()) return;
     setCreateBusy(true);
     try {
       const res = await api<AgentListItem>("/api/agents", {
@@ -133,6 +144,7 @@ export default function SpaceDetailPage() {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
       setCreateBusy(false);
+      createAgentAction.current.finish();
     }
   }
 

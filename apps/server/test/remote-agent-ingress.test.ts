@@ -8,6 +8,12 @@ import {
   agentChannelEvents,
   agentChannelThreads,
 } from "../src/db/schema.js";
+import { platformEvents } from "../src/services/platform-events.js";
+import { closeRedis } from "../src/services/redis.js";
+
+// This is an ingress unit contract; cross-instance Redis fan-out is covered by
+// platform-events-cross-instance.test.ts. Keep this process hermetic.
+process.env.REDIS_URL = "off";
 
 assert.equal(
   isRemoteSenderAllowed({ allowedUsers: ["U123"] }, "U123"),
@@ -216,3 +222,5 @@ class FakeDb {
 }
 
 console.log("remote-agent-ingress self-check ok");
+await platformEvents.close();
+await closeRedis();

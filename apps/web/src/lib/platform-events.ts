@@ -6,6 +6,7 @@
  * （onReconnect 回调即为此设计）。
  */
 import type { Socket } from "socket.io-client";
+import { createConnectionTracker } from "./realtime-lifecycle";
 import { acquireSocket } from "@/lib/socket";
 import type { ProgressSnapshot } from "@/lib/agents";
 
@@ -98,7 +99,7 @@ type Subscriber = {
 
 const subscribers = new Set<Subscriber>();
 let handle: { socket: Socket; release: () => void } | null = null;
-let everConnected = false;
+const connectionTracker = createConnectionTracker();
 
 function handleEvent(ev: PlatformEvent) {
   for (const s of subscribers) {
@@ -112,10 +113,9 @@ function handleEvent(ev: PlatformEvent) {
 
 function handleConnect() {
   // 首次连接不算重连：onReconnect 语义是「补拉快照对齐」
-  if (everConnected) {
+  if (connectionTracker.connect()) {
     for (const s of subscribers) s.onReconnect?.();
   }
-  everConnected = true;
 }
 
 /**
@@ -136,7 +136,7 @@ export function subscribePlatformEvents(
     // 已处于连接态（例如 chat 仍持有该连接）⇒ 下一次 connect 事件必然是「重连」，
     // 必须补拉快照。这里若固定播种 false，重新订阅后的首次重连会静默跳过
     // onReconnect，消费方将一直渲染陈旧状态。
-    everConnected = handle.socket.connected;
+    connectionTracker.reset();
     handle.socket.on("platform", handleEvent);
     handle.socket.on("connect", handleConnect);
   }
@@ -148,5 +148,6 @@ export function subscribePlatformEvents(
     handle.socket.off("connect", handleConnect);
     handle.release();
     handle = null;
+    connectionTracker.reset();
   };
 }

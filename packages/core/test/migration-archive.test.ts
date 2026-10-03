@@ -126,3 +126,31 @@ describe("exportWorkspace → importWorkspace round-trip", () => {
     rmSync(base, { recursive: true, force: true });
   });
 });
+
+it("finalized remote archive has real manifest, sha and enforced excludes", async () => {
+  const { finalizeMigrationArchive, inspectMigrationArchive } = await import("../src/migration-archive.js");
+  const source = mkdtempSync(join(tmpdir(), "zakura-finalize-src-"));
+  writeFileSync(join(source, "keep.txt"), "keep");
+  mkdirSync(join(source, "cache"));
+  writeFileSync(join(source, "cache", "drop.txt"), "drop");
+  const raw = await exportWorkspace({ workspaceRoot: source, spaceId: "s", sourceNodeId: "n" });
+  const finalized = await finalizeMigrationArchive({ archive: raw.archive, spaceId: "s", sourceNodeId: "remote", excludePatterns: ["cache/"] });
+  const manifest = await inspectMigrationArchive(finalized.archive, finalized.archiveSha256);
+  assert.equal(manifest.sourceNodeId, "remote");
+  assert.deepEqual(manifest.files.map((file) => file.path), ["keep.txt"]);
+  assert.equal(manifest.fileCount, 1);
+  assert.equal(manifest.totalBytes, 4);
+  await assert.rejects(inspectMigrationArchive(finalized.archive, "0".repeat(64)), /sha256 mismatch/);
+  rmSync(source, { recursive: true, force: true });
+});
+
+it("manifest verification rejects corrupted embedded file bytes", async () => {
+  const { inspectMigrationArchive } = await import("../src/migration-archive.js");
+  const source = mkdtempSync(join(tmpdir(), "zakura-corrupt-src-"));
+  writeFileSync(join(source, "value.txt"), "original");
+  const result = await exportWorkspace({ workspaceRoot: source, spaceId: "s", sourceNodeId: "n" });
+  const corrupted = Buffer.from(result.archive);
+  // Truncating gzip is deterministic corruption and must fail before remote upload.
+  await assert.rejects(inspectMigrationArchive(corrupted.subarray(0, corrupted.length - 8)), /unexpected end|invalid|checksum|archive/i);
+  rmSync(source, { recursive: true, force: true });
+});

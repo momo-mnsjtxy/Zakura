@@ -17,6 +17,8 @@ import type {
 import type { ShellJobSnapshot } from "./shell-job.js";
 import { openRunnerDuplex } from "./runner-stream.js";
 import { createRunnerWorkspaceFs } from "./runner-workspace-fs.js";
+import { archiveRunnerPaths, extractRunnerArchive, importRunnerArchive } from "./runner-archive.js";
+import { finalizeMigrationArchive, inspectMigrationArchive } from "./migration-archive.js";
 
 export type HubRpc = {
   rpc<T = unknown>(method: string, params?: unknown, timeoutMs?: number): Promise<T>;
@@ -579,22 +581,19 @@ export class RunnerClient {
     return { path: saved.path, size: data.length };
   }
 
-  async archivePaths(
+  archivePaths(
     spaceId: string,
     paths: string[],
   ): Promise<{ filename: string; buffer: Buffer }> {
-    const tar = await this.execWorkspace(spaceId, ["tar", "-czf", "-", ...paths]);
-    return { filename: "archive.tar.gz", buffer: Buffer.from(tar.stdout, "binary") };
+    return archiveRunnerPaths(this, spaceId, paths);
   }
 
-  async extractArchive(
+  extractArchive(
     spaceId: string,
     archivePath: string,
     destination?: string,
   ): Promise<{ destination: string; ok: true }> {
-    const dest = destination || "/";
-    await this.execWorkspace(spaceId, ["tar", "-xzf", archivePath, "-C", dest]);
-    return { destination: dest, ok: true };
+    return extractRunnerArchive(this, spaceId, archivePath, destination);
   }
 
   async rename(spaceId: string, oldPath: string, newPath: string): Promise<{ ok: true; path: string }> {
@@ -605,29 +604,24 @@ export class RunnerClient {
     spaceId: string,
     body: { sourceNodeId: string; excludePatterns?: string[]; includePatterns?: string[] },
   ): Promise<{ archive: Buffer; manifest: MigrationManifest; archiveSha256: string }> {
-    const arch = await this.archivePaths(spaceId, ["."]);
-    const manifest: MigrationManifest = {
-      version: 1,
+    const raw = await this.archivePaths(spaceId, ["."]);
+    return finalizeMigrationArchive({
+      archive: raw.buffer,
       spaceId,
-      exportedAt: new Date().toISOString(),
       sourceNodeId: body.sourceNodeId,
-      compression: "gzip",
-      excludePatterns: body.excludePatterns ?? [],
-      files: [],
-      totalBytes: arch.buffer.length,
-      fileCount: 0,
-    };
-    return { archive: arch.buffer, manifest, archiveSha256: "" };
+      excludePatterns: body.excludePatterns,
+      includePatterns: body.includePatterns,
+    });
   }
 
   async importMigration(
     spaceId: string,
     archive: Buffer,
-    _opts?: { expectedSha256?: string; atomic?: boolean },
+    opts?: { expectedSha256?: string; atomic?: boolean },
   ): Promise<{ ok: true; fileCount: number; workspaceRoot: string }> {
-    await this.uploadBytes(spaceId, "/.migrate.tar.gz", archive);
-    await this.extractArchive(spaceId, "/.migrate.tar.gz", "/");
-    return { ok: true, fileCount: 0, workspaceRoot: "/" };
+    const manifest = await inspectMigrationArchive(archive, opts?.expectedSha256);
+    const result = await importRunnerArchive(this, spaceId, archive, { atomic: opts?.atomic });
+    return { ...result, fileCount: manifest.fileCount };
   }
 
   async startExposure(_input: {

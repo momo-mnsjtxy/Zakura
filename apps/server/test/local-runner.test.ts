@@ -27,6 +27,7 @@ class TestDocker {
   readonly attached: string[] = [];
   readonly stdin: Buffer[] = [];
   available = true;
+  keepNextJobRunning = false;
   async ping() { return this.available ? { ok: true, version: "test" } : { ok: false, error: "Docker unavailable" }; }
   async ensureImage() {}
   async ensureNetwork() {}
@@ -60,7 +61,8 @@ class TestDocker {
     this.execs.push(id);
     const job = new ShellJob({ agentId: opts.agentId });
     job.append("stdout", "local shell");
-    job.finish(0);
+    if (this.keepNextJobRunning) this.keepNextJobRunning = false;
+    else job.finish(0);
     return job;
   }
   async attachStdio(id: string) {
@@ -221,6 +223,26 @@ describe("explicit Local Runner", () => {
     await agentService.workspace.stop(started);
     assert.equal(await agentService.workspace.isWorkspaceRunning(started), false);
     assert.equal(existsSync(join(dir, "spaces", agent.spaceId, "workspace/outputs/local.txt")), true);
+  });
+
+  it("distinguishes hard timeout from manual shell-job kill", async () => {
+    const local = await nodes.ensureLocalNode("saas");
+    const { client } = await nodes.requireRunnerClient("saas", local.id);
+    const agent = await newAgent();
+    const bound = await agentService.update("saas", agent.id, { runtimeNodeId: local.id, userId: "allowed" });
+    await agentService.workspace.start(bound);
+    docker.keepNextJobRunning = true;
+    const timed = await client.startExecJob(agent.spaceId, ["sleep", "10"], { timeoutMs: 5 });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const timedSnapshot = await client.getExecJob(agent.spaceId, timed.jobId);
+    assert.equal(timedSnapshot.exitCode, 124);
+    assert.equal(timedSnapshot.timedOut, true);
+
+    docker.keepNextJobRunning = true;
+    const manual = await client.startExecJob(agent.spaceId, ["sleep", "10"], { timeoutMs: 10_000 });
+    const killed = await client.killExecJob(agent.spaceId, manual.jobId);
+    assert.equal(killed.exitCode, 130);
+    assert.equal(killed.timedOut, false);
   });
 
   it("reports missing local Docker without converting the node into an offline Go runner", async () => {

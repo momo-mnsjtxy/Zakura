@@ -134,12 +134,14 @@ import { useSessionDoc } from "@/lib/sync/session-doc";
 import {
   createLatestRequestGate,
   createActionController,
+  createGenerationGuard,
   mergeOrderedEvent,
   nextHistoryState,
   realtimeTransition,
 } from "@/lib/chat-state";
 import { buildProjectCreateInput, removeProjectFromChatState } from "@/lib/chat-project-state";
 import { buildChatSettingsPatch } from "@/lib/chat-settings-state";
+import { createResolutionController } from "@/lib/interaction-ui-state";
 import {
   activeSessionIds,
   othersOnProject,
@@ -293,6 +295,8 @@ export function ChatApp() {
   const [realtimeOffline, setRealtimeOffline] = useState(false);
   const realtimeStateRef = useRef({ status: "online", error: null as string | null });
   const cancelControllerRef = useRef(createActionController());
+  const interactionControllerRef = useRef(createResolutionController());
+  const subscriptionGenerationRef = useRef(createGenerationGuard());
   const defaultRuntimeRef = useRef(ZAKURA_RUNTIME_ID);
   const [acpRuntime, setAcpRuntime] = useState<{
     state?: AcpRuntimeState;
@@ -1226,13 +1230,19 @@ export function ChatApp() {
   // —— 会话事件订阅（重连与 afterSeq 续传由传输层处理）——
   useEffect(() => {
     if (!sessionId || !agentId) return;
+    const generation = subscriptionGenerationRef.current.next();
     return subscribeCloudEvents(agentId, sessionId, seqRef.current, {
-      onEvent: mergeEvent,
+      onEvent: (event) => {
+        if (subscriptionGenerationRef.current.isCurrent(generation)) mergeEvent(event);
+      },
       onReady: () => {
+        if (!subscriptionGenerationRef.current.isCurrent(generation)) return;
         realtimeStateRef.current = realtimeTransition(realtimeStateRef.current, "ready");
+        interactionControllerRef.current.reconnect();
         setRealtimeOffline(false);
       },
       onError: (msg) => {
+        if (!subscriptionGenerationRef.current.isCurrent(generation)) return;
         console.warn("[chat realtime]", msg);
         realtimeStateRef.current = realtimeTransition(realtimeStateRef.current, { type: "error", message: msg });
         setRealtimeOffline(true);
@@ -2204,6 +2214,16 @@ export function ChatApp() {
     }
   }
 
+  async function resolveInteractionOnce(requestId: string, action: () => Promise<unknown>) {
+    if (!interactionControllerRef.current.begin(requestId)) return;
+    try {
+      await action();
+    } catch (err) {
+      interactionControllerRef.current.finish(requestId);
+      toast.error(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   async function handleContinue() {
     if (!agentId || !sessionId || runActive || sending) return;
     setSending(true);
@@ -2751,35 +2771,29 @@ export function ChatApp() {
               onOpenFile={openFileInPanel}
               onPermission={(requestId, optionId, cancelled) => {
                 if (!agentId || !sessionId) return;
-                void resolveAcpPermission(agentId, sessionId, {
-                  requestId,
-                  optionId,
-                  cancelled,
-                }).catch((err) =>
-                  toast.error(err instanceof Error ? err.message : String(err)),
+                void resolveInteractionOnce(requestId, () =>
+                  resolveAcpPermission(agentId, sessionId, { requestId, optionId, cancelled }),
                 );
               }}
               onElicitation={(requestId, cancelled, content) => {
                 if (!agentId || !sessionId) return;
-                void resolveAcpElicitation(agentId, sessionId, {
-                  requestId,
-                  cancelled,
-                  content,
-                }).catch((err) =>
-                  toast.error(err instanceof Error ? err.message : String(err)),
+                void resolveInteractionOnce(requestId, () =>
+                  resolveAcpElicitation(agentId, sessionId, { requestId, cancelled, content }),
                 );
               }}
               onAskUser={(input) => {
                 if (!agentId || !sessionId) return;
-                void resolveAskUser(agentId, sessionId, input).catch((err) =>
-                  toast.error(err instanceof Error ? err.message : String(err)),
-                );
+                return resolveAskUser(agentId, sessionId, input).catch((err) => {
+                  toast.error(err instanceof Error ? err.message : String(err));
+                  throw err;
+                });
               }}
               onToolApproval={(input) => {
                 if (!agentId || !sessionId) return;
-                void resolveToolApproval(agentId, sessionId, input).catch((err) =>
-                  toast.error(err instanceof Error ? err.message : String(err)),
-                );
+                return resolveToolApproval(agentId, sessionId, input).catch((err) => {
+                  toast.error(err instanceof Error ? err.message : String(err));
+                  throw err;
+                });
               }}
             />
               </>

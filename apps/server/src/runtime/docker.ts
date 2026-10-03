@@ -16,6 +16,7 @@ import {
   type CreateContainerOptions,
   type RunningContainer,
   recordPlatformFault,
+  deadline,
 } from "@zakura/core";
 import type { ContainerSpec, DockerPullEvent, ImageUpdateEntry } from "@zakura/shared";
 
@@ -129,10 +130,14 @@ export class DockerRuntime implements ContainerRuntime {
     }
   >();
   private imagePullTail: Promise<void> = Promise.resolve();
+  private readonly stopping = new Map<string, Promise<void>>();
+  private readonly removing = new Map<string, Promise<void>>();
+  private readonly operationTimeoutMs: number;
 
-  constructor(options?: Docker.DockerOptions) {
+  constructor(options?: Docker.DockerOptions, recovery?: { operationTimeoutMs?: number }) {
     const socketPath = options ? undefined : resolveDockerContextSocketPath();
     this.docker = new Docker(socketPath ? { socketPath } : options);
+    this.operationTimeoutMs = recovery?.operationTimeoutMs ?? 30_000;
   }
 
   async ping(): Promise<{ ok: true; version: string } | { ok: false; error: string }> {
@@ -164,6 +169,18 @@ export class DockerRuntime implements ContainerRuntime {
   }
 
   async createAndStart(opts: CreateContainerOptions): Promise<RunningContainer> {
+    const allocation = this.createAndStartInner(opts);
+    try {
+      return await deadline(allocation, this.operationTimeoutMs, "create container");
+    } catch (error) {
+      if (error instanceof Error && error.name === "TimeoutError") {
+        void allocation.then((container) => this.remove(container.id, true)).catch(() => undefined);
+      }
+      throw error;
+    }
+  }
+
+  private async createAndStartInner(opts: CreateContainerOptions): Promise<RunningContainer> {
     const { spec, tenantId, instanceId, purpose, allocatedTo } = opts;
     const network = spec.network;
 
@@ -276,6 +293,15 @@ export class DockerRuntime implements ContainerRuntime {
   }
 
   async stop(containerId: string): Promise<void> {
+    const active = this.stopping.get(containerId);
+    if (active) return active;
+    const operation = deadline(this.stopInner(containerId), this.operationTimeoutMs, "stop container")
+      .finally(() => this.stopping.delete(containerId));
+    this.stopping.set(containerId, operation);
+    return operation;
+  }
+
+  private async stopInner(containerId: string): Promise<void> {
     const c = this.docker.getContainer(containerId);
     try {
       await c.stop({ t: 10 });
@@ -286,6 +312,15 @@ export class DockerRuntime implements ContainerRuntime {
   }
 
   async remove(containerId: string, force = true): Promise<void> {
+    const active = this.removing.get(containerId);
+    if (active) return active;
+    const operation = deadline(this.removeInner(containerId, force), this.operationTimeoutMs, "remove container")
+      .finally(() => this.removing.delete(containerId));
+    this.removing.set(containerId, operation);
+    return operation;
+  }
+
+  private async removeInner(containerId: string, force = true): Promise<void> {
     try {
       await this.docker.getContainer(containerId).remove({ force });
     } catch (err) {

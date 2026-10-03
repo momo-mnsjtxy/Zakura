@@ -11,6 +11,7 @@ import { recordPlatformFault } from "@zakura/core";
 import type { Db } from "../db/client.js";
 import { agentUserQuestions, newId } from "../db/schema.js";
 import type { CloudAgentSessionStore } from "./cloud-agent-session.js";
+import { PendingLifecycle } from "./pending-lifecycle.js";
 
 export type AskUserMode = "sync" | "async";
 export type AskUserTimeoutAction = "skip" | "default";
@@ -24,10 +25,6 @@ export type AskUserAnswer = {
 
 const TICK_MS = 5_000;
 export const DEFAULT_ROUTINE_ASK_TIMEOUT_SEC = 30 * 60;
-
-type Pending = {
-  resolve: (value: AskUserAnswer) => void;
-};
 
 function parseOptions(raw: unknown): CloudAgentAskUserOption[] {
   if (!Array.isArray(raw)) return [];
@@ -74,7 +71,7 @@ export type AskUserInput = {
 };
 
 export class AskUserService {
-  private readonly pending = new Map<string, Pending>();
+  private readonly pending = new PendingLifecycle<AskUserAnswer>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private ticking = false;
   private followUp: ((input: {
@@ -220,7 +217,10 @@ export class AskUserService {
         eq(agentUserQuestions.agentId, agentId),
       ),
     });
-    if (!row || row.status !== "pending") throw new Error("没有等待中的询问");
+    if (!row) throw new Error("没有等待中的询问");
+    // Client retries after a lost response are idempotent; the first terminal
+    // decision remains authoritative and no duplicate resolved event is emitted.
+    if (row.status !== "pending") return;
 
     const options = parseOptions(JSON.parse(row.optionsJson || "[]"));
     const selected = parseIds(input.selected).filter((id) => options.some((o) => o.id === id));
@@ -282,27 +282,11 @@ export class AskUserService {
   }
 
   private wait(id: string, runId: string, expiresAt: Date | null): Promise<AskUserAnswer> {
-    return new Promise((resolve) => {
-      const finish = (value: AskUserAnswer) => {
-        uncancel();
-        if (timer) clearTimeout(timer);
-        this.pending.delete(id);
-        resolve(value);
-      };
-      this.pending.set(id, { resolve: finish });
-      const uncancel = this.store.onRunCancel(runId, () => {
-        void this.settle(id, { status: "cancelled", selected: [] }, { notifyAsync: false });
-      });
-      const ms = expiresAt ? expiresAt.getTime() - Date.now() : 0;
-      if (expiresAt && ms <= 0) {
-        void this.expire(id);
-      }
-      const timer =
-        expiresAt && ms > 0
-          ? setTimeout(() => {
-              void this.expire(id);
-            }, ms + 20)
-          : null;
+    return this.pending.wait(id, {
+      expiresAt,
+      subscribeCancel: (listener) => this.store.onRunCancel(runId, listener),
+      onCancel: () => { void this.settle(id, { status: "cancelled", selected: [] }, { notifyAsync: false }); },
+      onExpire: () => { void this.expire(id); },
     });
   }
 
@@ -334,14 +318,16 @@ export class AskUserService {
       selected: answer.selected,
       ...(row.secret ? {} : answer.text ? { text: answer.text } : {}),
     };
-    await this.db
+    const transitioned = await this.db
       .update(agentUserQuestions)
       .set({
         status,
         answerJson: JSON.stringify(stored),
         resolvedAt: new Date(),
       })
-      .where(eq(agentUserQuestions.id, id));
+      .where(and(eq(agentUserQuestions.id, id), eq(agentUserQuestions.status, "pending")))
+      .returning({ id: agentUserQuestions.id });
+    if (transitioned.length === 0) return;
 
     await this.store.appendEvent({
       sessionId: row.sessionId,
@@ -355,10 +341,7 @@ export class AskUserService {
       },
     });
 
-    const pending = this.pending.get(id);
-    if (pending) {
-      pending.resolve(answer);
-      this.pending.delete(id);
+    if (this.pending.settle(id, answer)) {
       return;
     }
     if (opts.notifyAsync && row.mode === "async" && this.followUp) {

@@ -62,6 +62,7 @@ const WorkspaceTerminalDialog = dynamic(
   { ssr: false },
 );
 import { WorkspaceDesktop } from "@/components/workspace-desktop";
+import { createActionController, createLatestRequestGate } from "@/lib/chat-state";
 
 export default function AgentComputerPage() {
   const { confirm } = useConfirmDialog();
@@ -81,10 +82,16 @@ export default function AgentComputerPage() {
   const [migrateStatus, setMigrateStatus] = useState<string | null>(null);
   const [terminalOpen, setTerminalOpen] = useState(false);
   const logEndRef = useRef<HTMLDivElement>(null);
+  const loadGate = useRef(createLatestRequestGate());
+  const computerAction = useRef(createActionController());
+  const environmentAction = useRef(createActionController());
+  const migrationAction = useRef(createActionController());
 
   const load = useCallback(async () => {
+    const requestId = loadGate.current.begin();
     try {
       const [a, ns] = await Promise.all([refresh({ list: false }), listRuntimeNodes()]);
+      if (!loadGate.current.isCurrent(requestId)) return;
       if (a) setWsStatus(getWorkspaceStatus(a));
       setNodes(ns);
     } catch (err) {
@@ -202,6 +209,7 @@ export default function AgentComputerPage() {
   }, [agent?.runtimeNodeId, availableNodes]);
 
   async function createComputer() {
+    if (!computerAction.current.begin()) return;
     setCreating(true);
     try {
       const runtimeNodeId = createNodeId || null;
@@ -225,11 +233,13 @@ export default function AgentComputerPage() {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
       setCreating(false);
+      computerAction.current.finish();
     }
   }
 
   async function deleteComputer() {
     if (!(await confirm({ title: "删除电脑？", description: "将停止环境并关闭电脑能力。", confirmLabel: "删除电脑" }))) return;
+    if (!computerAction.current.begin()) return;
     setDeleting(true);
     try {
       try {
@@ -247,10 +257,12 @@ export default function AgentComputerPage() {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
       setDeleting(false);
+      computerAction.current.finish();
     }
   }
 
   async function startWorkspace() {
+    if (!environmentAction.current.begin()) return;
     setEnvBusy(true);
     try {
       // Keep current binding when restarting
@@ -263,10 +275,12 @@ export default function AgentComputerPage() {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
       setEnvBusy(false);
+      environmentAction.current.finish();
     }
   }
 
   async function enableGraphicalWorkspace() {
+    if (!environmentAction.current.begin()) return;
     setEnvBusy(true);
     try {
       await api(`/api/agents/${id}`, { method: "PATCH", json: { workspaceKind: "container", restart: true } });
@@ -275,10 +289,12 @@ export default function AgentComputerPage() {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
       setEnvBusy(false);
+      environmentAction.current.finish();
     }
   }
 
   async function stopWorkspace() {
+    if (!environmentAction.current.begin()) return;
     setEnvBusy(true);
     try {
       await api(`/api/agents/${id}/stop`, { method: "POST" });
@@ -287,6 +303,7 @@ export default function AgentComputerPage() {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
       setEnvBusy(false);
+      environmentAction.current.finish();
     }
   }
 
@@ -295,6 +312,7 @@ export default function AgentComputerPage() {
       toast.error("请选择目标 Runner");
       return;
     }
+    if (!migrationAction.current.begin()) return;
     setMigrateBusy(true);
     setMigrateStatus("准备迁移…");
     try {
@@ -346,6 +364,7 @@ export default function AgentComputerPage() {
     } finally {
       setMigrateBusy(false);
       setMigrateStatus(null);
+      migrationAction.current.finish();
     }
   }
 

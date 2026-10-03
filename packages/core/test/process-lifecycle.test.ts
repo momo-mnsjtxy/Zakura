@@ -38,18 +38,28 @@ test("timeout and abort race still clean up once", async () => {
   assert.deepEqual(reasons, ["cancel"]);
 });
 
-test("ShellJob kill is idempotent and preserves timeout snapshot contract", async () => {
+test("ShellJob timeout is idempotent and preserves timeout snapshot contract", async () => {
   const job = new ShellJob({ agentId: "agent-1" });
   let kills = 0;
   job.setIO({ write() {}, async kill() { kills++; await new Promise((r) => setTimeout(r, 2)); } });
-  const one = job.kill();
-  const two = job.kill();
+  const one = job.timeout();
+  const two = job.timeout();
   assert.equal(one, two);
   await Promise.all([one, two]);
   assert.equal(kills, 1);
   assert.equal(job.snapshot().running, false);
   assert.equal(job.snapshot().timedOut, true);
   assert.equal(job.snapshot().exitCode, 124);
+});
+
+test("ShellJob explicit kill is distinct from timeout", async () => {
+  const job = new ShellJob({ agentId: "agent-1" });
+  let kills = 0;
+  job.setIO({ write() {}, async kill() { kills++; } });
+  await job.kill();
+  assert.equal(kills, 1);
+  assert.equal(job.snapshot().exitCode, 130);
+  assert.equal(job.snapshot().timedOut, false);
 });
 
 test("ShellJob abort cancellation cleans up once without timeout labeling", async () => {

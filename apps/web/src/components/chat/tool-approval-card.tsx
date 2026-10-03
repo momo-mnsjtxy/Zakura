@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import { ChevronDown, ShieldCheck, ShieldX } from "lucide-react";
 import { TOOL_APPROVAL_REASON_LABEL, type ToolApprovalReason } from "@zakura/shared";
@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { spring } from "@/lib/springs";
 import type { TimelineItem } from "@/lib/cloud-agent";
+import { createResolutionController, resolveWithRetry } from "@/lib/interaction-ui-state";
 
 function remainingLabel(expiresAt?: string | null): string | null {
   if (!expiresAt) return null;
@@ -100,12 +101,13 @@ export function ToolApprovalCard({
     requestId: string;
     decision: "approved" | "denied";
     alwaysAllow?: boolean;
-  }) => void;
+  }) => void | Promise<unknown>;
 }) {
   const [tick, setTick] = useState(0);
   const [argsOpen, setArgsOpen] = useState(false);
   const reduced = useReducedMotion() ?? false;
   const ai = item.ai;
+  const resolution = useRef(createResolutionController());
 
   useEffect(() => {
     if (!item.expiresAt || item.resolved) return;
@@ -122,6 +124,14 @@ export function ToolApprovalCard({
   const resolvedText = item.resolved
     ? DENIED_RESOLUTION[item.resolved.decision] ?? item.resolved.decision
     : null;
+
+  useEffect(() => {
+    if (item.resolved) resolution.current.replayResolved(item.requestId);
+  }, [item.requestId, item.resolved]);
+
+  const resolveOnce = (input: { requestId: string; decision: "approved" | "denied"; alwaysAllow?: boolean }) => {
+    void resolveWithRetry(resolution.current, input.requestId, () => onResolve?.(input)).catch(() => undefined);
+  };
 
   return (
     <div className="surface-2 my-2 max-w-md animate-rise space-y-2.5 rounded-xl px-3 py-3 text-sm">
@@ -246,7 +256,7 @@ export function ToolApprovalCard({
             <Button
               type="button"
               size="sm"
-              onClick={() => onResolve?.({ requestId: item.requestId, decision: "approved" })}
+              onClick={() => resolveOnce({ requestId: item.requestId, decision: "approved" })}
             >
               允许
             </Button>
@@ -255,7 +265,7 @@ export function ToolApprovalCard({
               size="sm"
               variant="outline"
               onClick={() =>
-                onResolve?.({
+                resolveOnce({
                   requestId: item.requestId,
                   decision: "approved",
                   alwaysAllow: true,
@@ -269,7 +279,7 @@ export function ToolApprovalCard({
               size="sm"
               variant="ghost"
               className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-              onClick={() => onResolve?.({ requestId: item.requestId, decision: "denied" })}
+              onClick={() => resolveOnce({ requestId: item.requestId, decision: "denied" })}
             >
               拒绝
             </Button>

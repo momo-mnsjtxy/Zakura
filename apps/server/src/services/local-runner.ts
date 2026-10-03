@@ -216,7 +216,7 @@ export class LocalRunnerClient extends RunnerClient {
     const job = await this.local.runtime.execJob(dockerId, command, { agentId: spaceId, ...opts });
     this.jobs.add(job);
     setTimeout(() => {
-      if (job.snapshot().running) void job.kill();
+      if (job.snapshot().running) void job.timeout();
       setTimeout(() => this.jobs.remove(job.id), 60_000).unref();
     }, opts?.timeoutMs ?? 300_000).unref();
     return job.snapshot();

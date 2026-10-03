@@ -464,3 +464,66 @@ export async function streamToBuffer(stream: NodeJS.ReadableStream): Promise<Buf
 }
 
 export { MANIFEST_PATH };
+
+/** Add a verified manifest to an existing gzip tar while preserving tar.gz format. */
+export async function finalizeMigrationArchive(input: {
+  archive: Buffer;
+  spaceId: string;
+  sourceNodeId: string;
+  excludePatterns?: string[];
+  includePatterns?: string[];
+}): Promise<ExportResult> {
+  const tarBuf = input.archive[0] === 0x1f && input.archive[1] === 0x8b
+    ? await gunzipBuffer(input.archive)
+    : input.archive;
+  const excludePatterns = mergeExcludePatterns(input.excludePatterns);
+  const entries = parseTar(tarBuf).filter((entry) =>
+    entry.name !== MANIFEST_PATH && !shouldExcludePath(entry.name, excludePatterns, input.includePatterns),
+  );
+  const files: MigrationManifestFile[] = entries.filter((entry) => !entry.isDir).map((entry) => ({
+    path: entry.name.replace(/\\/g, "/"),
+    size: entry.data.length,
+    sha256: createHash("sha256").update(entry.data).digest("hex"),
+    mode: entry.mode.toString(8).padStart(3, "0"),
+  }));
+  const manifest: MigrationManifest = {
+    version: 1,
+    spaceId: input.spaceId,
+    sourceNodeId: input.sourceNodeId,
+    exportedAt: new Date().toISOString(),
+    compression: "gzip",
+    excludePatterns,
+    files,
+    totalBytes: files.reduce((sum, file) => sum + file.size, 0),
+    fileCount: files.length,
+  };
+  const rebuilt = buildTar([
+    ...entries.map((entry) => ({ name: entry.name, data: entry.data, mode: entry.mode, isDir: entry.isDir })),
+    { name: MANIFEST_PATH, data: Buffer.from(JSON.stringify(manifest, null, 2)), mode: 0o644, isDir: false },
+  ]);
+  const archive = await gzipBuffer(rebuilt);
+  return { archive, manifest, archiveSha256: createHash("sha256").update(archive).digest("hex") };
+}
+
+/** Validate archive checksum, embedded manifest and every file hash without writing files. */
+export async function inspectMigrationArchive(archive: Buffer, expectedSha256?: string): Promise<MigrationManifest> {
+  if (expectedSha256) {
+    const actual = createHash("sha256").update(archive).digest("hex");
+    if (actual !== expectedSha256) throw new Error(`Archive sha256 mismatch: expected ${expectedSha256}, got ${actual}`);
+  }
+  const tarBuf = archive[0] === 0x1f && archive[1] === 0x8b ? await gunzipBuffer(archive) : archive;
+  const entries = parseTar(tarBuf);
+  const manifestEntry = entries.find((entry) => entry.name.replace(/\\/g, "/") === MANIFEST_PATH);
+  if (!manifestEntry) throw new Error("Archive missing _zakura/manifest.json");
+  const manifest = JSON.parse(manifestEntry.data.toString("utf8")) as MigrationManifest;
+  if (manifest.version !== 1 || !Array.isArray(manifest.files)) throw new Error("Invalid migration manifest");
+  for (const file of manifest.files) {
+    const entry = entries.find((candidate) => !candidate.isDir && candidate.name.replace(/\\/g, "/") === file.path);
+    if (!entry) throw new Error(`Manifest file missing in archive: ${file.path}`);
+    if (entry.data.length !== file.size) throw new Error(`Size mismatch for ${file.path}`);
+    if (createHash("sha256").update(entry.data).digest("hex") !== file.sha256) throw new Error(`Hash mismatch for ${file.path}`);
+  }
+  if (manifest.fileCount !== manifest.files.length) throw new Error("Manifest fileCount mismatch");
+  if (manifest.totalBytes !== manifest.files.reduce((sum, file) => sum + file.size, 0)) throw new Error("Manifest totalBytes mismatch");
+  return manifest;
+}

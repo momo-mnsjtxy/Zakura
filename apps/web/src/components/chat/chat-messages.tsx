@@ -510,12 +510,12 @@ function renderRunItems(
       cancelled?: boolean;
       selected?: string[];
       text?: string;
-    }) => void;
+    }) => void | Promise<unknown>;
     onToolApproval?: (input: {
       requestId: string;
       decision: "approved" | "denied";
       alwaysAllow?: boolean;
-    }) => void;
+    }) => void | Promise<unknown>;
   },
 ) {
   const blocks: ReactNode[] = [];
@@ -864,12 +864,12 @@ export function ChatMessages({
     cancelled?: boolean;
     selected?: string[];
     text?: string;
-  }) => void;
+  }) => void | Promise<unknown>;
   onToolApproval?: (input: {
     requestId: string;
     decision: "approved" | "denied";
     alwaysAllow?: boolean;
-  }) => void;
+  }) => void | Promise<unknown>;
 }) {
   const [sourcesFor, setSourcesFor] = useState<{
     messageId: string;

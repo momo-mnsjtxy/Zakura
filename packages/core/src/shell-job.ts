@@ -132,6 +132,10 @@ export class ShellJob {
   }
 
   kill(): Promise<void> {
+    return this.lifecycle.close("kill");
+  }
+
+  timeout(): Promise<void> {
     return this.lifecycle.close("timeout");
   }
 
