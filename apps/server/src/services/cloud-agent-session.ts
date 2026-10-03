@@ -321,7 +321,12 @@ export class CloudAgentSessionStore {
   async searchSessions(
     tenantId: string,
     query: string,
-    opts?: { agentId?: string; limit?: number; kinds?: SessionKindFilter },
+    opts?: {
+      agentId?: string;
+      limit?: number;
+      kinds?: SessionKindFilter;
+      includeArchived?: boolean;
+    },
   ): Promise<CloudSessionSearchHit[]> {
     const q = query.trim();
     if (!q) return [];
@@ -369,7 +374,7 @@ export class CloudAgentSessionStore {
       .where(
         and(
           eq(cloudAgentSessions.tenantId, tenantId),
-          eq(cloudAgentSessions.status, "active"),
+          ...(opts?.includeArchived ? [] : [eq(cloudAgentSessions.status, "active")]),
           ...(opts?.agentId ? [eq(cloudAgentSessions.agentId, opts.agentId)] : []),
           ...kindCondition(opts?.kinds),
           matchCond,
@@ -378,23 +383,35 @@ export class CloudAgentSessionStore {
       .orderBy(desc(rank), desc(cloudAgentSessions.updatedAt))
       .limit(limit);
 
-    const hits: CloudSessionSearchHit[] = [];
-    for (const { session } of rows) {
-      const [ev] = await this.db
-        .select({ payloadJson: cloudAgentEvents.payloadJson })
-        .from(cloudAgentEvents)
-        .where(
-          and(
-            eq(cloudAgentEvents.sessionId, session.id),
-            inArray(cloudAgentEvents.type, [...SEARCHABLE_EVENT_TYPES]),
-            ilike(cloudAgentEvents.payloadJson, pattern),
-          ),
-        )
-        .orderBy(desc(cloudAgentEvents.seq))
-        .limit(1);
-      hits.push({ session, snippet: ev ? extractSnippet(ev.payloadJson, q, 80) : null });
-    }
-    return hits;
+    // One DISTINCT ON query replaces the previous per-result event lookup.
+    const snippets = rows.length === 0
+      ? []
+      : await this.db
+          .selectDistinctOn(
+            [cloudAgentEvents.sessionId],
+            {
+              sessionId: cloudAgentEvents.sessionId,
+              payloadJson: cloudAgentEvents.payloadJson,
+            },
+          )
+          .from(cloudAgentEvents)
+          .where(
+            and(
+              inArray(cloudAgentEvents.sessionId, rows.map(({ session }) => session.id)),
+              inArray(cloudAgentEvents.type, [...SEARCHABLE_EVENT_TYPES]),
+              ilike(cloudAgentEvents.payloadJson, pattern),
+            ),
+          )
+          .orderBy(cloudAgentEvents.sessionId, desc(cloudAgentEvents.seq));
+    const snippetBySession = new Map(
+      snippets.map((snippet) => [snippet.sessionId, snippet.payloadJson]),
+    );
+    return rows.map(({ session }) => ({
+      session,
+      snippet: snippetBySession.has(session.id)
+        ? extractSnippet(snippetBySession.get(session.id)!, q, 80)
+        : null,
+    }));
   }
 
   subscribe(sessionId: string, listener: SessionListener): () => void {

@@ -129,6 +129,10 @@ export function createDesktopProxyGateway(
     let poll: ReturnType<typeof setInterval> | undefined;
     let closed = false;
     let pendingSize: { cols: number; rows: number } | undefined;
+    const pendingInput: string[] = [];
+    let pendingInputBytes = 0;
+    let inputChain: Promise<void> = Promise.resolve();
+    let polling = false;
     const send = (value: unknown) => {
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(value));
     };
@@ -151,6 +155,23 @@ export function createDesktopProxyGateway(
         ws.close(1000, "terminal exited");
       }
     };
+    const writeInput = (data: string) => {
+      if (!jobId || closed) return;
+      inputChain = inputChain
+        .catch(() => undefined)
+        .then(async () => {
+          if (!jobId || closed) return;
+          await deps.agentService.workspace.waitShellJob(agent, jobId, 1, { stdin: data });
+        });
+    };
+    const cleanup = () => {
+      if (closed) return;
+      closed = true;
+      if (poll) clearInterval(poll);
+      pendingInput.length = 0;
+      pendingInputBytes = 0;
+      if (jobId) void deps.agentService.workspace.killShellJob(agent, jobId).catch(() => undefined);
+    };
     ws.on("message", (raw) => {
       let message: { type?: string; data?: string; cols?: number; rows?: number };
       try {
@@ -161,15 +182,21 @@ export function createDesktopProxyGateway(
       if (message.type === "resize" && Number.isFinite(message.cols) && Number.isFinite(message.rows)) {
         pendingSize = { cols: message.cols!, rows: message.rows! };
         if (jobId) void deps.agentService.workspace.resizeShellJob(agent, jobId, pendingSize.cols, pendingSize.rows);
-      } else if (jobId && message.type === "input" && typeof message.data === "string") {
-        void deps.agentService.workspace.waitShellJob(agent, jobId, 1, { stdin: message.data });
+      } else if (message.type === "input" && typeof message.data === "string") {
+        if (jobId) writeInput(message.data);
+        else {
+          pendingInputBytes += Buffer.byteLength(message.data);
+          if (pendingInputBytes > 1024 * 1024) {
+            ws.close(1013, "Terminal input buffer full; reconnect");
+            cleanup();
+            return;
+          }
+          pendingInput.push(message.data);
+        }
       }
     });
-    ws.on("close", () => {
-      closed = true;
-      if (poll) clearInterval(poll);
-      if (jobId) void deps.agentService.workspace.killShellJob(agent, jobId).catch(() => undefined);
-    });
+    ws.on("close", cleanup);
+    ws.on("error", cleanup);
     try {
       // An ACP adapter now runs in its own container with its own credential
       // volume, so an interactive login must happen *there* — a shell in the
@@ -195,14 +222,23 @@ export function createDesktopProxyGateway(
       if (pendingSize) {
         await deps.agentService.workspace.resizeShellJob(agent, jobId, pendingSize.cols, pendingSize.rows);
       }
+      for (const input of pendingInput.splice(0)) writeInput(input);
+      pendingInputBytes = 0;
       pushSnapshot(initial);
+      if (!initial.running || closed) return;
       send({ type: "ready", sessionId: jobId, command: adapterId ? `${adapterId} login shell` : "bash -l" });
       // Remote Runner callbacks cross an HTTP boundary, so keep a tight authoritative
       // snapshot stream as a fallback. Local PTY output is pushed immediately above.
       poll = setInterval(() => {
-        if (!jobId || closed) return;
-        void deps.agentService.workspace.getShellJob(agent, jobId).then(pushSnapshot).catch(() => undefined);
+        if (!jobId || closed || polling) return;
+        polling = true;
+        void deps.agentService.workspace
+          .getShellJob(agent, jobId)
+          .then(pushSnapshot)
+          .catch(() => undefined)
+          .finally(() => { polling = false; });
       }, 120);
+      poll.unref?.();
     } catch (err) {
       send({ type: "error", message: err instanceof Error ? err.message : String(err) });
       ws.close(1011, "terminal unavailable");

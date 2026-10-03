@@ -120,18 +120,38 @@ export class SecurityAuditService {
     return { items: rows.map(serializeSecurityAudit), total: countRow?.count ?? 0 };
   }
 
-  async listAll(tenantId: string, opts?: { action?: string; since?: Date; until?: Date }) {
+  async export(
+    tenantId: string,
+    opts?: { action?: string; actorId?: string; since?: Date; until?: Date; limit?: number },
+  ): Promise<{ items: SecurityAuditLogDto[]; total: number; truncated: boolean; limit: number }> {
+    const requestedLimit = Number(opts?.limit ?? 5000);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.min(Math.max(Math.floor(requestedLimit), 1), 5000)
+      : 5000;
     const filters = [eq(securityAuditLogs.tenantId, tenantId)];
     if (opts?.action) filters.push(eq(securityAuditLogs.action, opts.action));
+    if (opts?.actorId) filters.push(eq(securityAuditLogs.actorId, opts.actorId));
     if (opts?.since) filters.push(gte(securityAuditLogs.createdAt, opts.since));
     if (opts?.until) filters.push(lte(securityAuditLogs.createdAt, opts.until));
-    const rows = await this.db
-      .select()
-      .from(securityAuditLogs)
-      .where(and(...filters))
-      .orderBy(desc(securityAuditLogs.createdAt))
-      .limit(5000);
-    return rows.map(serializeSecurityAudit);
+    const where = and(...filters);
+    const [rows, [countRow]] = await Promise.all([
+      this.db
+        .select()
+        .from(securityAuditLogs)
+        .where(where)
+        .orderBy(desc(securityAuditLogs.createdAt))
+        .limit(limit),
+      this.db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(securityAuditLogs)
+        .where(where),
+    ]);
+    const total = Number(countRow?.count ?? 0);
+    return { items: rows.map(serializeSecurityAudit), total, truncated: total > rows.length, limit };
+  }
+
+  async listAll(tenantId: string, opts?: { action?: string; actorId?: string; since?: Date; until?: Date }) {
+    return (await this.export(tenantId, opts)).items;
   }
 
   async retentionDays(tenantId: string): Promise<number> {
@@ -199,6 +219,9 @@ export function auditToCsv(items: SecurityAuditLogDto[]): string {
 }
 
 function csvCell(value: string): string {
-  if (/[",\n]/.test(value)) return `"${value.replaceAll('"', '""')}"`;
-  return value;
+  // Spreadsheet programs execute leading =,+,-,@ cells as formulas. Prefix an
+  // apostrophe while retaining valid RFC 4180 quoting for human-readable export.
+  const safe = /^[\t\r ]*[=+\-@]/.test(value) ? `'${value}` : value;
+  if (/[",\n]/.test(safe)) return `"${safe.replaceAll('"', '""')}"`;
+  return safe;
 }

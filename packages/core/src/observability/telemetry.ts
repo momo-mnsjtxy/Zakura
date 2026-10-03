@@ -12,6 +12,8 @@ export type TelemetryOptions = {
   service: string;
   version?: string;
   level?: LogLevel;
+  /** Test/integration seam. undefined auto-configures; null disables export. */
+  otlpBridge?: Pick<OtelLogsBridge, "sink" | "shutdown"> | null;
 };
 
 export type ComponentLogger = {
@@ -43,16 +45,19 @@ export class Telemetry {
 
   private collector: ReturnType<typeof setInterval> | undefined;
   private readonly startedAt = Date.now();
-  private readonly otlp: OtelLogsBridge | undefined;
+  private readonly otlp: Pick<OtelLogsBridge, "sink" | "shutdown"> | undefined;
+  private shutdownPromise: Promise<void> | undefined;
   readonly otlpEnabled: boolean;
 
   constructor(opts: TelemetryOptions) {
     this.service = opts.service;
     this.version = opts.version ?? "0.0.0";
     const otlpConfig = resolveOtlpLogsConfig();
-    this.otlp = otlpConfig
-      ? new OtelLogsBridge(otlpConfig, { service: this.service, version: this.version })
-      : undefined;
+    this.otlp = opts.otlpBridge === null
+      ? undefined
+      : opts.otlpBridge ?? (otlpConfig
+        ? new OtelLogsBridge(otlpConfig, { service: this.service, version: this.version })
+        : undefined);
     this.otlpEnabled = Boolean(this.otlp);
     this.log = new OperationalLogger({
       service: opts.service,
@@ -205,12 +210,19 @@ export class Telemetry {
     });
   }
 
-  shutdown(): void {
+  shutdown(): Promise<void> {
+    if (this.shutdownPromise) return this.shutdownPromise;
     if (this.collector) {
       clearInterval(this.collector);
       this.collector = undefined;
     }
-    void this.otlp?.shutdown();
+    const operation = Promise.resolve().then(() => this.otlp?.shutdown()).then(() => undefined);
+    this.shutdownPromise = operation.catch((error) => {
+      // A failed exporter shutdown may be retried by the process owner.
+      this.shutdownPromise = undefined;
+      throw error;
+    });
+    return this.shutdownPromise;
   }
 }
 
@@ -221,7 +233,15 @@ export function otlpExportEnabled(): boolean {
 let current: Telemetry | undefined;
 
 export function initTelemetry(opts: TelemetryOptions): Telemetry {
-  current?.shutdown();
+  void current?.shutdown().catch(() => undefined);
+  current = new Telemetry(opts);
+  current.startCollectors();
+  return current;
+}
+
+/** Ordered initialization for lifecycle owners that must flush the previous exporter. */
+export async function initTelemetryAsync(opts: TelemetryOptions): Promise<Telemetry> {
+  await current?.shutdown();
   current = new Telemetry(opts);
   current.startCollectors();
   return current;
@@ -238,7 +258,14 @@ export function getTelemetry(): Telemetry {
 }
 
 export function resetTelemetry(opts?: TelemetryOptions): Telemetry {
-  current?.shutdown();
+  void current?.shutdown().catch(() => undefined);
+  current = new Telemetry(opts ?? { service: "zakura-test", version: "test" });
+  return current;
+}
+
+/** Ordered reset for tests/process owners that require OTLP flush completion. */
+export async function resetTelemetryAsync(opts?: TelemetryOptions): Promise<Telemetry> {
+  await current?.shutdown();
   current = new Telemetry(opts ?? { service: "zakura-test", version: "test" });
   return current;
 }

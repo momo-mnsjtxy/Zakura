@@ -30,6 +30,8 @@ export type HookRunOpts = {
   matcherValue?: string;
   /** 工具审批策略：allow_all（默认全放行）/ ask / ai；缺省保持旧行为 */
   permissionMode?: string;
+  /** Cloud/ACP run cancellation stops later hooks and ignores late command output. */
+  signal?: AbortSignal;
 };
 
 export type HookRunResult = {
@@ -194,7 +196,15 @@ export class AgentHooksService {
     );
     const results: HookRunResult[] = [];
     for (const { action, pluginRoot } of actions) {
-      results.push(await this.runAction(agent, event, action, pluginRoot, opts));
+      if (opts?.signal?.aborted) {
+        results.push({ ok: false, reason: "hook cancelled" });
+        break;
+      }
+      const result = await this.runAction(agent, event, action, pluginRoot, opts);
+      results.push(result);
+      // Once an admission/stop hook denies, later command hooks must not run and
+      // produce side effects after the decision is already terminal.
+      if (result.deny) break;
     }
     return results;
   }
@@ -222,7 +232,7 @@ export class AgentHooksService {
     const timeoutMs = action.timeoutMs ?? 30_000;
     const stdin = hookStdinPayload(event, opts);
     try {
-      const exec = await this.workspace.execInWorkspace(
+      const execution = this.workspace.execInWorkspace(
         agent,
         ["bash", "-lc", `printf '%s\\n' "$ZAKURA_HOOK_STDIN" | eval "$ZAKURA_HOOK_CMD"`],
         {
@@ -241,6 +251,16 @@ export class AgentHooksService {
           },
         },
       );
+      const exec = opts?.signal
+        ? await new Promise<Awaited<typeof execution>>((resolve, reject) => {
+            const cancelled = () => reject(new Error("hook cancelled"));
+            if (opts.signal!.aborted) return cancelled();
+            opts.signal!.addEventListener("abort", cancelled, { once: true });
+            execution.then(resolve, reject).finally(() =>
+              opts.signal!.removeEventListener("abort", cancelled),
+            );
+          })
+        : await execution;
       return parseHookCommandOutput(event, exec.stdout ?? "", exec.stderr ?? "", exec.exitCode);
     } catch (err) {
       return {

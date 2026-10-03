@@ -2,6 +2,7 @@
  * Agent hooks + plugin hooks.json 解析 / 运行时输出自检
  */
 import assert from "node:assert/strict";
+import { it } from "node:test";
 import {
   matcherHits,
   mergeHookPackages,
@@ -16,6 +17,7 @@ import {
   firstDeny,
   hookStdinPayload,
   parseHookCommandOutput,
+  AgentHooksService,
 } from "../src/services/agent-hooks.js";
 
 const hooks = parseHooksJson({
@@ -141,3 +143,67 @@ const packages = parseAgentHookPackages([
 assert.equal(packages.length, 1);
 
 console.log("agent-hooks self-check ok");
+
+it("executes command hooks in order and stops after the first deny", async () => {
+  const commands: string[] = [];
+  const workspace = {
+    execInWorkspace: async (_agent: unknown, _command: string[], opts: { env: Record<string, string> }) => {
+      commands.push(opts.env.ZAKURA_HOOK_CMD!);
+      return opts.env.ZAKURA_HOOK_CMD === "deny"
+        ? { exitCode: 2, stdout: "", stderr: "blocked" }
+        : { exitCode: 0, stdout: "late", stderr: "" };
+    },
+  };
+  const service = new AgentHooksService(workspace as never);
+  const results = await service.runEvent(
+    { id: "agent", tenantId: "tenant", enableComputer: true, configJson: "{}" } as never,
+    "PreToolUse",
+    {
+      toolName: "re_shell_exec",
+      extraPackages: [{
+        id: "test", name: "test", source: "test", enabled: true,
+        events: { PreToolUse: [{ hooks: [
+          { type: "command", command: "deny" },
+          { type: "command", command: "must-not-run" },
+        ] }] },
+      }],
+    },
+  );
+  assert.equal(results[0]?.deny, true);
+  assert.deepEqual(commands, ["deny"]);
+});
+
+it("returns promptly on cancellation and does not start later hooks", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const commands: string[] = [];
+  const workspace = {
+    execInWorkspace: async (_agent: unknown, _command: string[], opts: { env: Record<string, string> }) => {
+      commands.push(opts.env.ZAKURA_HOOK_CMD!);
+      await gate;
+      return { exitCode: 0, stdout: "late", stderr: "" };
+    },
+  };
+  const service = new AgentHooksService(workspace as never);
+  const controller = new AbortController();
+  const running = service.runEvent(
+    { id: "agent", tenantId: "tenant", enableComputer: true, configJson: "{}" } as never,
+    "SessionStart",
+    {
+      signal: controller.signal,
+      extraPackages: [{
+        id: "test", name: "test", source: "test", enabled: true,
+        events: { SessionStart: [{ hooks: [
+          { type: "command", command: "slow" },
+          { type: "command", command: "must-not-run" },
+        ] }] },
+      }],
+    },
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  controller.abort();
+  const results = await running;
+  assert.match(results[0]?.reason ?? "", /cancelled/);
+  assert.deepEqual(commands, ["slow"]);
+  release();
+});

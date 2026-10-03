@@ -427,6 +427,7 @@ export function registerCloudAgentRoutes(
       agentId,
       limit: Number.isFinite(limitRaw) ? limitRaw : 20,
       ...(kinds ? { kinds } : {}),
+      includeArchived: c.req.query("all") === "1",
     });
     const agents = await agentService.list(session.tenantId);
     const byId = new Map(agents.map((a) => [a.id, a]));

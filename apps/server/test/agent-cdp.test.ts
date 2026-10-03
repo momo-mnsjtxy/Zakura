@@ -8,7 +8,7 @@ import { makePng } from "./helpers/png.js";
 async function fixture(t: TestContext) {
   const pages = ["a", "b"].map((id) => ({ id, type: "page", title: `Page ${id}`, url: `https://example.test/${id}`, webSocketDebuggerUrl: "" }));
   const commands: Array<{ tab: string; method: string; params: Record<string, any> }> = [];
-  const state = { surfaceFails: false, disconnect: "", evaluateError: false, loader: 1, empty: false, readyState: "complete", historyIndex: 1, inactiveHistoryReads: 0, historyError: "Not attached to an active page" };
+  const state = { surfaceFails: false, disconnect: "", stall: "", evaluateError: false, loader: 1, empty: false, readyState: "complete", historyIndex: 1, inactiveHistoryReads: 0, historyError: "Not attached to an active page" };
   const png = makePng(80, 60);
   const server = createServer((req, res) => {
     res.setHeader("content-type", "application/json");
@@ -25,6 +25,9 @@ async function fixture(t: TestContext) {
     ws.on("message", (raw) => {
       const { id, method, params } = JSON.parse(raw.toString());
       commands.push({ tab, method, params });
+      if (state.stall === method) {
+        return;
+      }
       if (state.disconnect === method) {
         state.disconnect = "";
         ws.close();
@@ -178,5 +181,34 @@ describe("browser CDP regression coverage", () => {
     const { service, state } = await fixture(t);
     state.empty = true;
     assert.equal((await service.observe("agent", { observe: "get_title" })).title, "Page a");
+  });
+
+  it("bounds stalled protocol commands by the caller timeout", async (t) => {
+    const { service, state } = await fixture(t);
+    state.stall = "Runtime.evaluate";
+    const started = Date.now();
+    await assert.rejects(
+      service.observe("agent", { observe: "get_title", timeout: 100 }),
+      /timeout|closed|connection/i,
+    );
+    assert.ok(Date.now() - started < 1_000, "caller timeout did not bound the CDP command");
+  });
+
+  it("invalidates in-flight and queued state across an Agent reset", async (t) => {
+    const { service, state } = await fixture(t);
+    state.stall = "Runtime.evaluate";
+    const active = service.observe("agent", { observe: "get_title", timeout: 150 });
+    const queued = service.observe("agent", { observe: "get_title", timeout: 150 });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    service.resetAgent("agent");
+    await assert.rejects(active, /reset|changed/i);
+    await assert.rejects(queued, /reset|changed/i);
+    state.stall = "";
+    assert.equal((await service.observe("agent", { observe: "get_title" })).title, "Page a");
+    service.dispose();
+    await assert.rejects(
+      service.observe("agent", { observe: "get_title" }),
+      /shutting down/i,
+    );
   });
 });

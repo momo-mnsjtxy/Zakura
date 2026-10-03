@@ -24,6 +24,7 @@ import {
   toApiPath,
   toWorkspacePath,
 } from "./path-jail.js";
+import { LocalFileMutationLifecycle, type LocalFileOperations } from "./local-file-operations.js";
 import type {
   ListOpts,
   ListResult,
@@ -116,8 +117,11 @@ function applyEdit(raw: string, oldText: string, newText: string): string {
  * Local disk WorkspaceFs — 仅用于本机路径工具 / 迁移解包。
  */
 export class LocalWorkspaceFs implements WorkspaceFs {
-  constructor(private readonly root: string) {
+  private readonly mutations: LocalFileMutationLifecycle;
+
+  constructor(private readonly root: string, fileOperations?: LocalFileOperations) {
     ensureWorkspaceDir(root);
+    this.mutations = new LocalFileMutationLifecycle(fileOperations);
   }
 
   getRoot(): string {
@@ -249,36 +253,24 @@ export class LocalWorkspaceFs implements WorkspaceFs {
 
   async write(path: string, content: string) {
     const abs = resolveInRoot(this.root, path);
-    mkdirSync(dirname(abs), { recursive: true });
-    writeFileSync(abs, content, "utf8");
-    return { path: toWorkspacePath(this.root, abs), bytes: Buffer.byteLength(content, "utf8") };
+    const data = Buffer.from(content, "utf8");
+    await this.mutations.write(abs, data, { revision: contentRevision });
+    return { path: toWorkspacePath(this.root, abs), bytes: data.length };
   }
 
   async writeText(path: string, content: string, expectedRevision?: string | null) {
     const abs = resolveInRoot(this.root, path);
-    if (expectedRevision !== undefined && expectedRevision !== null) {
-      if (expectedRevision === "") {
-        throw new Error("expectedRevision must be non-empty; omit the field for an unconditional write");
-      }
-      if (!existsSync(abs)) {
-        throw Object.assign(new Error("file changed on disk"), { status: 409 });
-      }
-      const current = contentRevision(readFileSync(abs));
-      if (current !== expectedRevision) {
-        throw Object.assign(new Error("file changed on disk"), { status: 409 });
-      }
+    if (expectedRevision === "") {
+      throw new Error("expectedRevision must be non-empty; omit the field for an unconditional write");
     }
-    mkdirSync(dirname(abs), { recursive: true });
     const buf = Buffer.from(content, "utf8");
-    writeFileSync(abs, buf);
-    return { path: toApiPath(this.root, abs), ok: true as const, revision: contentRevision(buf) };
+    const revision = await this.mutations.write(abs, buf, { expectedRevision, revision: contentRevision });
+    return { path: toApiPath(this.root, abs), ok: true as const, revision };
   }
 
   async edit(path: string, oldText: string, newText: string) {
     const abs = resolveInRoot(this.root, path);
-    const raw = readFileSync(abs, "utf8");
-    const updated = applyEdit(raw, oldText, newText);
-    writeFileSync(abs, updated, "utf8");
+    await this.mutations.edit(abs, (raw) => applyEdit(raw, oldText, newText));
     return { path: toWorkspacePath(this.root, abs), ok: true as const };
   }
 
@@ -364,8 +356,7 @@ export class LocalWorkspaceFs implements WorkspaceFs {
 
   async writeBytes(path: string, data: Buffer) {
     const abs = resolveInRoot(this.root, path);
-    mkdirSync(dirname(abs), { recursive: true });
-    writeFileSync(abs, data);
+    await this.mutations.write(abs, data, { revision: contentRevision });
     return { path: toApiPath(this.root, abs), size: data.length };
   }
 

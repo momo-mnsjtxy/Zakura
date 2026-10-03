@@ -26,6 +26,7 @@ describe("ui-history window", () => {
     const forUi = sliceEventsPreferringUserMessage(events, 500);
     assert.ok(forUi.some((e) => e.type === "user_message"));
     assert.equal(forUi[0]?.type, "user_message");
+    assert.equal(forUi.length, 500, "user-boundary preservation must still honor maxEvents");
   });
 
   it("reattachOrphanUserRoots promotes truncated parents so turns are not empty", () => {

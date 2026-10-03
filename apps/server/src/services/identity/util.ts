@@ -46,16 +46,27 @@ export function parseJsonObject(raw: string | null | undefined): Record<string, 
 
 /** 审计 detail 去掉密钥类字段。 */
 export function redactAuditDetail(detail: Record<string, unknown>): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(detail)) {
-    if (SENSITIVE.test(key)) continue;
-    if (typeof value === "string" && value.length > 500) {
-      out[key] = `${value.slice(0, 80)}…`;
-      continue;
+  const seen = new WeakSet<object>();
+  let budget = 500;
+  const visit = (value: unknown, depth: number): unknown => {
+    if (--budget < 0 || depth > 5) return "[truncated]";
+    if (typeof value === "string") {
+      return value.length > 500 ? `${value.slice(0, 80)}…` : value;
     }
-    out[key] = value;
-  }
-  return out;
+    if (value === null || typeof value === "number" || typeof value === "boolean") return value;
+    if (value instanceof Date) return value.toISOString();
+    if (Array.isArray(value)) return value.slice(0, 50).map((entry) => visit(entry, depth + 1));
+    if (!value || typeof value !== "object") return String(value ?? "");
+    if (seen.has(value)) return "[circular]";
+    seen.add(value);
+    const out: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value).slice(0, 100)) {
+      if (SENSITIVE.test(key)) continue;
+      out[key] = visit(child, depth + 1);
+    }
+    return out;
+  };
+  return visit(detail, 0) as Record<string, unknown>;
 }
 
 export function rpFromWebUrl(webPublicUrl: string): { rpID: string; origin: string; name: string } {

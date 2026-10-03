@@ -38,7 +38,10 @@ class CdpSession {
   private pending = new Map<number, Pending>();
   private closed = false;
 
-  constructor(ws: WebSocket) {
+  constructor(
+    ws: WebSocket,
+    private readonly commandTimeoutMs = 45_000,
+  ) {
     this.ws = ws;
     this.ws.addEventListener("message", (ev) => {
       try {
@@ -83,7 +86,7 @@ class CdpSession {
           this.pending.delete(id);
           reject(new CdpConnectionError(`CDP timeout: ${method}`));
         }
-      }, 45_000);
+      }, this.commandTimeoutMs);
       this.pending.set(id, { method, resolve: (v) => resolve(v as T), reject, timer });
       try {
         this.ws.send(JSON.stringify({ id, method, params: params ?? {} }));
@@ -103,7 +106,7 @@ class CdpSession {
   }
 }
 
-async function waitWsOpen(ws: WebSocket): Promise<void> {
+async function waitWsOpen(ws: WebSocket, timeoutMs = 10_000): Promise<void> {
   if (ws.readyState === WebSocket.OPEN) return;
   await new Promise<void>((resolve, reject) => {
     const cleanup = () => {
@@ -120,36 +123,36 @@ async function waitWsOpen(ws: WebSocket): Promise<void> {
       ws.on("error", () => undefined);
       ws.terminate();
       reject(new CdpConnectionError("CDP WebSocket open timeout"));
-    }, 10_000);
+    }, timeoutMs);
     ws.addEventListener("open", opened);
     ws.addEventListener("error", failed);
     ws.addEventListener("close", failed);
   });
 }
 
-export async function listCdpTargets(cdpBaseUrl: string): Promise<CdpTarget[]> {
+export async function listCdpTargets(cdpBaseUrl: string, timeoutMs = 8_000): Promise<CdpTarget[]> {
   const base = cdpBaseUrl.replace(/\/$/, "");
-  const res = await fetch(`${base}/json/list`, { signal: AbortSignal.timeout(8000) });
+  const res = await fetch(`${base}/json/list`, { signal: AbortSignal.timeout(timeoutMs) });
   if (!res.ok) throw new Error(`CDP /json/list failed: ${res.status}`);
   const targets = await res.json();
   if (!Array.isArray(targets)) throw new Error("CDP /json/list returned an invalid target list");
   return targets as CdpTarget[];
 }
 
-export async function cdpReady(cdpBaseUrl: string): Promise<boolean> {
+export async function cdpReady(cdpBaseUrl: string, timeoutMs = 8_000): Promise<boolean> {
   try {
-    await listCdpTargets(cdpBaseUrl);
+    await listCdpTargets(cdpBaseUrl, timeoutMs);
     return true; // An empty browser is ready; openSession can create a page.
   } catch {
     return false;
   }
 }
 
-async function openSession(cdpBaseUrl: string, targetId?: string): Promise<{
+async function openSession(cdpBaseUrl: string, targetId?: string, timeoutMs = 10_000): Promise<{
   session: CdpSession;
   target: CdpTarget;
 }> {
-  const targets = await listCdpTargets(cdpBaseUrl);
+  const targets = await listCdpTargets(cdpBaseUrl, timeoutMs);
   let page = targetId
     ? targets.find((t) => t.id === targetId && t.type === "page")
     : targets.find((t) => t.type === "page" && t.webSocketDebuggerUrl);
@@ -160,12 +163,12 @@ async function openSession(cdpBaseUrl: string, targetId?: string): Promise<{
     const base = cdpBaseUrl.replace(/\/$/, "");
     const res = await fetch(`${base}/json/new?about:blank`, {
       method: "PUT",
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     if (!res.ok) {
       // Some Chrome versions use GET
       const res2 = await fetch(`${base}/json/new?about:blank`, {
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       if (!res2.ok) throw new Error("No CDP page target and failed to create tab");
       page = (await res2.json()) as CdpTarget;
@@ -188,9 +191,9 @@ async function openSession(cdpBaseUrl: string, targetId?: string): Promise<{
   }
 
   const ws = new WebSocket(wsUrl, { maxPayload: 16 * 1024 * 1024 });
-  const session = new CdpSession(ws);
+  const session = new CdpSession(ws, timeoutMs);
   try {
-    await waitWsOpen(ws);
+    await waitWsOpen(ws, timeoutMs);
     await session.send("Page.enable");
     await session.send("Runtime.enable");
     await session.send("DOM.enable");
@@ -427,22 +430,71 @@ export class AgentBrowserService {
   private bases = new Map<string, string>();
   private refs = new Map<string, SnapshotRefs>();
   private queues = new Map<string, Promise<unknown>>();
+  private generations = new Map<string, number>();
+  private disposed = false;
 
   constructor(private readonly getCdpBaseUrl: CdpResolver) {}
 
+  /** Invalidate tab/ref/endpoint state across workspace stop, migration or delete. */
+  resetAgent(agentId: string): void {
+    this.generations.set(agentId, (this.generations.get(agentId) ?? 0) + 1);
+    this.selected.delete(agentId);
+    this.bases.delete(agentId);
+    this.refs.delete(agentId);
+  }
+
+  /** Release all cached state and reject future work during server shutdown. */
+  dispose(): void {
+    this.disposed = true;
+    const ids = new Set([
+      ...this.selected.keys(),
+      ...this.bases.keys(),
+      ...this.refs.keys(),
+      ...this.queues.keys(),
+    ]);
+    for (const id of ids) this.resetAgent(id);
+  }
+
   private async serial<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
-    const pending = (this.queues.get(agentId) ?? Promise.resolve()).catch(() => undefined).then(operation);
+    if (this.disposed) throw new Error("Browser service is shutting down");
+    const generation = this.generations.get(agentId) ?? 0;
+    const pending = (this.queues.get(agentId) ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(async () => {
+        if (this.disposed || (this.generations.get(agentId) ?? 0) !== generation) {
+          throw new Error("Browser state was reset; observe the workspace again");
+        }
+        let result: T;
+        try {
+          result = await operation();
+        } catch (error) {
+          if (this.disposed || (this.generations.get(agentId) ?? 0) !== generation) {
+            this.selected.delete(agentId);
+            this.bases.delete(agentId);
+            this.refs.delete(agentId);
+            throw new Error("Browser state changed during the operation; observe before retrying");
+          }
+          throw error;
+        }
+        if (this.disposed || (this.generations.get(agentId) ?? 0) !== generation) {
+          this.selected.delete(agentId);
+          this.bases.delete(agentId);
+          this.refs.delete(agentId);
+          throw new Error("Browser state changed during the operation; observe before retrying");
+        }
+        return result;
+      });
     this.queues.set(agentId, pending);
     try { return await pending; }
     finally { if (this.queues.get(agentId) === pending) this.queues.delete(agentId); }
   }
 
-  private async withSession<T>(agentId: string, readOnly: boolean, operation: (session: CdpSession, target: CdpTarget, base: string) => Promise<T>): Promise<T> {
+  private async withSession<T>(agentId: string, readOnly: boolean, timeout: number, operation: (session: CdpSession, target: CdpTarget, base: string) => Promise<T>): Promise<T> {
     for (let attempt = 0; ; attempt++) {
       let session: CdpSession | undefined;
       try {
-        const base = await this.requireCdp(agentId);
-        const opened = await openSession(base, this.selected.get(agentId));
+        const base = await this.requireCdp(agentId, timeout);
+        const opened = await openSession(base, this.selected.get(agentId), timeout);
         session = opened.session;
         this.selected.set(agentId, opened.target.id);
         return await operation(session, opened.target, base);
@@ -520,10 +572,10 @@ export class AgentBrowserService {
     return this.serial(agentId, async () => {
       const timeout = timeoutMs(args.timeout, 8000);
       if (args.observe === "tab_list") {
-        const tabs = await listCdpTargets(await this.requireCdp(agentId));
+        const tabs = await listCdpTargets(await this.requireCdp(agentId, timeout), timeout);
         return { tabs: tabs.filter((tab) => tab.type === "page").map((tab, index) => ({ index, id: tab.id, title: tab.title, url: tab.url, selected: tab.id === this.selected.get(agentId) })) };
       }
-      return this.withSession(agentId, args.observe !== "evaluate", async (session, target) => {
+      return this.withSession(agentId, args.observe !== "evaluate", timeout, async (session, target) => {
         if (args.observe === "evaluate") {
           if (!args.script) throw new Error("script required for evaluate");
           return { result: await evaluate(session, args.script) };
@@ -557,20 +609,20 @@ export class AgentBrowserService {
     return this.serial(agentId, async () => {
       const timeout = timeoutMs(args.timeout, args.action === "wait" ? 1000 : 8000);
       if (["tab_new", "tab_select", "tab_close"].includes(args.action)) {
-        const base = await this.requireCdp(agentId);
+        const base = await this.requireCdp(agentId, timeout);
         if (args.action === "tab_new") {
           const url = `${base.replace(/\/$/, "")}/json/new?${encodeURIComponent(args.url || "about:blank")}`;
-          let response = await fetch(url, { method: "PUT", signal: AbortSignal.timeout(10_000) });
-          if (response.status === 405) response = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+          let response = await fetch(url, { method: "PUT", signal: AbortSignal.timeout(timeout) });
+          if (response.status === 405) response = await fetch(url, { signal: AbortSignal.timeout(timeout) });
           if (!response.ok) throw new Error(`tab_new failed: ${response.status}`);
           this.selected.set(agentId, ((await response.json()) as CdpTarget).id);
         } else {
-          const tabs = (await listCdpTargets(base)).filter((tab) => tab.type === "page");
+          const tabs = (await listCdpTargets(base, timeout)).filter((tab) => tab.type === "page");
           const index = args.tab_index ?? 0;
           if (!Number.isInteger(index) || index < 0 || !tabs[index]) throw new Error(`No tab at index ${index}`);
           const tab = tabs[index]!;
           if (args.action === "tab_close") {
-            const response = await fetch(`${base.replace(/\/$/, "")}/json/close/${encodeURIComponent(tab.id)}`, { signal: AbortSignal.timeout(5000) });
+            const response = await fetch(`${base.replace(/\/$/, "")}/json/close/${encodeURIComponent(tab.id)}`, { signal: AbortSignal.timeout(timeout) });
             if (!response.ok) throw new Error(`tab_close failed: ${response.status}`);
             if (this.selected.get(agentId) === tab.id) { this.selected.delete(agentId); this.refs.delete(agentId); }
             return { ok: true, closed: tab.id };
@@ -578,14 +630,14 @@ export class AgentBrowserService {
           this.selected.set(agentId, tab.id);
         }
         this.refs.delete(agentId);
-        return this.withSession(agentId, false, async (session, target) => {
+        return this.withSession(agentId, false, timeout, async (session, target) => {
           await session.send("Page.bringToFront");
           const state = await waitForDocument(session, timeout);
           return { ok: true, selected: { id: target.id, url: state.url, title: state.title }, ...state, coordinateSpace,
             ...(args.screenshot ? await captureScreenshot(session, state) : {}) };
         });
       }
-      return this.withSession(agentId, false, async (session, target) => {
+      return this.withSession(agentId, false, timeout, async (session, target) => {
         let state: BrowserState | undefined;
         const extra: Record<string, unknown> = {};
         switch (args.action) {
@@ -715,11 +767,11 @@ export class AgentBrowserService {
     });
   }
 
-  private async requireCdp(agentId: string): Promise<string> {
+  private async requireCdp(agentId: string, timeout = 8_000): Promise<string> {
     const raw = await this.getCdpBaseUrl(agentId);
     const base = typeof raw === "string" || raw == null ? raw : raw.url;
     if (!base) throw new Error(typeof raw === "object" && raw?.reason ? raw.reason : "Browser CDP unavailable. Enable the computer workspace and wait for Chromium to start.");
-    if (!await cdpReady(base)) throw new CdpConnectionError("Chromium CDP is not ready. Check workspace display/Chrome startup logs and retry observe.");
+    if (!await cdpReady(base, timeout)) throw new CdpConnectionError("Chromium CDP is not ready. Check workspace display/Chrome startup logs and retry observe.");
     // Reset stale state before tab_new/tab_select sets a new selection.
     if (this.bases.has(agentId) && this.bases.get(agentId) !== base) {
       this.selected.delete(agentId);

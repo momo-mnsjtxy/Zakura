@@ -11,6 +11,7 @@ import { callAgentNativeTool, listAgentNativeTools } from "../src/services/agent
 import { screenshotResult, pngDimensions } from "../src/services/agent-screenshot.js";
 import { makePng } from "./helpers/png.js";
 import { mcpResultToModelOutput, RESULT_TEXT_LIMIT } from "../src/services/cloud-agent/tools.js";
+import { resetDesktopAgent } from "../src/services/agent-desktop.js";
 
 const agent = { id: "desktop-test", tenantId: "t1", enableComputer: true } as Agent;
 const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII=";
@@ -243,6 +244,29 @@ describe("desktop accessibility snapshots and refs", () => {
     const next = await nextSnapshot;
     assert.notEqual(next.items[1].ref, items[1].ref);
     assert.deepEqual(requests.map((request) => request.command), ["snapshot", "resolve", "snapshot"]);
+  });
+
+  it("invalidates in-flight input and queued refs when an Agent workspace resets", async (t) => {
+    const { service, observe } = a11yWorkspace();
+    const { items } = await observe();
+    const original = service.execInWorkspace.bind(service);
+    let release!: () => void, entered!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const resolving = new Promise<void>((resolve) => { entered = resolve; });
+    t.after(() => release());
+    t.mock.method(service, "execInWorkspace", async (...args: Parameters<typeof service.execInWorkspace>) => {
+      if (args[1].includes("resolve")) { entered(); await gate; }
+      return original(...args);
+    });
+    const click = callAgentNativeTool(agent, service, "computer_click", { ref: items[1].ref });
+    await resolving;
+    resetDesktopAgent(service, agent as never);
+    release();
+    const cancelled = await click;
+    assert.equal(cancelled.isError, true);
+    assert.match(JSON.stringify(cancelled), /state changed|observe/i);
+    const stale = await callAgentNativeTool(agent, service, "computer_click", { ref: items[1].ref });
+    assert.equal(stale.isError, true);
   });
 
   it("preserves the snapshot on screenshot failure and bounds output to complete JSON/ref lines", async () => {

@@ -946,9 +946,16 @@ export function registerIdentityRoutes(
     if (!isSessionAdmin(session) && !session.isPlatformAdmin) {
       return c.json({ error: "Admin only" }, 403);
     }
-    const tenantId = c.req.query("tenantId") && session.isPlatformAdmin
-      ? c.req.query("tenantId")!
+    const requestedTenantId = c.req.query("tenantId")?.trim();
+    if (requestedTenantId && requestedTenantId !== session.tenantId && !session.isPlatformAdmin) {
+      return c.json({ error: "Platform admin only" }, 403);
+    }
+    const tenantId = requestedTenantId && session.isPlatformAdmin
+      ? requestedTenantId
       : session.tenantId;
+    if (!(await db.query.tenants.findFirst({ where: eq(tenants.id, tenantId) }))) {
+      return c.json({ error: "Tenant not found" }, 404);
+    }
     const since = c.req.query("since") ? new Date(c.req.query("since")!) : undefined;
     const until = c.req.query("until") ? new Date(c.req.query("until")!) : undefined;
     if (since && !Number.isFinite(since.getTime())) return c.json({ error: "Invalid since" }, 400);
@@ -956,10 +963,19 @@ export function registerIdentityRoutes(
     if (since && until && since > until) return c.json({ error: "since must not exceed until" }, 400);
     const format = c.req.query("format");
     if (format === "csv") {
-      const items = await audit.listAll(tenantId, { action: c.req.query("action") ?? undefined, since, until });
-      return c.body(auditToCsv(items), 200, {
+      const result = await audit.export(tenantId, {
+        action: c.req.query("action") ?? undefined,
+        actorId: c.req.query("actorId") ?? undefined,
+        since,
+        until,
+        limit: Number(c.req.query("limit") ?? 5000),
+      });
+      return c.body(auditToCsv(result.items), 200, {
         "content-type": "text/csv; charset=utf-8",
         "content-disposition": `attachment; filename="audit.csv"`,
+        "x-audit-total": String(result.total),
+        "x-audit-exported": String(result.items.length),
+        "x-audit-truncated": String(result.truncated),
       });
     }
     const result = await audit.list(tenantId, {
@@ -976,17 +992,29 @@ export function registerIdentityRoutes(
 
   app.put("/api/tenant/audit/retention", async (c) => {
     const session = c.get("session")!;
-    if (!isSessionAdmin(session)) return c.json({ error: "Admin only" }, 403);
+    if (!isSessionAdmin(session) && !session.isPlatformAdmin) {
+      return c.json({ error: "Admin only" }, 403);
+    }
+    const requestedTenantId = c.req.query("tenantId")?.trim();
+    if (requestedTenantId && requestedTenantId !== session.tenantId && !session.isPlatformAdmin) {
+      return c.json({ error: "Platform admin only" }, 403);
+    }
+    const tenantId = requestedTenantId && session.isPlatformAdmin
+      ? requestedTenantId
+      : session.tenantId;
+    if (!(await db.query.tenants.findFirst({ where: eq(tenants.id, tenantId) }))) {
+      return c.json({ error: "Tenant not found" }, 404);
+    }
     const body = await c.req.json<{ retentionDays?: number }>().catch(() => ({}) as never);
     try {
       const retentionDays = await audit.setRetentionDays(
-        session.tenantId,
+        tenantId,
         Number(body.retentionDays ?? 365),
       );
-      await audit.append(session.tenantId, "audit.retention", {
+      await audit.append(tenantId, "audit.retention", {
         actor: actor(session, clientIpFromHeaders((name) => c.req.header(name))),
         targetType: "tenant",
-        targetId: session.tenantId,
+        targetId: tenantId,
         detail: { retentionDays },
       });
       return c.json({ retentionDays });

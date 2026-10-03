@@ -221,7 +221,8 @@ describe("enterprise identity and tenancy policy on PGlite", () => {
       { id: newId(), tenantId: tenantA, actorType: "system", action: "old-a", detailJson: "{}", createdAt: old },
       { id: newId(), tenantId: tenantB, actorType: "system", action: "old-b", detailJson: "{}", createdAt: old },
     ]);
-    assert.equal(await audit.purgeExpired(), 1);
+    const purged = await Promise.all([audit.purgeExpired(), audit.purgeExpired()]);
+    assert.equal(purged[0]! + purged[1]!, 1);
     assert.equal(await db.query.securityAuditLogs.findFirst({ where: eq(securityAuditLogs.action, "old-a") }), undefined);
     assert.ok(await db.query.securityAuditLogs.findFirst({ where: eq(securityAuditLogs.action, "old-b") }));
   });
@@ -254,9 +255,41 @@ describe("enterprise identity and tenancy policy on PGlite", () => {
     session = { userId: adminA, tenantId: tenantA, email: "enterprise-admin@example.test", role: "admin" };
     assert.equal((await app.request(`http://test/api/usage/users?tenantId=${tenantB}`)).status, 403);
     assert.equal((await app.request("http://test/api/tenant/audit?since=not-a-date")).status, 400);
+    await audit.append(tenantA, "=formula", {
+      actor: { type: "user", id: adminA }, targetType: "user", targetId: "@target",
+      detail: { nested: { password: "hidden", safe: "visible" } },
+    });
+    await audit.append(tenantA, "=formula", {
+      actor: { type: "user", id: adminA }, targetType: "user", targetId: "+target",
+    });
+    const exported = await app.request(
+      `http://test/api/tenant/audit?format=csv&actorId=${adminA}&limit=1`,
+    );
+    assert.equal(exported.status, 200, await exported.clone().text());
+    assert.equal(exported.headers.get("x-audit-total"), "2");
+    assert.equal(exported.headers.get("x-audit-exported"), "1");
+    assert.equal(exported.headers.get("x-audit-truncated"), "true");
+    assert.match(await exported.text(), /'=formula/);
+    const forbiddenRetention = await app.request(
+      `http://test/api/tenant/audit/retention?tenantId=${tenantB}`,
+      { method: "PUT", headers: { "content-type": "application/json" }, body: '{"retentionDays":45}' },
+    );
+    assert.equal(forbiddenRetention.status, 403);
     session = { ...session, isPlatformAdmin: true };
     const crossTenant = await app.request(`http://test/api/usage/users?tenantId=${tenantB}`);
     assert.equal(crossTenant.status, 200, await crossTenant.clone().text());
+    const platformRetention = await app.request(
+      `http://test/api/tenant/audit/retention?tenantId=${tenantB}`,
+      { method: "PUT", headers: { "content-type": "application/json" }, body: '{"retentionDays":45}' },
+    );
+    assert.equal(platformRetention.status, 200, await platformRetention.clone().text());
+    assert.equal(await audit.retentionDays(tenantB), 45);
+    assert.equal(
+      (await app.request("http://test/api/tenant/audit/retention?tenantId=missing", {
+        method: "PUT", headers: { "content-type": "application/json" }, body: "{}",
+      })).status,
+      404,
+    );
 
     process.env.REDIS_URL = "off";
     invalidateAllSuspensions();

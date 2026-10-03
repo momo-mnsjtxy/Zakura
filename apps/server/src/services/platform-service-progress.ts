@@ -30,8 +30,10 @@ export type PlatformServiceProgressSnapshot = {
 
 const store = new Map<string, PlatformServiceProgressSnapshot>();
 const MAX_EVENTS = 400;
+const MAX_SERVICE_PROGRESS = 64;
+export const PLATFORM_PROGRESS_STALE_MS = 30 * 60_000;
 
-function empty(serviceKey: string): PlatformServiceProgressSnapshot {
+function empty(serviceKey: string, now = Date.now()): PlatformServiceProgressSnapshot {
   return {
     serviceKey,
     phase: "idle",
@@ -41,8 +43,32 @@ function empty(serviceKey: string): PlatformServiceProgressSnapshot {
     error: null,
     message: "",
     events: [],
-    updatedAt: Date.now(),
+    updatedAt: now,
   };
+}
+
+function cloneSnapshot(snapshot: PlatformServiceProgressSnapshot): PlatformServiceProgressSnapshot {
+  return {
+    ...snapshot,
+    events: snapshot.events.map((event) => ({ ...event })),
+  };
+}
+
+function pruneStore(): void {
+  if (store.size <= MAX_SERVICE_PROGRESS) return;
+  const oldest = [...store.entries()].sort((a, b) => {
+    if (a[1].running !== b[1].running) return a[1].running ? 1 : -1;
+    return a[1].updatedAt - b[1].updatedAt;
+  });
+  for (const [key] of oldest) {
+    if (store.size <= MAX_SERVICE_PROGRESS) break;
+    store.delete(key);
+  }
+}
+
+function save(serviceKey: string, snapshot: PlatformServiceProgressSnapshot): void {
+  store.set(serviceKey, snapshot);
+  pruneStore();
 }
 
 function publish(serviceKey: string): void {
@@ -50,28 +76,63 @@ function publish(serviceKey: string): void {
   platformEvents.publishAll({
     type: "platform_service_progress",
     serviceKey,
-    snapshot,
+    snapshot: cloneSnapshot(snapshot),
   });
 }
 
 export function getPlatformServiceProgress(
   serviceKey: string,
+  opts: { now?: number; staleAfterMs?: number } = {},
 ): PlatformServiceProgressSnapshot {
-  return store.get(serviceKey) ?? empty(serviceKey);
+  const now = opts.now ?? Date.now();
+  const current = store.get(serviceKey);
+  if (!current) return empty(serviceKey, now);
+  if (
+    current.running &&
+    now - current.updatedAt > (opts.staleAfterMs ?? PLATFORM_PROGRESS_STALE_MS)
+  ) {
+    const message = "deployment progress became stale; reconcile service state";
+    const staleEvent: PlatformServiceProgressEvent = {
+      ts: now,
+      level: "error",
+      step: "stale",
+      message,
+      percent: current.percent,
+    };
+    const stale: PlatformServiceProgressSnapshot = {
+      ...current,
+      phase: "error",
+      running: false,
+      done: true,
+      error: message,
+      message,
+      events: [
+        ...current.events,
+        staleEvent,
+      ].slice(-MAX_EVENTS),
+      updatedAt: now,
+    };
+    save(serviceKey, stale);
+    publish(serviceKey);
+    return cloneSnapshot(stale);
+  }
+  return cloneSnapshot(current);
 }
 
 export function beginPlatformServiceProgress(
   serviceKey: PlatformServiceKey | string,
   phase = "checking",
   message = "准备中…",
+  opts: { now?: number } = {},
 ): void {
-  store.set(serviceKey, {
-    ...empty(serviceKey),
+  const now = opts.now ?? Date.now();
+  save(serviceKey, {
+    ...empty(serviceKey, now),
     phase,
     message,
     running: true,
     percent: 2,
-    updatedAt: Date.now(),
+    updatedAt: now,
   });
   publish(serviceKey);
 }
@@ -80,21 +141,22 @@ export function logPlatformServiceProgress(
   serviceKey: string,
   step: string,
   message: string,
-  opts?: { level?: ProgressLevel; percent?: number; phase?: string },
+  opts?: { level?: ProgressLevel; percent?: number; phase?: string; now?: number },
 ): void {
   const cur = store.get(serviceKey) ?? empty(serviceKey);
+  const now = opts?.now ?? Date.now();
   const percent =
     opts?.percent !== undefined
       ? Math.max(0, Math.min(100, opts.percent))
       : cur.percent;
   const event: PlatformServiceProgressEvent = {
-    ts: Date.now(),
+    ts: now,
     level: opts?.level ?? "info",
     step,
     message,
     percent,
   };
-  store.set(serviceKey, {
+  save(serviceKey, {
     ...cur,
     phase: opts?.phase ?? cur.phase,
     percent,
@@ -104,7 +166,7 @@ export function logPlatformServiceProgress(
     done: false,
     error: null,
     events: [...cur.events, event].slice(-MAX_EVENTS),
-    updatedAt: Date.now(),
+    updatedAt: now,
   });
   publish(serviceKey);
 }
@@ -113,7 +175,13 @@ export function logPlatformServiceProgress(
 export function appendPlatformServiceLog(
   serviceKey: string,
   line: string,
-  opts?: { step?: string; level?: ProgressLevel; phase?: string; percent?: number },
+  opts?: {
+    step?: string;
+    level?: ProgressLevel;
+    phase?: string;
+    percent?: number;
+    now?: number;
+  },
 ): void {
   const text = line.replace(/\r/g, "").trimEnd();
   if (!text.trim()) return;
@@ -125,6 +193,7 @@ export function appendPlatformServiceLog(
       level: opts?.level ?? "info",
       phase: opts?.phase,
       percent: opts?.percent,
+      now: opts?.now,
     });
   }
 }
@@ -133,33 +202,35 @@ export function setPlatformServicePhase(
   serviceKey: string,
   phase: string,
   percent?: number,
+  opts: { now?: number } = {},
 ): void {
   const cur = store.get(serviceKey) ?? empty(serviceKey);
-  store.set(serviceKey, {
+  save(serviceKey, {
     ...cur,
     phase,
     percent: percent ?? cur.percent,
     running: true,
     done: false,
-    updatedAt: Date.now(),
+    updatedAt: opts.now ?? Date.now(),
   });
   publish(serviceKey);
 }
 
 export function finishPlatformServiceProgress(
   serviceKey: string,
-  opts?: { error?: string | null; message?: string },
+  opts?: { error?: string | null; message?: string; now?: number },
 ): void {
   const cur = store.get(serviceKey) ?? empty(serviceKey);
   const error = opts?.error ?? null;
+  const now = opts?.now ?? Date.now();
   const finalEvent: PlatformServiceProgressEvent = {
-    ts: Date.now(),
+    ts: now,
     level: error ? "error" : "ok",
     step: error ? "error" : "done",
     message: opts?.message ?? (error ? error : "完成"),
     percent: 100,
   };
-  store.set(serviceKey, {
+  save(serviceKey, {
     ...cur,
     phase: error ? "error" : "done",
     percent: 100,
@@ -168,7 +239,12 @@ export function finishPlatformServiceProgress(
     error,
     message: opts?.message ?? (error ? error : "完成"),
     events: [...cur.events, finalEvent].slice(-MAX_EVENTS),
-    updatedAt: Date.now(),
+    updatedAt: now,
   });
   publish(serviceKey);
+}
+
+export function clearPlatformServiceProgress(serviceKey?: string): void {
+  if (serviceKey) store.delete(serviceKey);
+  else store.clear();
 }

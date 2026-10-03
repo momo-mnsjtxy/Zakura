@@ -31,13 +31,13 @@ Generated build output is excluded. These counts prevent a carried-over compatib
 
 | Scope | Baseline-identical files | Changed files | Added files | Missing files |
 |---|---:|---:|---:|---:|
-| `apps/server` | 406 | 117 | 69 | 0 |
+| `apps/server` | 383 | 140 | 73 | 0 |
 | `packages/saas` | 7 | 6 | 2 | 0 |
 | `apps/web` | 253 | 45 | 43 | 0 |
-| `packages/core` | 35 | 8 | 18 | 0 |
+| `packages/core` | 29 | 14 | 23 | 0 |
 | `go` | 43 | 3 | 10 | 0 |
 | `apps/oauth-bridge` | 1 | 3 | 5 | 0 |
 | `mcps` | 128 | 0 | 0 | 0 |
 | `packages/shared` | 53 | 0 | 1 | 0 |
 
-Baseline-identical files are mostly presentation/assets, static protocol data, schemas, migrations and still-classified auxiliary business modules. They are not counted as rewritten merely because the complete product remains present. The largest remaining implementation scopes are network/tunnel/exposure, observability/deployment, OS-specific desktop/CDP adapters, several auxiliary agent/automation services, and presentational web composition. Follow `MIGRATION_PLAN.md` until those modules are either substantively migrated or deliberately classified compatibility data and every Stage 9 gate is green.
+Baseline-identical files are mostly presentation/assets, static protocol data, schemas, migrations and still-classified auxiliary business modules. They are not counted as rewritten merely because the complete product remains present. Network/exposure, observability lifecycle, desktop/CDP state, automation, audit export, model upstream administration and local filesystem/image runtime lifecycle are now migrated. The largest remaining scopes are deployment/installer wrappers, a smaller set of OS/provider-specific adapters and agent helpers, and presentational web composition. Follow `MIGRATION_PLAN.md` until those modules are either substantively migrated or deliberately classified compatibility data and every Stage 9 gate is green.

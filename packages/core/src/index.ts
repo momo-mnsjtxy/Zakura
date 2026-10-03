@@ -37,6 +37,8 @@ export type {
   ExtractResult,
 } from "./workspace-fs.js";
 export { LocalWorkspaceFs, contentRevision, ensureWorkspaceDir } from "./local-workspace-fs.js";
+export { LocalFileMutationLifecycle, nodeLocalFileOperations } from "./local-file-operations.js";
+export type { LocalFileOperations, AtomicWriteOptions } from "./local-file-operations.js";
 export {
   matchExcludePattern,
   shouldExcludePath,
@@ -116,8 +118,10 @@ export {
   classifyHttpMethod,
   Telemetry,
   initTelemetry,
+  initTelemetryAsync,
   getTelemetry,
   resetTelemetry,
+  resetTelemetryAsync,
   log,
   recordPlatformFault,
   recordHttpRequest,
@@ -169,3 +173,5 @@ export * from "./runner-archive.js";
 export * from "./json-rpc-client.js";
 
 export * from "./runner-request.js";
+
+export * from "./image-probe-lifecycle.js";

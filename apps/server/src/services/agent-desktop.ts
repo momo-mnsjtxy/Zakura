@@ -21,31 +21,87 @@ type A11ySnapshot = {
 };
 type SnapshotRefs = { session: string; expires: number; nodes: Map<string, A11yHandle> };
 type DesktopState = { snapshot?: SnapshotRefs; pending?: Promise<unknown>; lastUsed: number };
-const desktopStates = new WeakMap<Workspace, { agents: Map<string, DesktopState>; nextRef: number }>();
+type DesktopOwner = {
+  agents: Map<string, DesktopState>;
+  generations: Map<string, number>;
+  nextRef: number;
+  disposed: boolean;
+};
+const desktopStates = new WeakMap<Workspace, DesktopOwner>();
+const disposedDesktopWorkspaces = new WeakSet<Workspace>();
 const REF_TTL_MS = 5 * 60_000;
 const refreshSnapshot = "Run computer_observe observe=snapshot again.";
 const SNAPSHOT_OUTPUT_LIMIT = 10_000;
 
 /** Keep observations and input ordered, including parallel calls in a tool batch. */
 async function serialDesktop<T>(workspace: Workspace, agent: AgentWithSpace, operation: (state: DesktopState, nextRef: () => string) => Promise<T>): Promise<T> {
+  if (disposedDesktopWorkspaces.has(workspace)) {
+    throw new Error("Desktop service is shutting down");
+  }
   let owner = desktopStates.get(workspace);
-  if (!owner) desktopStates.set(workspace, owner = { agents: new Map(), nextRef: 0 });
+  if (!owner) desktopStates.set(workspace, owner = {
+    agents: new Map(), generations: new Map(), nextRef: 0, disposed: false,
+  });
+  if (owner.disposed) throw new Error("Desktop service is shutting down");
   for (const [key, state] of owner.agents) {
     if (!state.pending && state.lastUsed + REF_TTL_MS < Date.now()) owner.agents.delete(key);
   }
   const key = JSON.stringify([agent.tenantId, agent.id, agent.runtimeNodeId]);
+  const generation = owner.generations.get(key) ?? 0;
   let state = owner.agents.get(key);
   if (!state) owner.agents.set(key, state = { lastUsed: Date.now() });
   const current = state;
   const counter = owner;
   const pending = (current.pending ?? Promise.resolve()).catch(() => undefined)
-    .then(() => operation(current, () => `e${++counter.nextRef}`));
+    .then(async () => {
+      if (counter.disposed || (counter.generations.get(key) ?? 0) !== generation) {
+        throw new Error("Desktop state was reset; observe the workspace again");
+      }
+      const result = await operation(current, () => `e${++counter.nextRef}`);
+      if (counter.disposed || (counter.generations.get(key) ?? 0) !== generation) {
+        current.snapshot = undefined;
+        throw new Error("Desktop state changed during the operation; observe before retrying");
+      }
+      return result;
+    });
   current.pending = pending;
   try { return await pending; }
   finally {
     if (current.pending === pending) current.pending = undefined;
     current.lastUsed = Date.now();
   }
+}
+
+/** Invalidate refs and queued calls for one Agent across runner migrations. */
+export function resetDesktopAgent(
+  workspace: Workspace,
+  agent: Pick<AgentWithSpace, "tenantId" | "id">,
+): void {
+  const owner = desktopStates.get(workspace);
+  if (!owner) return;
+  for (const key of new Set([...owner.agents.keys(), ...owner.generations.keys()])) {
+    try {
+      const [tenantId, agentId] = JSON.parse(key) as [string, string];
+      if (tenantId !== agent.tenantId || agentId !== agent.id) continue;
+    } catch {
+      continue;
+    }
+    owner.generations.set(key, (owner.generations.get(key) ?? 0) + 1);
+    owner.agents.delete(key);
+  }
+}
+
+/** Reject queued work and drop all cached desktop refs during server shutdown. */
+export function disposeDesktopState(workspace: Workspace): void {
+  disposedDesktopWorkspaces.add(workspace);
+  const owner = desktopStates.get(workspace);
+  if (!owner) return;
+  owner.disposed = true;
+  for (const key of new Set([...owner.agents.keys(), ...owner.generations.keys()])) {
+    owner.generations.set(key, (owner.generations.get(key) ?? 0) + 1);
+  }
+  owner.agents.clear();
+  desktopStates.delete(workspace);
 }
 
 const xdotoolScript = `set -eu

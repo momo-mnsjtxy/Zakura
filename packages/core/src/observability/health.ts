@@ -6,7 +6,7 @@ export type HealthCheckResult = {
   message?: string;
 };
 
-export type HealthCheck = () => Promise<HealthCheckResult> | HealthCheckResult;
+export type HealthCheck = (signal?: AbortSignal) => Promise<HealthCheckResult> | HealthCheckResult;
 
 export type LiveStatus = {
   status: "ok";
@@ -30,13 +30,17 @@ type RegisteredCheck = {
   timeoutMs: number;
 };
 
-async function withTimeout<T>(work: Promise<T>, timeoutMs: number): Promise<T> {
+async function withTimeout<T>(work: (signal: AbortSignal) => Promise<T>, timeoutMs: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
+  const controller = new AbortController();
   try {
     return await Promise.race([
-      work,
+      work(controller.signal),
       new Promise<T>((_, reject) => {
-        timer = setTimeout(() => reject(new Error("health check timeout")), timeoutMs);
+        timer = setTimeout(() => {
+          reject(new Error("health check timeout"));
+          controller.abort();
+        }, timeoutMs);
       }),
     ]);
   } finally {
@@ -45,7 +49,7 @@ async function withTimeout<T>(work: Promise<T>, timeoutMs: number): Promise<T> {
 }
 
 export class HealthRegistry {
-  private readonly checks: RegisteredCheck[] = [];
+  private readonly checks = new Map<string, RegisteredCheck>();
   private booted = false;
 
   constructor(
@@ -59,7 +63,9 @@ export class HealthRegistry {
     check: HealthCheck,
     opts?: { critical?: boolean; timeoutMs?: number },
   ): void {
-    this.checks.push({
+    // Registration is keyed: a component restart/reload replaces its prior
+    // callback rather than running duplicate probes under the same result key.
+    this.checks.set(name, {
       name,
       check,
       critical: opts?.critical ?? true,
@@ -93,10 +99,10 @@ export class HealthRegistry {
     }
 
     await Promise.all(
-      this.checks.map(async (entry) => {
+      [...this.checks.values()].map(async (entry) => {
         const t0 = performance.now();
         try {
-          const result = await withTimeout(Promise.resolve(entry.check()), entry.timeoutMs);
+          const result = await withTimeout((signal) => Promise.resolve(entry.check(signal)), entry.timeoutMs);
           const latencyMs = Math.round(performance.now() - t0);
           checks[entry.name] = { ...result, latencyMs: result.latencyMs ?? latencyMs };
           if (entry.critical && result.status === "down") failed = true;

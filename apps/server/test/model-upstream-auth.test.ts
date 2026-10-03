@@ -2,6 +2,7 @@ import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import {
   CODEX_OAUTH_CLIENT_ID,
+  defaultJsonHttp,
   ModelUpstreamAuthService,
   parseClaudeCallback,
   parseGeminiCliCreds,
@@ -27,6 +28,52 @@ import type { ResolvedRoute } from "../src/model-router/types.js";
 import type { Db } from "../src/db/client.js";
 
 registerBuiltinModelAdapters();
+
+describe("default OAuth JSON transport", () => {
+  it("bounds stalled requests and propagates caller cancellation", async () => {
+    const restore = stubFetch(async (_url, init) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener(
+          "abort",
+          () => reject(init.signal?.reason),
+          { once: true },
+        );
+      }));
+    try {
+      const http = defaultJsonHttp();
+      await assert.rejects(
+        http.getJson("https://oauth.invalid/stalled", undefined, { timeoutMs: 10 }),
+        (error: unknown) => error instanceof Error && error.name === "TimeoutError",
+      );
+      const controller = new AbortController();
+      const pending = http.postJson(
+        "https://oauth.invalid/cancel",
+        {},
+        undefined,
+        { signal: controller.signal, timeoutMs: 10_000 },
+      );
+      controller.abort(new Error("caller cancelled"));
+      await assert.rejects(pending, /caller cancelled/);
+    } finally {
+      restore();
+    }
+  });
+
+  it("preserves non-2xx status and JSON bodies for provider parsers", async () => {
+    const restore = stubFetch(async () =>
+      Response.json({ error: "invalid_grant" }, { status: 400 }));
+    try {
+      const result = await defaultJsonHttp().postForm(
+        "https://oauth.invalid/token",
+        { grant_type: "refresh_token" },
+      );
+      assert.equal(result.status, 400);
+      assert.deepEqual(result.json, { error: "invalid_grant" });
+    } finally {
+      restore();
+    }
+  });
+});
 
 function jwtWith(payload: Record<string, unknown>): string {
   const head = Buffer.from(JSON.stringify({ alg: "none" })).toString("base64url");

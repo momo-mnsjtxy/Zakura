@@ -5,7 +5,7 @@ import {
   type ModelCapability,
 } from "@zakura/shared";
 import type { Db } from "../db/client.js";
-import { modelRoutes, newId, type ModelRoute } from "../db/schema.js";
+import { modelRoutes, newId, tenants, type ModelRoute } from "../db/schema.js";
 import { parseJsonRecord, parseRouteOptions } from "../model-router/types.js";
 import { serializeUpstream, type ModelUpstreamsService } from "./model-upstreams.js";
 
@@ -141,12 +141,8 @@ export class ModelRoutesService {
     }
 
     const isDefault = input.isDefault === true;
-    if (isDefault) await this.clearDefault(tenantId, input.capability);
-
     const now = new Date();
-    const [row] = await this.db
-      .insert(modelRoutes)
-      .values({
+    const values = {
         id: newId(),
         tenantId,
         name,
@@ -162,8 +158,20 @@ export class ModelRoutesService {
         status: "ready",
         createdAt: now,
         updatedAt: now,
-      })
-      .returning();
+      };
+    const insert = async (database: Db) => {
+      const [row] = await database.insert(modelRoutes).values(values).returning();
+      if (!row) throw new Error("route create failed");
+      return row;
+    };
+    const row = isDefault
+      ? await this.db.transaction(async (tx) => {
+          const database = tx as unknown as Db;
+          await this.lockTenant(database, tenantId);
+          await this.clearDefault(tenantId, input.capability, database);
+          return insert(database);
+        })
+      : await insert(this.db);
     this.onMutate?.(tenantId);
     return serializeRoute(row, serializeUpstream(upstream));
   }
@@ -188,10 +196,6 @@ export class ModelRoutesService {
       const upstream = await this.upstreams.getRow(tenantId, patch.upstreamId);
       if (!upstream) throw new Error("上游不存在");
     }
-    if (patch.isDefault === true) {
-      await this.clearDefault(tenantId, row.capability as ModelCapability);
-    }
-
     const updates: Partial<ModelRoute> = { updatedAt: new Date() };
     if (typeof patch.name === "string" && patch.name.trim()) updates.name = patch.name.trim();
     if (typeof patch.model === "string" && patch.model.trim()) {
@@ -207,42 +211,82 @@ export class ModelRoutesService {
     if (typeof patch.isDefault === "boolean") updates.isDefault = patch.isDefault;
     if (patch.upstreamId) updates.upstreamId = patch.upstreamId;
 
-    const [next] = await this.db
-      .update(modelRoutes)
-      .set(updates)
-      .where(and(eq(modelRoutes.id, id), eq(modelRoutes.tenantId, tenantId)))
-      .returning();
+    const mutate = async (database: Db) => {
+      const [next] = await database
+        .update(modelRoutes)
+        .set(updates)
+        .where(and(eq(modelRoutes.id, id), eq(modelRoutes.tenantId, tenantId)))
+        .returning();
+      if (!next) throw new Error("Not found");
+      return next;
+    };
+    const next = patch.isDefault === true
+      ? await this.db.transaction(async (tx) => {
+          const database = tx as unknown as Db;
+          await this.lockTenant(database, tenantId);
+          await this.clearDefault(
+            tenantId,
+            row.capability as ModelCapability,
+            database,
+          );
+          return mutate(database);
+        })
+      : await mutate(this.db);
     const upstream = await this.upstreams.get(tenantId, next.upstreamId);
     this.onMutate?.(tenantId);
     return serializeRoute(next, upstream ?? undefined);
   }
 
   async remove(tenantId: string, id: string) {
-    const row = await this.getRow(tenantId, id);
-    if (!row) return;
-    await this.db
-      .delete(modelRoutes)
-      .where(and(eq(modelRoutes.id, id), eq(modelRoutes.tenantId, tenantId)));
-    if (row.isDefault) {
-      const next = await this.db.query.modelRoutes.findFirst({
-        where: and(
-          eq(modelRoutes.tenantId, tenantId),
-          eq(modelRoutes.capability, row.capability),
-        ),
-        orderBy: [asc(modelRoutes.priority), asc(modelRoutes.createdAt)],
+    const removed = await this.db.transaction(async (tx) => {
+      const database = tx as unknown as Db;
+      await this.lockTenant(database, tenantId);
+      const row = await database.query.modelRoutes.findFirst({
+        where: and(eq(modelRoutes.id, id), eq(modelRoutes.tenantId, tenantId)),
       });
-      if (next) {
-        await this.db
-          .update(modelRoutes)
-          .set({ isDefault: true, updatedAt: new Date() })
-          .where(eq(modelRoutes.id, next.id));
+      if (!row) return false;
+      await database
+        .delete(modelRoutes)
+        .where(and(eq(modelRoutes.id, id), eq(modelRoutes.tenantId, tenantId)));
+      if (row.isDefault) {
+        const next = await database.query.modelRoutes.findFirst({
+          where: and(
+            eq(modelRoutes.tenantId, tenantId),
+            eq(modelRoutes.capability, row.capability),
+          ),
+          orderBy: [asc(modelRoutes.priority), asc(modelRoutes.createdAt)],
+        });
+        if (next) {
+          await database
+            .update(modelRoutes)
+            .set({ isDefault: true, updatedAt: new Date() })
+            .where(
+              and(
+                eq(modelRoutes.id, next.id),
+                eq(modelRoutes.tenantId, tenantId),
+              ),
+            );
+        }
       }
-    }
-    this.onMutate?.(tenantId);
+      return true;
+    });
+    if (removed) this.onMutate?.(tenantId);
   }
 
-  private async clearDefault(tenantId: string, capability: ModelCapability) {
-    await this.db
+  private async lockTenant(database: Db, tenantId: string): Promise<void> {
+    await database
+      .select({ id: tenants.id })
+      .from(tenants)
+      .where(eq(tenants.id, tenantId))
+      .for("update");
+  }
+
+  private async clearDefault(
+    tenantId: string,
+    capability: ModelCapability,
+    database: Db = this.db,
+  ) {
+    await database
       .update(modelRoutes)
       .set({ isDefault: false, updatedAt: new Date() })
       .where(

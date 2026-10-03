@@ -12,6 +12,9 @@ import type { DockerRuntime } from "./runtime/docker.js";
 
 export const SERVER_VERSION = "0.2.0";
 
+const registeredHealth = new WeakSet<Telemetry>();
+const mountedProbeApps = new WeakSet<object>();
+
 export function initServerTelemetry(): Telemetry {
   return initTelemetry({
     service: "zakura",
@@ -33,11 +36,16 @@ export async function probeDb(db: Db): Promise<HealthCheckResult> {
   }
 }
 
-export async function probeRedis(): Promise<HealthCheckResult> {
-  if (!isRedisEnabled()) return { status: "disabled" };
+export async function probeRedis(deps: {
+  enabled?: () => boolean;
+  getClient?: typeof getRedis;
+} = {}): Promise<HealthCheckResult> {
+  const enabled = deps.enabled ?? isRedisEnabled;
+  const getClient = deps.getClient ?? getRedis;
+  if (!enabled()) return { status: "disabled" };
   const t0 = performance.now();
   try {
-    const client = await getRedis();
+    const client = await getClient();
     if (!client) return { status: "disabled" };
     await client.ping();
     return { status: "up", latencyMs: Math.round(performance.now() - t0) };
@@ -52,10 +60,18 @@ export async function probeRedis(): Promise<HealthCheckResult> {
 
 export async function probeDocker(runtime: DockerRuntime): Promise<HealthCheckResult> {
   const t0 = performance.now();
-  const ping = await runtime.ping();
-  const latencyMs = Math.round(performance.now() - t0);
-  if (ping.ok) return { status: "up", latencyMs };
-  return { status: "down", latencyMs, message: ping.error };
+  try {
+    const ping = await runtime.ping();
+    const latencyMs = Math.round(performance.now() - t0);
+    if (ping.ok) return { status: "up", latencyMs };
+    return { status: "down", latencyMs, message: ping.error };
+  } catch (err) {
+    return {
+      status: "down",
+      latencyMs: Math.round(performance.now() - t0),
+      message: err instanceof Error ? err.message : "docker probe failed",
+    };
+  }
 }
 
 export function registerServerHealthChecks(opts: {
@@ -63,6 +79,8 @@ export function registerServerHealthChecks(opts: {
   runtime: DockerRuntime;
 }): void {
   const telemetry = getTelemetry();
+  if (registeredHealth.has(telemetry)) return;
+  registeredHealth.add(telemetry);
   telemetry.registerCheck("db", () => probeDb(opts.db), { critical: true });
   telemetry.registerCheck("redis", () => probeRedis(), {
     critical: isRedisEnabled(),
@@ -74,6 +92,8 @@ export function registerServerHealthChecks(opts: {
 
 /** Liveness / readiness / Prometheus. No tenant data. Public. */
 export function mountPlatformProbes(app: Hono): void {
+  if (mountedProbeApps.has(app)) return;
+  mountedProbeApps.add(app);
   const live = (c: { json: (body: unknown, status?: 200) => Response }) =>
     c.json(getTelemetry().health.live(), 200);
 

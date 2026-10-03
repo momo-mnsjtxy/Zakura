@@ -51,16 +51,44 @@ export async function collectNodeImages(
   return [...out].map(([image, kind]) => ({ image, kind }));
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+export type ImageUpdateScheduler = {
+  setTimeout: typeof setTimeout;
+  clearTimeout: typeof clearTimeout;
+  setInterval: typeof setInterval;
+  clearInterval: typeof clearInterval;
+};
+
+export type ImageUpdateCheckerOptions = {
+  scheduler?: ImageUpdateScheduler;
+  now?: () => number;
+  intervalMs?: number;
+  bootstrapDelayMs?: number;
+  nodeProbeTimeoutMs?: number;
+  drainTimeoutMs?: number;
+};
+
+const defaultScheduler: ImageUpdateScheduler = {
+  setTimeout,
+  clearTimeout,
+  setInterval,
+  clearInterval,
+};
+
+function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  label: string,
+  scheduler: ImageUpdateScheduler,
+): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`${label} 超时（${ms}ms）`)), ms);
+    const timer = scheduler.setTimeout(() => reject(new Error(`${label} 超时（${ms}ms）`)), ms);
     promise.then(
       (v) => {
-        clearTimeout(timer);
+        scheduler.clearTimeout(timer);
         resolve(v);
       },
       (e) => {
-        clearTimeout(timer);
+        scheduler.clearTimeout(timer);
         reject(e);
       },
     );
@@ -71,43 +99,73 @@ export class ImageUpdateChecker {
   private timer: ReturnType<typeof setInterval> | null = null;
   private bootstrapTimer: ReturnType<typeof setTimeout> | null = null;
   /** Re-entrancy guard: a slow sweep must not overlap the next interval. */
-  private ticking = false;
+  private activeSweep: Promise<void> | null = null;
   private readonly cache = new Map<string, NodeImageUpdateStatus>();
   private readonly inFlight = new Map<string, Promise<NodeImageUpdateStatus>>();
+  private readonly scheduler: ImageUpdateScheduler;
+  private readonly now: () => number;
+  private readonly intervalMs: number;
+  private readonly bootstrapDelayMs: number;
+  private readonly nodeProbeTimeoutMs: number;
+  private readonly drainTimeoutMs: number;
 
   constructor(
     private readonly db: Db,
     private readonly nodes: RuntimeNodeService,
     _docker?: DockerRuntime,
+    opts: ImageUpdateCheckerOptions = {},
   ) {
     void _docker;
+    this.scheduler = opts.scheduler ?? defaultScheduler;
+    this.now = opts.now ?? Date.now;
+    this.intervalMs = opts.intervalMs ?? CHECK_INTERVAL_MS;
+    this.bootstrapDelayMs = opts.bootstrapDelayMs ?? 30_000;
+    this.nodeProbeTimeoutMs = opts.nodeProbeTimeoutMs ?? NODE_PROBE_TIMEOUT_MS;
+    this.drainTimeoutMs = opts.drainTimeoutMs ?? 5_000;
   }
 
   start(): void {
-    if (this.timer) return;
-    this.timer = setInterval(() => void this.tick(), CHECK_INTERVAL_MS);
+    if (this.timer || this.bootstrapTimer) return;
+    this.timer = this.scheduler.setInterval(() => void this.runOnce(), this.intervalMs);
     this.timer.unref?.();
     // Delay the first sweep so Runners have time to register.
-    this.bootstrapTimer = setTimeout(() => void this.tick(), 30_000);
+    this.bootstrapTimer = this.scheduler.setTimeout(() => {
+      this.bootstrapTimer = null;
+      void this.runOnce();
+    }, this.bootstrapDelayMs);
     this.bootstrapTimer.unref?.();
-    log.info("image_update_checker.started", { interval_ms: CHECK_INTERVAL_MS });
+    log.info("image_update_checker.started", { interval_ms: this.intervalMs });
   }
 
   stop(): void {
     if (this.timer) {
-      clearInterval(this.timer);
+      this.scheduler.clearInterval(this.timer);
       this.timer = null;
     }
     // Previously leaked: stopping within 30s of boot still fired one sweep.
     if (this.bootstrapTimer) {
-      clearTimeout(this.bootstrapTimer);
+      this.scheduler.clearTimeout(this.bootstrapTimer);
       this.bootstrapTimer = null;
     }
   }
 
+  async stopAndDrain(): Promise<void> {
+    this.stop();
+    const active = this.activeSweep;
+    if (!active) return;
+    await new Promise<void>((resolve) => {
+      const timer = this.scheduler.setTimeout(resolve, this.drainTimeoutMs);
+      timer.unref?.();
+      void active.finally(() => {
+        this.scheduler.clearTimeout(timer);
+        resolve();
+      });
+    });
+  }
+
   /** Cached status across all nodes, for the global indicator. */
   getAllStatuses(): NodeImageUpdateStatus[] {
-    const now = Date.now();
+    const now = this.now();
     return [...this.cache.values()].filter((e) => now - e.checkedAt <= STALE_AFTER_MS);
   }
 
@@ -137,13 +195,12 @@ export class ImageUpdateChecker {
     return check;
   }
 
-  private async tick(): Promise<void> {
-    if (this.ticking) {
+  async runOnce(): Promise<void> {
+    if (this.activeSweep) {
       log.debug("image_update_checker.tick_skipped_overlap");
-      return;
+      return this.activeSweep;
     }
-    this.ticking = true;
-    try {
+    const sweep = (async () => {
       const nodes = await this.db.query.runtimeNodes.findMany({
         where: inArray(runtimeNodes.kind, ["local", "computer", "server", "runner"]),
       });
@@ -152,11 +209,20 @@ export class ImageUpdateChecker {
         try {
           const status = await withTimeout(
             this.probeNode(node.id),
-            NODE_PROBE_TIMEOUT_MS,
+            this.nodeProbeTimeoutMs,
             `节点 ${node.slug ?? node.id} 镜像探测`,
+            this.scheduler,
           );
           this.cache.set(node.id, status);
         } catch (err) {
+          this.cache.set(node.id, {
+            nodeId: node.id,
+            checkedAt: this.now(),
+            entries: [],
+            hasUpdates: false,
+            hasRunningStale: false,
+            error: err instanceof Error ? err.message : String(err),
+          });
           // warn, not debug: a silently failing probe is indistinguishable from
           // "no updates" in the UI, which is exactly how this stayed unnoticed.
           log.warn("image_update_checker.node_failed", {
@@ -165,12 +231,16 @@ export class ImageUpdateChecker {
           });
         }
       }
-    } catch (err) {
+    })().catch((err) => {
       log.warn("image_update_checker.tick_failed", {
         error: err instanceof Error ? err.message : String(err),
       });
+    });
+    this.activeSweep = sweep;
+    try {
+      await sweep;
     } finally {
-      this.ticking = false;
+      if (this.activeSweep === sweep) this.activeSweep = null;
     }
   }
 
@@ -239,7 +309,7 @@ export class ImageUpdateChecker {
 
       return {
         nodeId,
-        checkedAt: Date.now(),
+        checkedAt: this.now(),
         entries,
         hasUpdates: entries.some((e) => e.updateAvailable),
         hasRunningStale: entries.some((e) => e.runningStale),
@@ -248,7 +318,7 @@ export class ImageUpdateChecker {
     } catch (err) {
       return {
         nodeId,
-        checkedAt: Date.now(),
+        checkedAt: this.now(),
         entries: [],
         hasUpdates: false,
         hasRunningStale: false,

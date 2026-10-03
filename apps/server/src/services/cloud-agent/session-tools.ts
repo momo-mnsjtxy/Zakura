@@ -73,6 +73,11 @@ export function listSessionToolDefinitions(): ModelToolDefinition[] {
               maximum: 30,
               default: 10,
             },
+            include_archived: {
+              type: "boolean",
+              default: false,
+              description: "Also search archived chat sessions",
+            },
           },
           required: ["query"],
         },
@@ -148,9 +153,14 @@ async function loadSessionMessages(
   sessionId: string,
 ): Promise<{ messages: ReturnType<typeof eventsToMessages>; turns: number }> {
   const lastCompaction = await store.getLastCompaction(sessionId);
-  const events = await store.listEventsForChain(sessionId, {
-    afterSeq: lastCompaction?.seq ?? 0,
+  // Reuse/import is a summary workflow, not model replay. Bound it to the same
+  // deterministic UI history window so a pre-compaction legacy session cannot
+  // load 50k event payloads into one tool call.
+  const page = await store.listEventsForUi(sessionId, {
+    keepUserMessages: 80,
+    maxEvents: 5_000,
   });
+  const events = page.events.filter((event) => event.seq > (lastCompaction?.seq ?? 0));
   const stored = events.map((e) => ({
     type: e.type,
     runId: e.runId,
@@ -208,6 +218,7 @@ export async function callSessionTool(
         agentId: agent.id,
         limit,
         kinds: ["chat"],
+        includeArchived: args.include_archived === true,
       });
       return {
         text: JSON.stringify(

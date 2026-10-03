@@ -7,7 +7,11 @@ import { afterEach, beforeEach, test } from "node:test";
 import { setImmediate as nextTick } from "node:timers/promises";
 import type { Db } from "../src/db/client.js";
 import type { RuntimeNodeService } from "../src/services/runtime-nodes.js";
-import { ImageUpdateChecker } from "../src/services/image-update-checker.js";
+import {
+  ImageUpdateChecker,
+  type ImageUpdateCheckerOptions,
+  type ImageUpdateScheduler,
+} from "../src/services/image-update-checker.js";
 
 let directory: string;
 let digest: string;
@@ -36,18 +40,34 @@ afterEach(async () => {
   await rm(directory, { recursive: true, force: true });
 });
 
-function harness(options: { docker?: boolean; failWorkspace?: boolean; gate?: Promise<void> } = {}) {
+function harness(options: {
+  docker?: boolean;
+  failWorkspace?: boolean;
+  gate?: Promise<void>;
+  checkerOptions?: ImageUpdateCheckerOptions;
+} = {}) {
   const calls = { light: 0, full: 0, images: 0, select: 0 };
-  const state = { sha256: "ab".repeat(32) };
+  const state = { sha256: "ab".repeat(32), failRunner: false };
   const info = () => ({ version: "old", goos: "linux", goarch: "amd64", sha256: state.sha256 });
-  const node = { id: "node", tenantId: "owner", kind: "computer", agentVersion: "old" };
+  const node = {
+    id: "node",
+    tenantId: "owner",
+    kind: "computer",
+    agentVersion: "old",
+    status: "online",
+    slug: "node",
+  };
   const db = {
-    query: { runtimeNodes: { async findFirst() { return node; } } },
+    query: { runtimeNodes: {
+      async findFirst() { return node; },
+      async findMany() { return [node]; },
+    } },
     select() { calls.select++; return { from: () => ({ where: async () => [] }) }; },
   };
   const nodes = {
     async requireRunnerClient(_tenantId: string, _nodeId: string, request: { skipHeartbeatRefresh?: boolean }) {
       assert.equal(request.skipHeartbeatRefresh, true);
+      if (state.failRunner) throw new Error("runner unavailable");
       return { client: {
         async systemVersion() { calls.light++; await options.gate; return { ...info(), image: "/agent", containerId: null }; },
         async ping() { calls.full++; return { ...info(), ok: true, docker: { ok: options.docker !== false } }; },
@@ -63,7 +83,16 @@ function harness(options: { docker?: boolean; failWorkspace?: boolean; gate?: Pr
       } };
     },
   };
-  return { calls, state, checker: new ImageUpdateChecker(db as unknown as Db, nodes as unknown as RuntimeNodeService) };
+  return {
+    calls,
+    state,
+    checker: new ImageUpdateChecker(
+      db as unknown as Db,
+      nodes as unknown as RuntimeNodeService,
+      undefined,
+      options.checkerOptions,
+    ),
+  };
 }
 
 test("agent-only checks use lightweight info without collecting or probing workspace images", async () => {
@@ -121,4 +150,45 @@ test("concurrent checks for the same node and scope share one probe", async () =
   const results = await Promise.all([first, second]);
   assert.equal(calls.light, 1);
   assert.deepEqual(results[0], results[1]);
+});
+
+test("a failed background sweep replaces stale success with an explicit error", async () => {
+  let now = 1_000;
+  const { checker, state } = harness({ checkerOptions: { now: () => now } });
+  const first = await checker.checkNode("node");
+  assert.equal(first.error, null);
+  state.failRunner = true;
+  now = 2_000;
+  await checker.runOnce();
+  const [cached] = checker.getAllStatuses();
+  assert.equal(cached.error, "runner unavailable");
+  assert.equal(cached.checkedAt, 2_000);
+  assert.equal(cached.hasUpdates, false);
+});
+
+test("stop cancels bootstrap and recurring schedules", () => {
+  const timeouts = new Map<object, () => void>();
+  const intervals = new Map<object, () => void>();
+  const scheduler: ImageUpdateScheduler = {
+    setTimeout: ((fn: () => void) => {
+      const handle = { unref() {} };
+      timeouts.set(handle, fn);
+      return handle;
+    }) as typeof setTimeout,
+    clearTimeout: ((handle: object) => timeouts.delete(handle)) as typeof clearTimeout,
+    setInterval: ((fn: () => void) => {
+      const handle = { unref() {} };
+      intervals.set(handle, fn);
+      return handle;
+    }) as typeof setInterval,
+    clearInterval: ((handle: object) => intervals.delete(handle)) as typeof clearInterval,
+  };
+  const { checker } = harness({ checkerOptions: { scheduler } });
+  checker.start();
+  checker.start();
+  assert.equal(timeouts.size, 1);
+  assert.equal(intervals.size, 1);
+  checker.stop();
+  assert.equal(timeouts.size, 0);
+  assert.equal(intervals.size, 0);
 });

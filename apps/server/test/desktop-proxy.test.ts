@@ -135,4 +135,59 @@ describe("desktop proxy", { timeout: 5000 }, () => {
     }
     assert.equal(starts, 0);
   });
+
+  it("buffers early terminal input, serializes polling and kills the late shell on close", async (t) => {
+    const server = createServer();
+    const shell = deferred<any>();
+    const inputs: string[] = [];
+    let killed = 0;
+    let polling = 0;
+    let maxPolling = 0;
+    const snapshot = {
+      jobId: "shell-1", terminalOutput: "", terminalOffset: 0,
+      stdout: "", stderr: "", running: true, exitCode: null,
+    };
+    createDesktopProxyGateway(server, {
+      config: { secret: "desktop-proxy-test" } as never,
+      agentService: {
+        get: async () => ({ id: "a", tenantId: "t", enableComputer: true }),
+        workspace: {
+          startShellJob: async () => shell.promise,
+          waitShellJob: async (_agent: unknown, _jobId: string, _wait: number, opts: { stdin?: string }) => {
+            if (opts.stdin) inputs.push(opts.stdin);
+            return snapshot;
+          },
+          resizeShellJob: async () => snapshot,
+          killShellJob: async () => { killed += 1; },
+          getShellJob: async () => {
+            polling += 1;
+            maxPolling = Math.max(maxPolling, polling);
+            await new Promise((resolve) => setTimeout(resolve, 180));
+            polling -= 1;
+            return snapshot;
+          },
+        },
+      } as never,
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    t.after(async () => {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    });
+    const token = signWorkspaceConnectionTicket("desktop-proxy-test", "t", "a", "terminal");
+    const ws = new WebSocket(
+      `ws://127.0.0.1:${(server.address() as { port: number }).port}/api/agents/a/terminal-proxy?token=${encodeURIComponent(token)}`,
+    );
+    await once(ws, "open");
+    ws.send(JSON.stringify({ type: "input", data: "early command\n" }));
+    shell.resolve(snapshot);
+    await waitFor(() => inputs.length === 1);
+    assert.deepEqual(inputs, ["early command\n"]);
+    await new Promise((resolve) => setTimeout(resolve, 420));
+    assert.equal(maxPolling, 1);
+    ws.close();
+    await once(ws, "close");
+    await waitFor(() => killed === 1);
+    assert.equal(killed, 1);
+  });
 });

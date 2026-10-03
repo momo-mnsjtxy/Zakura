@@ -16,6 +16,60 @@ export function isModelUpstreamProtocol(v: string): v is ModelUpstreamProtocol {
   return (MODEL_UPSTREAM_PROTOCOLS as readonly string[]).includes(v);
 }
 
+export const MODEL_UPSTREAM_SECRET_KEEP_VALUE = "***";
+
+function sensitiveConfigKey(key: string): boolean {
+  return /api.?key|secret|token|password|authorization/i.test(key);
+}
+
+function redactConfig(raw: Record<string, unknown>): Record<string, unknown> {
+  const publicConfig: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (key === "oauthEnc") continue;
+    if (key === "extraHeaders" && value && typeof value === "object" && !Array.isArray(value)) {
+      publicConfig.extraHeaders = Object.fromEntries(
+        Object.keys(value as Record<string, unknown>).map((name) => [
+          name,
+          MODEL_UPSTREAM_SECRET_KEEP_VALUE,
+        ]),
+      );
+      continue;
+    }
+    publicConfig[key] = sensitiveConfigKey(key) && value
+      ? MODEL_UPSTREAM_SECRET_KEEP_VALUE
+      : value;
+  }
+  return publicConfig;
+}
+
+function mergeConfigPreservingSecrets(
+  previous: Record<string, unknown>,
+  patch: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...previous, ...patch };
+  for (const [key, value] of Object.entries(patch)) {
+    if (
+      sensitiveConfigKey(key) &&
+      (value === MODEL_UPSTREAM_SECRET_KEEP_VALUE || value === "" || value === undefined)
+    ) {
+      merged[key] = previous[key];
+    }
+  }
+  if (patch.extraHeaders && typeof patch.extraHeaders === "object" && !Array.isArray(patch.extraHeaders)) {
+    const priorHeaders =
+      previous.extraHeaders && typeof previous.extraHeaders === "object" && !Array.isArray(previous.extraHeaders)
+        ? (previous.extraHeaders as Record<string, unknown>)
+        : {};
+    merged.extraHeaders = Object.fromEntries(
+      Object.entries(patch.extraHeaders as Record<string, unknown>).map(([key, value]) => [
+        key,
+        value === MODEL_UPSTREAM_SECRET_KEEP_VALUE ? priorHeaders[key] : value,
+      ]),
+    );
+  }
+  return merged;
+}
+
 function slugify(name: string): string {
   const base = name
     .trim()
@@ -47,9 +101,10 @@ function requiresApiKey(protocol: ModelUpstreamProtocol): boolean {
 export function serializeUpstream(row: ModelUpstream) {
   const protocol = row.protocol as ModelUpstreamProtocol;
   const raw = parseJsonRecord(row.configJson);
-  const publicConfig = { ...raw };
-  delete publicConfig.oauthEnc;
-  const config = parseUpstreamConfig(publicConfig, protocol);
+  const config = parseUpstreamConfig(raw, protocol);
+  const publicConfig = redactConfig(raw);
+  const resolvedConfig = redactConfig({ ...config, oauthEnc: undefined });
+  delete resolvedConfig.oauthEnc;
   const oauth = config.oauth;
   return {
     id: row.id,
@@ -58,7 +113,7 @@ export function serializeUpstream(row: ModelUpstream) {
     slug: row.slug,
     protocol,
     config: publicConfig,
-    resolvedConfig: { ...config, oauthEnc: undefined },
+    resolvedConfig,
     auth: oauth?.loggedIn
       ? {
           loggedIn: true,
@@ -132,7 +187,10 @@ export class ModelUpstreamsService {
     if (protocol === "azure-openai" && !parsed.apiVersion) {
       throw new Error("Azure OpenAI 需要配置 apiVersion");
     }
-    if (requiresApiKey(protocol) && !parsed.apiKey) {
+    if (
+      requiresApiKey(protocol) &&
+      (!parsed.apiKey || parsed.apiKey === MODEL_UPSTREAM_SECRET_KEEP_VALUE)
+    ) {
       throw new Error(`${MODEL_UPSTREAM_PROTOCOL_META[protocol].name} 需要配置 API Key`);
     }
     return {
@@ -208,14 +266,7 @@ export class ModelUpstreamsService {
     if (patch.config) {
       const protocol = row.protocol as ModelUpstreamProtocol;
       const prev = parseJsonRecord(row.configJson);
-      const merged: Record<string, unknown> = { ...prev, ...patch.config };
-      if (
-        !("apiKey" in patch.config) ||
-        patch.config.apiKey === undefined ||
-        patch.config.apiKey === ""
-      ) {
-        merged.apiKey = prev.apiKey;
-      }
+      const merged = mergeConfigPreservingSecrets(prev, patch.config);
       merged.oauthEnc = prev.oauthEnc;
       merged.oauth = prev.oauth;
       updates.configJson = JSON.stringify(this.validateConfig(protocol, merged));
@@ -239,13 +290,14 @@ export class ModelUpstreamsService {
   async removeMany(tenantId: string, ids: string[]) {
     const unique = [...new Set(ids.map((id) => id.trim()).filter(Boolean))];
     if (unique.length === 0) return { deleted: 0 };
-    await this.db
+    const deleted = await this.db
       .delete(modelUpstreams)
       .where(
         and(eq(modelUpstreams.tenantId, tenantId), inArray(modelUpstreams.id, unique)),
-      );
-    this.onMutate?.(tenantId);
-    return { deleted: unique.length };
+      )
+      .returning();
+    if (deleted.length > 0) this.onMutate?.(tenantId);
+    return { deleted: deleted.length };
   }
 
   async healthCheck(tenantId: string, id: string) {
@@ -258,7 +310,7 @@ export class ModelUpstreamsService {
     }
     if (isAgentSubscriptionProtocol(protocol)) {
       const { tryBearerFromConfig } = await import("./model-upstream-auth/tokens.js");
-      const ok = Boolean(cfg.oauth?.loggedIn || tryBearerFromConfig(cfg));
+      const ok = Boolean(tryBearerFromConfig(cfg));
       const message = ok ? "已登录" : "尚未登录订阅";
       await this.db
         .update(modelUpstreams)
@@ -267,7 +319,7 @@ export class ModelUpstreamsService {
           lastError: ok ? null : message,
           updatedAt: new Date(),
         })
-        .where(eq(modelUpstreams.id, id));
+        .where(and(eq(modelUpstreams.id, id), eq(modelUpstreams.tenantId, tenantId)));
       return { status: ok ? ("healthy" as const) : ("unhealthy" as const), message };
     }
     try {
@@ -309,7 +361,7 @@ export class ModelUpstreamsService {
             lastError: ok ? null : message,
             updatedAt: new Date(),
           })
-          .where(eq(modelUpstreams.id, id));
+          .where(and(eq(modelUpstreams.id, id), eq(modelUpstreams.tenantId, tenantId)));
         return { status: ok ? ("healthy" as const) : ("unhealthy" as const), message };
       }
       const res = await fetch(url, {
@@ -325,7 +377,7 @@ export class ModelUpstreamsService {
         },
         signal: AbortSignal.timeout(cfg.timeoutMs ?? 15000),
       });
-      const ok = res.ok || res.status === 404;
+      const ok = res.ok;
       const message = ok ? "连接正常" : `HTTP ${res.status}`;
       await this.db
         .update(modelUpstreams)
@@ -334,14 +386,14 @@ export class ModelUpstreamsService {
           lastError: ok ? null : message,
           updatedAt: new Date(),
         })
-        .where(eq(modelUpstreams.id, id));
+        .where(and(eq(modelUpstreams.id, id), eq(modelUpstreams.tenantId, tenantId)));
       return { status: ok ? ("healthy" as const) : ("unhealthy" as const), message };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       await this.db
         .update(modelUpstreams)
         .set({ status: "error", lastError: message, updatedAt: new Date() })
-        .where(eq(modelUpstreams.id, id));
+        .where(and(eq(modelUpstreams.id, id), eq(modelUpstreams.tenantId, tenantId)));
       return { status: "unhealthy" as const, message };
     }
   }

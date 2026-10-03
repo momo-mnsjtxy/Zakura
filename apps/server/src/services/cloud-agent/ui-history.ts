@@ -10,8 +10,9 @@ export function sliceEventsPreferringUserMessage<T extends { type: string }>(
   events: T[],
   maxEvents: number,
 ): T[] {
-  if (events.length <= maxEvents) return events;
-  const sliced = events.slice(-maxEvents);
+  const limit = Math.max(1, Math.floor(maxEvents));
+  if (events.length <= limit) return events;
+  const sliced = events.slice(-limit);
   if (sliced.some((e) => e.type === "user_message")) return sliced;
   let lastUserIdx = -1;
   for (let i = events.length - 1; i >= 0; i--) {
@@ -20,7 +21,13 @@ export function sliceEventsPreferringUserMessage<T extends { type: string }>(
       break;
     }
   }
-  return lastUserIdx >= 0 ? events.slice(lastUserIdx) : sliced;
+  if (lastUserIdx < 0) return sliced;
+  // Keep one user boundary plus the newest tail without violating the caller's
+  // hard memory cap. A single tool/delta burst can otherwise expand a 5k UI
+  // request back toward the 50k model-history ceiling.
+  return limit === 1
+    ? [events[lastUserIdx]!]
+    : [events[lastUserIdx]!, ...events.slice(-(limit - 1))];
 }
 
 /**

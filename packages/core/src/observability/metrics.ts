@@ -7,6 +7,7 @@ const NAME_RE = /^[a-zA-Z_:][a-zA-Z0-9_:]*$/;
 export const HTTP_DURATION_BUCKETS_MS = [
   5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 15_000, 60_000,
 ];
+const DEFAULT_MAX_SERIES = 1000;
 
 function assertName(name: string): void {
   if (!NAME_RE.test(name)) {
@@ -43,6 +44,7 @@ export class Counter {
   constructor(
     readonly name: string,
     readonly help: string,
+    private readonly maxSeries = DEFAULT_MAX_SERIES,
   ) {
     assertName(name);
   }
@@ -52,7 +54,7 @@ export class Counter {
     const key = fingerprint(labels);
     const cur = this.series.get(key);
     if (cur) cur.value += by;
-    else this.series.set(key, { labels: { ...labels }, value: by });
+    else if (this.series.size < this.maxSeries) this.series.set(key, { labels: { ...labels }, value: by });
   }
 
   get(labels: LabelSet = {}): number {
@@ -78,13 +80,17 @@ export class Gauge {
   constructor(
     readonly name: string,
     readonly help: string,
+    private readonly maxSeries = DEFAULT_MAX_SERIES,
   ) {
     assertName(name);
   }
 
   set(value: number, labels: LabelSet = {}): void {
     if (!Number.isFinite(value)) return;
-    this.series.set(fingerprint(labels), { labels: { ...labels }, value });
+    const key = fingerprint(labels);
+    if (this.series.has(key) || this.series.size < this.maxSeries) {
+      this.series.set(key, { labels: { ...labels }, value });
+    }
   }
 
   inc(labels: LabelSet = {}, by = 1): void {
@@ -126,6 +132,7 @@ export class Histogram {
     readonly name: string,
     readonly help: string,
     readonly buckets: readonly number[] = HTTP_DURATION_BUCKETS_MS,
+    private readonly maxSeries = DEFAULT_MAX_SERIES,
   ) {
     assertName(name);
   }
@@ -135,6 +142,7 @@ export class Histogram {
     const key = fingerprint(labels);
     let cur = this.series.get(key);
     if (!cur) {
+      if (this.series.size >= this.maxSeries) return;
       cur = {
         labels: { ...labels },
         buckets: new Array(this.buckets.length).fill(0),
@@ -185,27 +193,45 @@ export class MetricsRegistry {
   private readonly counters = new Map<string, Counter>();
   private readonly gauges = new Map<string, Gauge>();
   private readonly histograms = new Map<string, Histogram>();
+  private readonly families = new Map<string, { type: "counter" | "gauge" | "histogram"; help: string; buckets?: readonly number[] }>();
+
+  constructor(private readonly maxSeriesPerFamily = DEFAULT_MAX_SERIES) {}
+
+  private claim(name: string, type: "counter" | "gauge" | "histogram", help: string, buckets?: readonly number[]): void {
+    const existing = this.families.get(name);
+    if (!existing) {
+      this.families.set(name, { type, help, buckets: buckets ? [...buckets] : undefined });
+      return;
+    }
+    const sameBuckets = type !== "histogram" || JSON.stringify(existing.buckets ?? HTTP_DURATION_BUCKETS_MS) === JSON.stringify(buckets ?? HTTP_DURATION_BUCKETS_MS);
+    if (existing.type !== type || existing.help !== help || !sameBuckets) {
+      throw new Error(`conflicting metric family metadata: ${name}`);
+    }
+  }
 
   counter(name: string, help: string): Counter {
+    this.claim(name, "counter", help);
     const existing = this.counters.get(name);
     if (existing) return existing;
-    const created = new Counter(name, help);
+    const created = new Counter(name, help, this.maxSeriesPerFamily);
     this.counters.set(name, created);
     return created;
   }
 
   gauge(name: string, help: string): Gauge {
+    this.claim(name, "gauge", help);
     const existing = this.gauges.get(name);
     if (existing) return existing;
-    const created = new Gauge(name, help);
+    const created = new Gauge(name, help, this.maxSeriesPerFamily);
     this.gauges.set(name, created);
     return created;
   }
 
   histogram(name: string, help: string, buckets?: readonly number[]): Histogram {
+    this.claim(name, "histogram", help, buckets);
     const existing = this.histograms.get(name);
     if (existing) return existing;
-    const created = new Histogram(name, help, buckets);
+    const created = new Histogram(name, help, buckets, this.maxSeriesPerFamily);
     this.histograms.set(name, created);
     return created;
   }

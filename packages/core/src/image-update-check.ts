@@ -16,6 +16,7 @@
  * than dockerode's types so this module stays dependency-free.
  */
 import { log } from "./observability/index.js";
+import { ImageProbeLifecycle } from "./image-probe-lifecycle.js";
 
 export type ImageRef = {
   /**
@@ -50,6 +51,10 @@ export type ImageUpdateProbeOptions = {
    * disappear on the next check. Only enable for an explicit, user-initiated check.
    */
   allowPullFallback?: boolean;
+  /** Cancel an active check or sweep. */
+  signal?: AbortSignal;
+  /** Shared request lifecycle; chiefly useful to stop a whole sweep. */
+  lifecycle?: ImageProbeLifecycle;
 };
 
 const DOCKER_HUB_REGISTRY = "registry-1.docker.io";
@@ -196,7 +201,8 @@ export interface DockerInfoLike {
 
 // —— registry mirror discovery ——
 
-let mirrorCache: string[] | null = null;
+let mirrorCache: { value: string[]; expiresAt: number } | null = null;
+const MIRROR_CACHE_TTL_MS = 5 * 60_000;
 let mirrorInFlight: Promise<string[]> | null = null;
 
 /** Reset the mirror cache (test-only). */
@@ -217,8 +223,13 @@ export function _resetMirrorCacheForTests(): void {
  * lifetime — on a mirror-only host that silently broke update detection until
  * restart. Concurrent callers share one in-flight query.
  */
-export async function discoverDockerRegistryMirrors(docker?: DockerLike): Promise<string[]> {
-  if (mirrorCache) return mirrorCache;
+export async function discoverDockerRegistryMirrors(
+  docker?: DockerLike,
+  cacheOptions?: { now?: () => number; ttlMs?: number },
+): Promise<string[]> {
+  const now = cacheOptions?.now ?? Date.now;
+  if (mirrorCache && mirrorCache.expiresAt > now()) return mirrorCache.value;
+  if (mirrorCache) mirrorCache = null;
   if (mirrorInFlight) return mirrorInFlight;
   if (!docker?.info) return [];
 
@@ -247,7 +258,7 @@ export async function discoverDockerRegistryMirrors(docker?: DockerLike): Promis
       .map(stripScheme)
       .filter((h) => h && h !== DOCKER_HUB_REGISTRY && h !== "docker.io");
     if (resolved.length > 0) {
-      mirrorCache = resolved;
+      mirrorCache = { value: resolved, expiresAt: now() + (cacheOptions?.ttlMs ?? MIRROR_CACHE_TTL_MS) };
       log.info("image.mirrors_discovered", { mirrors: resolved.join(",") });
     }
     return resolved;
@@ -340,6 +351,7 @@ async function probeRemoteDigest(
 ): Promise<string | null> {
   const fetchImpl = opts?.fetchImpl ?? fetch;
   const timeoutMs = opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const lifecycle = opts?.lifecycle ?? new ImageProbeLifecycle();
   // Mirrors are Hub pull-through caches; they are meaningless for ghcr.io or a
   // private registry, so only Hub images consult them.
   const mirrors =
@@ -347,7 +359,8 @@ async function probeRemoteDigest(
       ? (opts?.registryMirrors ?? [])
       : [];
   for (const host of [...mirrors, ref.registry]) {
-    const digest = await probeDigestOnHost(ref, host, fetchImpl, timeoutMs);
+    if (opts?.signal?.aborted) throw Object.assign(new Error("image probe was aborted"), { name: "AbortError" });
+    const digest = await probeDigestOnHost(ref, host, fetchImpl, timeoutMs, lifecycle, opts?.signal);
     if (digest) return digest;
   }
   return null;
@@ -367,6 +380,8 @@ async function probeDigestOnHost(
   host: string,
   fetchImpl: typeof fetch,
   timeoutMs: number,
+  lifecycle: ImageProbeLifecycle,
+  signal?: AbortSignal,
 ): Promise<string | null> {
   const { repository, reference } = ref;
   const encodedRepo = repository
@@ -380,7 +395,7 @@ async function probeDigestOnHost(
 
   const request = async (method: "HEAD" | "GET", token?: string): Promise<Response | null> => {
     try {
-      return await fetchImpl(url, {
+      return await lifecycle.run((requestSignal) => fetchImpl(url, {
         method,
         headers: {
           Accept: MANIFEST_ACCEPT,
@@ -388,9 +403,10 @@ async function probeDigestOnHost(
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
         redirect: "follow",
-        signal: AbortSignal.timeout(timeoutMs),
-      });
+        signal: requestSignal,
+      }), timeoutMs, signal);
     } catch (err) {
+      if (err instanceof Error && err.name === "AbortError") throw err;
       log.debug("image.remote_digest_probe_failed", {
         image: `${host}/${repository}:${reference}`,
         method,
@@ -406,7 +422,7 @@ async function probeDigestOnHost(
   let token: string | undefined;
   if (res.status === 401) {
     const challenge = res.headers.get("WWW-Authenticate") ?? res.headers.get("Www-Authenticate");
-    const got = await fetchRegistryToken(challenge, host, repository, fetchImpl, timeoutMs);
+    const got = await fetchRegistryToken(challenge, host, repository, fetchImpl, timeoutMs, lifecycle, signal);
     if (!got) return null;
     token = got;
     res = await request("HEAD", token);
@@ -428,9 +444,7 @@ async function probeDigestOnHost(
     const body = new Uint8Array(await got.arrayBuffer());
     const { createHash } = await import("node:crypto");
     return `sha256:${createHash("sha256").update(body).digest("hex")}`;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
 /**
@@ -448,6 +462,8 @@ async function fetchRegistryToken(
   repository: string,
   fetchImpl: typeof fetch,
   timeoutMs: number,
+  lifecycle: ImageProbeLifecycle,
+  signal?: AbortSignal,
 ): Promise<string | null> {
   let realm: string | null = null;
   let service: string | null = null;
@@ -471,14 +487,15 @@ async function fetchRegistryToken(
   url.searchParams.set("scope", scope ?? `repository:${repository}:pull`);
 
   try {
-    const res = await fetchImpl(url.toString(), {
+    const res = await lifecycle.run((requestSignal) => fetchImpl(url.toString(), {
       headers: { "User-Agent": USER_AGENT },
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+      signal: requestSignal,
+    }), timeoutMs, signal);
     if (!res.ok) return null;
     const json = (await res.json()) as { token?: string; access_token?: string };
     return json.token ?? json.access_token ?? null;
-  } catch {
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") throw err;
     return null;
   }
 }
@@ -512,6 +529,7 @@ export async function checkImageUpdate(
       error = "registry_probe_unavailable";
     }
   } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") throw err;
     error = err instanceof Error ? err.message : String(err);
   }
 
@@ -539,11 +557,13 @@ async function mapWithConcurrency<T, R>(
   items: T[],
   limit: number,
   fn: (item: T, index: number) => Promise<R>,
+  signal?: AbortSignal,
 ): Promise<R[]> {
   const out = new Array<R>(items.length);
   let next = 0;
   const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
     for (;;) {
+      if (signal?.aborted) throw Object.assign(new Error("image sweep was aborted"), { name: "AbortError" });
       const i = next++;
       if (i >= items.length) return;
       out[i] = await fn(items[i]!, i);
@@ -563,6 +583,7 @@ export async function checkImageUpdates(
     // Look up running ids by normalized ref so a container reported as
     // `docker.io/...` matches a probe for the bare `user/repo:tag`.
     checkImageUpdate(docker, image, runningImageIds?.get(normalizeImageRef(image)), probeOptions),
+    probeOptions?.signal,
   );
 }
 

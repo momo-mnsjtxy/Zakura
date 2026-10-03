@@ -9,6 +9,7 @@ import type { Db } from "../db/client.js";
 import {
   modelUpstreams,
   newId,
+  tenants,
   upstreamModels,
   type UpstreamModel,
 } from "../db/schema.js";
@@ -228,13 +229,7 @@ export class UpstreamModelsService {
     );
     const now = new Date();
 
-    if (input.isDefault) {
-      await this.clearDefault(tenantId, capability);
-    }
-
-    const [row] = await this.db
-      .insert(upstreamModels)
-      .values({
+    const values = {
         id: newId(),
         tenantId,
         upstreamId: input.upstreamId,
@@ -250,8 +245,20 @@ export class UpstreamModelsService {
         syncedAt: now,
         createdAt: now,
         updatedAt: now,
-      })
-      .returning();
+      };
+    const insert = async (database: Db) => {
+      const [row] = await database.insert(upstreamModels).values(values).returning();
+      if (!row) throw new Error("model create failed");
+      return row;
+    };
+    const row = input.isDefault
+      ? await this.db.transaction(async (tx) => {
+          const database = tx as unknown as Db;
+          await this.lockTenant(database, tenantId);
+          await this.clearDefault(tenantId, capability, database);
+          return insert(database);
+        })
+      : await insert(this.db);
 
     this.onMutate?.(tenantId);
     const up = await this.upstreams.get(tenantId, input.upstreamId);
@@ -285,9 +292,6 @@ export class UpstreamModelsService {
     const capability = patch.capability ?? (existing.capability as ModelCapability);
     if (!isModelCapability(capability)) throw new Error("不支持的能力");
     const isDefault = patch.isDefault ?? existing.isDefault;
-    if (isDefault && (patch.isDefault === true || capability !== existing.capability)) {
-      await this.clearDefault(tenantId, capability);
-    }
 
     const nativeModel = patch.nativeModel?.trim() ?? existing.nativeModel;
     let canonicalModel = existing.canonicalModel;
@@ -315,9 +319,7 @@ export class UpstreamModelsService {
       metaJson = JSON.stringify(resolved.meta ?? {});
     }
 
-    const [row] = await this.db
-      .update(upstreamModels)
-      .set({
+    const values = {
         nativeModel,
         canonicalModel,
         displayName,
@@ -333,9 +335,38 @@ export class UpstreamModelsService {
             : existing.optionsJson,
         metaJson: patch.meta != null ? JSON.stringify(patch.meta) : metaJson,
         updatedAt: new Date(),
-      })
-      .where(and(eq(upstreamModels.id, id), eq(upstreamModels.tenantId, tenantId)))
-      .returning();
+      };
+    const mutate = async (database: Db) => {
+      const [row] = await database
+        .update(upstreamModels)
+        .set(values)
+        .where(and(eq(upstreamModels.id, id), eq(upstreamModels.tenantId, tenantId)))
+        .returning();
+      if (!row) throw new Error("Not found");
+      return row;
+    };
+    const changesDefault =
+      patch.isDefault !== undefined ||
+      (existing.isDefault && capability !== existing.capability);
+    const row = changesDefault
+      ? await this.db.transaction(async (tx) => {
+          const database = tx as unknown as Db;
+          await this.lockTenant(database, tenantId);
+          if (isDefault) await this.clearDefault(tenantId, capability, database);
+          const updated = await mutate(database);
+          if (
+            existing.isDefault &&
+            (!isDefault || capability !== existing.capability)
+          ) {
+            await this.promoteDefault(
+              database,
+              tenantId,
+              existing.capability as ModelCapability,
+            );
+          }
+          return updated;
+        })
+      : await mutate(this.db);
 
     this.onMutate?.(tenantId);
     const up = await this.upstreams.get(tenantId, row!.upstreamId);
@@ -348,36 +379,76 @@ export class UpstreamModelsService {
   }
 
   async remove(tenantId: string, id: string) {
-    const existing = await this.get(tenantId, id);
-    if (!existing) throw new Error("Not found");
-    await this.db
-      .delete(upstreamModels)
-      .where(and(eq(upstreamModels.id, id), eq(upstreamModels.tenantId, tenantId)));
+    const removed = await this.db.transaction(async (tx) => {
+      const database = tx as unknown as Db;
+      await this.lockTenant(database, tenantId);
+      const existing = await database.query.upstreamModels.findFirst({
+        where: and(eq(upstreamModels.id, id), eq(upstreamModels.tenantId, tenantId)),
+      });
+      if (!existing) return false;
+      await database
+        .delete(upstreamModels)
+        .where(and(eq(upstreamModels.id, id), eq(upstreamModels.tenantId, tenantId)));
+      if (existing.isDefault) {
+        await this.promoteDefault(
+          database,
+          tenantId,
+          existing.capability as ModelCapability,
+        );
+      }
+      return true;
+    });
+    if (!removed) throw new Error("Not found");
     this.onMutate?.(tenantId);
   }
 
   async removeMany(tenantId: string, ids: string[]) {
     const unique = [...new Set(ids.map((id) => id.trim()).filter(Boolean))];
     if (unique.length === 0) return { deleted: 0 };
-    await this.db
-      .delete(upstreamModels)
-      .where(
-        and(eq(upstreamModels.tenantId, tenantId), inArray(upstreamModels.id, unique)),
+    const deleted = await this.db.transaction(async (tx) => {
+      const database = tx as unknown as Db;
+      await this.lockTenant(database, tenantId);
+      const rows = await database
+        .delete(upstreamModels)
+        .where(
+          and(eq(upstreamModels.tenantId, tenantId), inArray(upstreamModels.id, unique)),
+        )
+        .returning();
+      const capabilities = new Set(
+        rows
+          .filter((row) => row.isDefault)
+          .map((row) => row.capability as ModelCapability),
       );
-    this.onMutate?.(tenantId);
-    return { deleted: unique.length };
+      for (const capability of capabilities) {
+        await this.promoteDefault(database, tenantId, capability);
+      }
+      return rows;
+    });
+    if (deleted.length > 0) this.onMutate?.(tenantId);
+    return { deleted: deleted.length };
   }
 
   async removeByUpstream(tenantId: string, upstreamId: string) {
-    await this.db
-      .delete(upstreamModels)
-      .where(
-        and(
-          eq(upstreamModels.tenantId, tenantId),
-          eq(upstreamModels.upstreamId, upstreamId),
-        ),
-      );
-    this.onMutate?.(tenantId);
+    const deleted = await this.db.transaction(async (tx) => {
+      const database = tx as unknown as Db;
+      await this.lockTenant(database, tenantId);
+      const rows = await database
+        .delete(upstreamModels)
+        .where(
+          and(
+            eq(upstreamModels.tenantId, tenantId),
+            eq(upstreamModels.upstreamId, upstreamId),
+          ),
+        )
+        .returning();
+      for (const capability of new Set(
+        rows.filter((row) => row.isDefault).map((row) => row.capability as ModelCapability),
+      )) {
+        await this.promoteDefault(database, tenantId, capability);
+      }
+      return rows;
+    });
+    if (deleted.length > 0) this.onMutate?.(tenantId);
   }
 
   async countByUpstream(tenantId: string, upstreamId: string): Promise<number> {
@@ -773,8 +844,53 @@ export class UpstreamModelsService {
     };
   }
 
-  private async clearDefault(tenantId: string, capability: ModelCapability) {
-    await this.db
+  private async lockTenant(database: Db, tenantId: string): Promise<void> {
+    await database
+      .select({ id: tenants.id })
+      .from(tenants)
+      .where(eq(tenants.id, tenantId))
+      .for("update");
+  }
+
+  private async promoteDefault(
+    database: Db,
+    tenantId: string,
+    capability: ModelCapability,
+  ): Promise<void> {
+    const current = await database.query.upstreamModels.findFirst({
+      where: and(
+        eq(upstreamModels.tenantId, tenantId),
+        eq(upstreamModels.capability, capability),
+        eq(upstreamModels.isDefault, true),
+      ),
+    });
+    if (current) return;
+    const next = await database.query.upstreamModels.findFirst({
+      where: and(
+        eq(upstreamModels.tenantId, tenantId),
+        eq(upstreamModels.capability, capability),
+      ),
+      orderBy: [asc(upstreamModels.createdAt), asc(upstreamModels.id)],
+    });
+    if (next) {
+      await database
+        .update(upstreamModels)
+        .set({ isDefault: true, updatedAt: new Date() })
+        .where(
+          and(
+            eq(upstreamModels.id, next.id),
+            eq(upstreamModels.tenantId, tenantId),
+          ),
+        );
+    }
+  }
+
+  private async clearDefault(
+    tenantId: string,
+    capability: ModelCapability,
+    database: Db = this.db,
+  ) {
+    await database
       .update(upstreamModels)
       .set({ isDefault: false, updatedAt: new Date() })
       .where(

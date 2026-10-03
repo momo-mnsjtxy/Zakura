@@ -22,6 +22,7 @@ import { Orchestrator } from "./services/orchestrator.js";
 import { McpGateway } from "./services/mcp-gateway.js";
 import { AgentService } from "./services/agents.js";
 import { AgentBrowserService } from "./services/agent-cdp.js";
+import { disposeDesktopState } from "./services/agent-desktop.js";
 import { MemoryStore } from "./services/memory-store.js";
 import { MemoryProvidersService } from "./services/memory-providers.js";
 import { ModelRouterService } from "./services/model-router.js";
@@ -479,8 +480,15 @@ async function main() {
   runnerHub.attach(server as import("node:http").Server);
   apiApp.zakurabotGateway?.attach(server as import("node:http").Server);
   server.on("close", () => {
+    browserService.dispose();
+    disposeDesktopState(agentService.workspace);
     apiApp.automation.stop();
     void apiApp.tenantContentLifecycle?.stop();
+    void Promise.allSettled([
+      marketSync.stopAndDrain(),
+      imageUpdateChecker.stopAndDrain(),
+      telemetry.shutdown(),
+    ]);
   });
 }
 

@@ -71,10 +71,11 @@ describe("CloudAgentSessionStore.searchSessions", () => {
     );
     store = new CloudAgentSessionStore(created.db);
 
-    for (const title of ["部署脚本调优", "无关的会话", "内容里提到部署"]) {
+    for (const title of ["部署脚本调优", "无关的会话", "内容里提到部署", "归档部署记录"]) {
       const s = await store.createSession({ tenantId, agentId, title });
       ids[title] = s.id;
     }
+    await store.updateSession(tenantId, agentId, ids["归档部署记录"]!, { status: "archived" });
     // 「无关的会话」最后更新，标题命中项必须仍排在它前面
     await store.appendEvent({
       sessionId: ids["内容里提到部署"]!,
@@ -149,5 +150,12 @@ describe("CloudAgentSessionStore.searchSessions", () => {
       titles.includes("部署脚本调优"),
       `错字查询应模糊命中标题，实际: ${titles.join(",") || "(空)"}`,
     );
+  });
+
+  it("只在显式请求时搜索归档会话", async () => {
+    const active = await store.searchSessions(tenantId, "归档部署");
+    assert.equal(active.some((hit) => hit.session.title === "归档部署记录"), false);
+    const all = await store.searchSessions(tenantId, "归档部署", { includeArchived: true });
+    assert.equal(all.some((hit) => hit.session.title === "归档部署记录"), true);
   });
 });

@@ -51,8 +51,10 @@ export type { HttpRouteClass } from "./http.js";
 export {
   Telemetry,
   initTelemetry,
+  initTelemetryAsync,
   getTelemetry,
   resetTelemetry,
+  resetTelemetryAsync,
   log,
   recordPlatformFault,
   recordHttpRequest,

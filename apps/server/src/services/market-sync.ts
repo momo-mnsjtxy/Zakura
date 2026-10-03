@@ -9,41 +9,108 @@ import type { StoreCatalogService } from "./store-catalog.js";
 import type { SkillsService } from "./skills/index.js";
 
 const SYNC_INTERVAL_MS = 60 * 60 * 1000;
+const BOOTSTRAP_DELAY_MS = 20_000;
+
+export type MarketSyncScheduler = {
+  setTimeout: typeof setTimeout;
+  clearTimeout: typeof clearTimeout;
+  setInterval: typeof setInterval;
+  clearInterval: typeof clearInterval;
+};
+
+export type MarketSyncOptions = {
+  scheduler?: MarketSyncScheduler;
+  bootstrapDelayMs?: number;
+  intervalMs?: number;
+  drainTimeoutMs?: number;
+};
+
+const defaultScheduler: MarketSyncScheduler = {
+  setTimeout,
+  clearTimeout,
+  setInterval,
+  clearInterval,
+};
 
 export class MarketSyncService {
   private timer: ReturnType<typeof setInterval> | null = null;
-  private running = false;
+  private bootstrapTimer: ReturnType<typeof setTimeout> | null = null;
+  private activeTick: Promise<void> | null = null;
+  private readonly scheduler: MarketSyncScheduler;
+  private readonly bootstrapDelayMs: number;
+  private readonly intervalMs: number;
+  private readonly drainTimeoutMs: number;
 
   constructor(
     private readonly mcpStore: McpStoreService,
     private readonly catalog: StoreCatalogService,
     private readonly skills: SkillsService,
-  ) {}
+    opts: MarketSyncOptions = {},
+  ) {
+    this.scheduler = opts.scheduler ?? defaultScheduler;
+    this.bootstrapDelayMs = opts.bootstrapDelayMs ?? BOOTSTRAP_DELAY_MS;
+    this.intervalMs = opts.intervalMs ?? SYNC_INTERVAL_MS;
+    this.drainTimeoutMs = opts.drainTimeoutMs ?? 30_000;
+  }
 
   start(): void {
-    if (this.timer) return;
-    setTimeout(() => void this.tick(), 20_000);
-    this.timer = setInterval(() => void this.tick(), SYNC_INTERVAL_MS);
+    if (this.timer || this.bootstrapTimer) return;
+    this.bootstrapTimer = this.scheduler.setTimeout(() => {
+      this.bootstrapTimer = null;
+      void this.tick();
+    }, this.bootstrapDelayMs);
+    this.bootstrapTimer.unref?.();
+    this.timer = this.scheduler.setInterval(() => void this.tick(), this.intervalMs);
+    this.timer.unref?.();
   }
 
   stop(): void {
-    if (this.timer) clearInterval(this.timer);
+    if (this.timer) this.scheduler.clearInterval(this.timer);
     this.timer = null;
+    if (this.bootstrapTimer) this.scheduler.clearTimeout(this.bootstrapTimer);
+    this.bootstrapTimer = null;
+  }
+
+  async stopAndDrain(): Promise<void> {
+    this.stop();
+    const active = this.activeTick;
+    if (!active) return;
+    await new Promise<void>((resolve) => {
+      const timer = this.scheduler.setTimeout(resolve, this.drainTimeoutMs);
+      timer.unref?.();
+      void active.finally(() => {
+        this.scheduler.clearTimeout(timer);
+        resolve();
+      });
+    });
   }
 
   async tick(): Promise<void> {
-    if (this.running) return;
-    this.running = true;
-    try {
-      await this.syncMcpStores();
-      await this.indexCurated();
-      await this.indexSkillRepos();
+    if (this.activeTick) return this.activeTick;
+    const run = (async () => {
+      await this.runStep("stores", () => this.syncMcpStores());
+      await this.runStep("curated", () => this.indexCurated());
+      await this.runStep("skills", () => this.indexSkillRepos());
       // 插件市场：每轮最多同步一个，避免打爆 git
-      await this.syncOnePluginMarket();
-    } catch (err) {
-      recordPlatformFault("market_sync.tick", err, { subsystem: "market_sync" });
+      await this.runStep("plugin", () => this.syncOnePluginMarket());
+    })();
+    this.activeTick = run;
+    try {
+      await run;
     } finally {
-      this.running = false;
+      if (this.activeTick === run) this.activeTick = null;
+    }
+  }
+
+  private async runStep(name: string, step: () => Promise<void>): Promise<void> {
+    try {
+      await step();
+    } catch (err) {
+      // Preserve the existing metric/log kind; include stage in the error text.
+      const message = err instanceof Error ? err.message : String(err);
+      recordPlatformFault("market_sync.tick", new Error(`${name}: ${message}`), {
+        subsystem: "market_sync",
+      });
     }
   }
 
