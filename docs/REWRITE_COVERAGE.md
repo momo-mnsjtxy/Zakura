@@ -4,6 +4,8 @@ Baseline: Moonrend/Zakura `210677c58a700dbaf58dbff86350d46fd7b9a3e1`.
 
 This ledger separates rewritten implementation logic from compatibility material intentionally retained verbatim. “Present” is not equivalent to “rewritten.” Full product completion requires all behavior gates in `FEATURE_MATRIX.md`, not merely source-tree presence.
 
+Exact carried-over paths are listed in `PRESERVED_MANIFEST.md`; every registered HTTP handler and its declaring implementation state is listed in `ROUTE_ACCEPTANCE.md`.
+
 | Scope | Current treatment | Acceptance requirement |
 |---|---|---|
 | Root workspace, CI, integration tests, compatibility/ownership docs | New implementation | Pinned install, typecheck, tests, builds, and Go checks pass |
@@ -24,6 +26,10 @@ This ledger separates rewritten implementation logic from compatibility material
 ## Live verification gates
 
 Real third-party credentials and paid provider calls are intentionally excluded. Production adapters must be exercised with local fake servers. Live Google/OAuth, hosted model, external connector, Headscale, Docker network isolation/proxy, deployment, and remote publish remain environment/authorization gates and may not be reported as passed from local tests.
+
+## Placeholder gate
+
+The changed-source scan contains no new TODO, FIXME, “not implemented,” or unimplemented production branch. The one inherited platform-assistant migration fallback now reports an unavailable injected service and has a positive test proving that the mounted production migration boundary is invoked. UI input `placeholder` properties and tests that assert no unresolved template placeholders are not implementation stubs.
 
 ## Source delta snapshot (2026-10-03)
 

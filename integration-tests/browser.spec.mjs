@@ -118,3 +118,54 @@ test("tenant switch enrollment retries without replacing the current session pre
   await expect(page.getByText("页面出错了")).toHaveCount(0);
   expect(pageErrors).toEqual([]);
 });
+
+test("rewritten desktop state pages render schema-valid fixture contracts", async ({ page }) => {
+  const pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error));
+  await page.goto("http://127.0.0.1:3001/login");
+  await page.evaluate(() => localStorage.setItem("zakura_session", "fixture-session"));
+  const cases = [
+    ["/dashboard/agents", "Fixture Team", "desktop-agents-dashboard.png"],
+    ["/dashboard/network", "网络与隧道", "desktop-network-overview.png"],
+    ["/dashboard/network/exposure", "Cloudflare Quick Tunnel", "desktop-network-exposure.png"],
+    ["/dashboard/runners", "Fixture Runner", "desktop-runners.png"],
+    ["/dashboard/platform-services", "Headscale", "desktop-platform-services.png"],
+    ["/dashboard/policies", "策略", "desktop-policies.png"],
+    ["/dashboard/keys", "API Keys", "desktop-api-keys.png"],
+    ["/dashboard/settings/oauth-clients", "Fixture CLI", "desktop-oauth-clients.png"],
+  ];
+  for (const [path, text, screenshot] of cases) {
+    await page.goto(`http://127.0.0.1:3001${path}`);
+    await expect(page.getByText(text, { exact: false }).first()).toBeVisible();
+    await expect(page.getByText("页面出错了")).toHaveCount(0);
+    await page.screenshot({ path: `artifacts/e2e/${screenshot}`, fullPage: true });
+  }
+  expect(pageErrors, pageErrors.map((error) => error.stack ?? error.message).join("\n")).toEqual([]);
+});
+
+test("mobile API key retry preserves form state and reveals the secret once", async ({ page }) => {
+  const pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error));
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("http://127.0.0.1:3001/login");
+  await page.evaluate(() => localStorage.setItem("zakura_session", "fixture-session"));
+  await page.goto("http://127.0.0.1:3001/dashboard/keys");
+  await expect(page.getByText("API Keys", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "新建" }).click();
+  await page.getByLabel("名称").fill("mobile-retry");
+  await page.getByRole("button", { name: "创建", exact: true }).click();
+  await expect(page.getByText("Key service temporarily unavailable")).toBeVisible();
+  await expect(page.getByLabel("名称")).toHaveValue("mobile-retry");
+  await page.getByRole("button", { name: "创建", exact: true }).click();
+  await expect(page.getByText("zk_fixture_once_only")).toBeVisible();
+  await expect(page.getByText("页面出错了")).toHaveCount(0);
+  await page.screenshot({ path: "artifacts/e2e/mobile-api-key-secret.png", fullPage: true });
+  await page.getByRole("button", { name: "完成" }).click();
+  await page.goto("http://127.0.0.1:3001/dashboard/policies");
+  await expect(page.getByText("策略", { exact: true }).first()).toBeVisible();
+  await page.screenshot({ path: "artifacts/e2e/mobile-policies.png", fullPage: true });
+  await page.goto("http://127.0.0.1:3001/dashboard/network/exposure");
+  await expect(page.getByText("Cloudflare Quick Tunnel")).toBeVisible();
+  await page.screenshot({ path: "artifacts/e2e/mobile-network-exposure.png", fullPage: true });
+  expect(pageErrors).toEqual([]);
+});

@@ -345,7 +345,7 @@ export async function callPlatformAssistantTool(
           ? rawId.slice("instance:".length)
           : rawId;
         if (!ctx.instanceMigrations) {
-          return textResult("Instance migration not implemented", true);
+          return textResult("Instance migration service unavailable", true);
         }
         const result = await ctx.instanceMigrations.migrate(
           ctx.tenantId,

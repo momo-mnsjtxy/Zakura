@@ -2,6 +2,7 @@ import { createServer } from "node:http";
 
 let enrollmentStartAttempts = 0;
 let tenantEnrollmentStartAttempts = 0;
+let apiKeyCreateAttempts = 0;
 
 const server = createServer(async (request, response) => {
   const pathname = new URL(request.url ?? "/", "http://fixture").pathname.replace(/\/$/, "") || "/";
@@ -111,6 +112,7 @@ const server = createServer(async (request, response) => {
       user: { id: "fixture-user", name: "Fixture Member", email: "member@example.test" },
       tenant: { id: "fixture-tenant", name: "Fixture Team", onboardingCompleted: true },
       role: "owner",
+      isPlatformAdmin: true,
       edition: "oss",
       multiTenant: true,
       canUseLocalRunner: true,
@@ -119,6 +121,44 @@ const server = createServer(async (request, response) => {
   }
   if (pathname === "/api/agents" || pathname === "/api/spaces") {
     response.end("[]");
+    return;
+  }
+  if (pathname === "/api/settings/network/overview") {
+    response.end(JSON.stringify({ mesh: { connected: true, displayName: "Fixture Mesh", status: "ready" }, defaultProvider: "cloudflare-quick", exposureEnabled: true, runners: { online: 1, total: 1 }, activeExposures: 0, exposuresToday: 3, auditEventsToday: 4, hostJoinsTailscale: false }));
+    return;
+  }
+  if (pathname === "/api/settings/network/exposure/providers") {
+    response.end(JSON.stringify({ providers: [{ id: "provider-1", tenantId: "fixture-tenant", provider: "cloudflare-quick", enabled: true, isDefault: true, config: {}, hasConfig: true, lastTestAt: null, lastTestOk: true, lastError: null, meta: { name: "Cloudflare Quick Tunnel", description: "Fixture public tunnel", requiresConfig: false, publicExposure: true }, createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" }] }));
+    return;
+  }
+  if (pathname === "/api/runtime-nodes") {
+    response.end(JSON.stringify({ nodes: [{ id: "runner-1", name: "Fixture Runner", slug: "fixture-runner", kind: "remote", access: "private", status: "online", endpoint: "https://runner.example.test", labels: {}, createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" }], canUseLocalRunner: true }));
+    return;
+  }
+  if (pathname === "/api/platform-services") {
+    response.end(JSON.stringify({ canManage: true, services: [{ key: "headscale", name: "Headscale", description: "Fixture managed mesh", mapsTo: { kind: "service", id: "headscale" }, mode: "managed", status: "running", healthStatus: "healthy", endpointUrl: "https://mesh.example.test", lastError: null, containers: [], config: { hasApiKey: true, hostPort: 8080, image: "headscale:fixture" }, lifecycle: { state: "running", label: "运行中", detail: "Healthy", tone: "success", busy: false, actions: ["restart", "stop"] }, progress: { running: false, done: true, phase: "ready", message: "Ready", events: [] } }] }));
+    return;
+  }
+  if (pathname === "/api/mcp/policies/bootstrap") {
+    response.end(JSON.stringify({ policies: [{ id: "policy-1", apiKeyId: null, apiKey: null, instanceIds: [], toolAllowlist: ["search"], toolDenylist: null, includeBuiltin: true }], apiKeys: [], instances: [] }));
+    return;
+  }
+  if (pathname === "/api/api-keys" && request.method === "GET") {
+    response.end(JSON.stringify([{ id: "key-1", name: "fixture", keyPrefix: "zk_fixture", lastUsedAt: null, createdAt: "2026-01-01T00:00:00Z" }]));
+    return;
+  }
+  if (pathname === "/api/api-keys" && request.method === "POST") {
+    apiKeyCreateAttempts += 1;
+    if (apiKeyCreateAttempts === 1) {
+      response.statusCode = 503;
+      response.end(JSON.stringify({ error: "Key service temporarily unavailable" }));
+      return;
+    }
+    response.end(JSON.stringify({ rawKey: "zk_fixture_once_only" }));
+    return;
+  }
+  if (pathname === "/api/oauth/clients") {
+    response.end(JSON.stringify({ inbound: [{ id: "oauth-1", clientId: "fixture-client", clientName: "Fixture CLI", registrationType: "dynamic", tenantBound: true, createdAt: "2026-01-01T00:00:00Z" }], dcr: [], byo: [] }));
     return;
   }
   response.statusCode = 404;

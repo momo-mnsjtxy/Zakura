@@ -48,7 +48,7 @@ describe("platform assistant tools", () => {
     assert.equal(isPlatformAssistantToolName("fs_read"), false);
   });
 
-  it("migrate_instance stubs when service missing", async () => {
+  it("reports an unavailable migration service without presenting a placeholder", async () => {
     const result = await callPlatformAssistantTool(
       "migrate_instance",
       { instance_id: "abc", target_node_id: "node-1" },
@@ -62,8 +62,34 @@ describe("platform assistant tools", () => {
     const text =
       result.content.find((c): c is { type: "text"; text: string } => c.type === "text")?.text ??
       "";
-    assert.match(text, /not implemented/i);
+    assert.match(text, /service unavailable/i);
+    assert.doesNotMatch(text, /not implemented|todo|placeholder/i);
     assert.equal(result.isError, true);
+  });
+
+  it("migrate_instance invokes the production migration boundary", async () => {
+    const calls: unknown[] = [];
+    const result = await callPlatformAssistantTool(
+      "migrate_instance",
+      { instance_id: "instance:abc", target_node_id: "node-1" },
+      {
+        tenantId: "t1",
+        agentId: "a1",
+        isPlatformAdmin: true,
+        instanceMigrations: {
+          async migrate(...args: unknown[]) {
+            calls.push(args);
+            return { ok: true, instanceId: "abc", targetNodeId: "node-1" };
+          },
+        } as never,
+      },
+    );
+    assert.deepEqual(calls, [["t1", "abc", "node-1"]]);
+    assert.equal(result.isError, false);
+    const payload = JSON.parse(result.content.find((part) => part.type === "text")?.text ?? "{}") as {
+      ok?: boolean;
+    };
+    assert.equal(payload.ok, true);
   });
 
   it("rejects platform credential writes without explicit platform-admin authorization", async () => {
