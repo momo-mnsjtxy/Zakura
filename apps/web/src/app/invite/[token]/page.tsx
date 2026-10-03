@@ -11,6 +11,8 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { createActionLock, inviteState } from "@/lib/auth-flow";
 import { createLatestRequestGate } from "@/lib/chat-state";
+import { AuthMfaEnrollment } from "@/components/auth-mfa-enrollment";
+import { authCallbackResult } from "@/lib/auth-callback-state";
 
 type InviteInfo = {
   email: string;
@@ -28,6 +30,7 @@ export default function InviteAcceptPage() {
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
+  const [enrollmentTicket, setEnrollmentTicket] = useState<string | null>(null);
   const [meEmail, setMeEmail] = useState<string | null>(null);
   const loadGate = useRef(createLatestRequestGate());
   const acceptAction = useRef(createActionLock());
@@ -56,15 +59,21 @@ export default function InviteAcceptPage() {
     setBusy(true);
     try {
       const res = await api<{
-        session: string;
-        tenant: { onboardingCompleted?: boolean };
+        session?: string;
+        tenant?: { onboardingCompleted?: boolean };
+        mfaEnrollmentRequired?: boolean;
+        mfaEnrollmentTicket?: string;
+        methods?: string[];
       }>(`/api/invites/${token}/accept`, {
         method: "POST",
         json: meEmail
           ? {}
           : { email: info?.email, password, name: name || undefined },
       });
-      setSession(res.session);
+      const outcome = authCallbackResult(res);
+      if (outcome.kind === "enrollment") { setEnrollmentTicket(outcome.ticket); return; }
+      if (outcome.kind !== "session") throw new Error(outcome.message);
+      setSession(outcome.session);
       toast.success("已加入团队");
       router.push(
         res.tenant?.onboardingCompleted === false ? "/onboarding" : "/dashboard/agents",
@@ -88,7 +97,13 @@ export default function InviteAcceptPage() {
           <p className="mt-1 text-sm text-muted-foreground">接受邀请成为团队成员</p>
         </div>
 
-        {error ? (
+        {enrollmentTicket ? (
+          <AuthMfaEnrollment ticket={enrollmentTicket} onSession={(result) => {
+            setSession(result.session);
+            toast.success("已加入团队");
+            router.push(result.tenant?.onboardingCompleted === false ? "/onboarding" : "/dashboard/agents");
+          }} />
+        ) : error ? (
           <div className="rounded-md border border-destructive/30 px-3 py-2 text-xs text-destructive">
             {error}
           </div>

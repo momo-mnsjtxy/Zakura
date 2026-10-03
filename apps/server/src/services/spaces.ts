@@ -31,7 +31,9 @@ export const DEFAULT_SPACE_SLUG = "default";
 
 export type SpaceLifecycle = {
   /** Remove runner-owned resources before the database cascade becomes irreversible. */
-  beforeDelete?: (space: Space) => Promise<void>;
+  beforeDelete?: (
+    space: Space,
+  ) => Promise<void | ((deleted?: boolean) => Promise<void> | void)>;
 };
 
 function slugify(input: string): string {
@@ -185,10 +187,16 @@ export class SpaceService {
     }
     // A Space owns its computer. Stop/remove it before cascading the Space row;
     // otherwise an offline/failed runner cleanup leaves an unaddressable orphan.
-    await this.lifecycle.beforeDelete?.(space);
-    await this.db
-      .delete(spaces)
-      .where(and(eq(spaces.tenantId, tenantId), eq(spaces.id, space.id)));
+    const release = await this.lifecycle.beforeDelete?.(space);
+    let deleted = false;
+    try {
+      await this.db
+        .delete(spaces)
+        .where(and(eq(spaces.tenantId, tenantId), eq(spaces.id, space.id)));
+      deleted = true;
+    } finally {
+      await release?.(deleted);
+    }
     try {
       rmSync(spaceWorkspaceHostPath(this.config, space.id), { recursive: true, force: true });
     } catch {

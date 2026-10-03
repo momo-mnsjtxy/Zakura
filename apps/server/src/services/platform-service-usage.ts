@@ -1,10 +1,16 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, ne, sql } from "drizzle-orm";
 import type { AppConfig } from "../config.js";
 import type { Db } from "../db/client.js";
 import { newId, platformServiceQuotas, platformServiceUsage } from "../db/schema.js";
 import type { PlatformServiceKey } from "@zakura/shared";
 
 export const PLATFORM_QUOTA_SCOPE = "__platform__";
+/** Dedicated aggregate row used to serialize quota reservations across users/replicas. */
+export const PLATFORM_QUOTA_TOTAL_USER = "__quota_total__";
+
+function transactionDb(value: unknown): Db {
+  return value as Db;
+}
 
 export class QuotaExceededError extends Error {
   constructor(
@@ -52,31 +58,31 @@ export class PlatformServiceUsageService {
     const day = dayPeriod(now);
     const userId = opts.userId?.trim() ?? "";
 
-    if (quota.monthlyLimit != null) {
-      const used = await this.getCount(opts.tenantId, opts.serviceKey, month);
-      if (used >= quota.monthlyLimit) {
-        throw new QuotaExceededError(
-          `托管服务 ${opts.serviceKey} 已达月限额（${used}/${quota.monthlyLimit}）`,
-          opts.serviceKey,
-          month,
-          quota.monthlyLimit,
-        );
-      }
-    }
-    if (quota.dailyLimit != null) {
-      const used = await this.getCount(opts.tenantId, opts.serviceKey, day);
-      if (used >= quota.dailyLimit) {
-        throw new QuotaExceededError(
-          `托管服务 ${opts.serviceKey} 已达日限额（${used}/${quota.dailyLimit}）`,
-          opts.serviceKey,
-          day,
-          quota.dailyLimit,
-        );
-      }
-    }
-
-    await this.bump(opts.tenantId, userId, opts.serviceKey, month, false);
-    await this.bump(opts.tenantId, userId, opts.serviceKey, day, false);
+    await this.db.transaction(async (tx) => {
+      const database = transactionDb(tx);
+      // The aggregate rows are shared by all users. Their unique-key upserts
+      // serialize concurrent replicas; throwing on either period rolls the
+      // whole transaction back, so a rejected daily request cannot consume a
+      // monthly unit (and vice versa).
+      await this.reservePeriod(
+        database,
+        opts.tenantId,
+        opts.serviceKey,
+        month,
+        quota.monthlyLimit,
+        "月",
+      );
+      await this.reservePeriod(
+        database,
+        opts.tenantId,
+        opts.serviceKey,
+        day,
+        quota.dailyLimit,
+        "日",
+      );
+      await this.bump(database, opts.tenantId, userId, opts.serviceKey, month, false);
+      await this.bump(database, opts.tenantId, userId, opts.serviceKey, day, false);
+    });
   }
 
   async recordError(opts: {
@@ -87,8 +93,11 @@ export class PlatformServiceUsageService {
     if (!this.config.multiTenant) return;
     const now = new Date();
     const userId = opts.userId?.trim() ?? "";
-    await this.bump(opts.tenantId, userId, opts.serviceKey, monthPeriod(now), true);
-    await this.bump(opts.tenantId, userId, opts.serviceKey, dayPeriod(now), true);
+    await this.db.transaction(async (tx) => {
+      const database = transactionDb(tx);
+      await this.bump(database, opts.tenantId, userId, opts.serviceKey, monthPeriod(now), true);
+      await this.bump(database, opts.tenantId, userId, opts.serviceKey, dayPeriod(now), true);
+    });
   }
 
   async resolveQuota(tenantId: string, serviceKey: string): Promise<ResolvedQuota> {
@@ -204,6 +213,7 @@ export class PlatformServiceUsageService {
   }) {
     const rows = await this.db.query.platformServiceUsage.findMany();
     return rows.filter((r) => {
+      if (r.userId === PLATFORM_QUOTA_TOTAL_USER) return false;
       if (opts.tenantId && r.tenantId !== opts.tenantId) return false;
       if (opts.serviceKey && r.serviceKey !== opts.serviceKey) return false;
       if (opts.periodPrefix && !r.period.startsWith(opts.periodPrefix)) return false;
@@ -211,58 +221,125 @@ export class PlatformServiceUsageService {
     });
   }
 
-  private async getCount(
+  private async existingCount(
+    database: Db,
     tenantId: string,
     serviceKey: string,
     period: string,
   ): Promise<number> {
-    const rows = await this.db.query.platformServiceUsage.findMany({
-      where: and(
+    const rows = await database
+      .select({ requestCount: platformServiceUsage.requestCount })
+      .from(platformServiceUsage)
+      .where(and(
         eq(platformServiceUsage.tenantId, tenantId),
         eq(platformServiceUsage.serviceKey, serviceKey),
         eq(platformServiceUsage.period, period),
-      ),
-    });
+        ne(platformServiceUsage.userId, PLATFORM_QUOTA_TOTAL_USER),
+      ));
     return rows.reduce((sum, r) => sum + (r.requestCount ?? 0), 0);
   }
 
+  private async reservePeriod(
+    database: Db,
+    tenantId: string,
+    serviceKey: string,
+    period: string,
+    limit: number | null,
+    label: "月" | "日",
+  ): Promise<void> {
+    if (limit != null && limit <= 0) {
+      throw new QuotaExceededError(
+        `托管服务 ${serviceKey} 已达${label}限额（0/${limit}）`,
+        serviceKey,
+        period,
+        limit,
+      );
+    }
+    // Upgrade-safe bootstrap: seed the aggregate with any historical per-user
+    // rows. Concurrent first writers use the same unique key; the loser takes
+    // the conflict path and increments the winner rather than overwriting it.
+    const baseline = await this.existingCount(database, tenantId, serviceKey, period);
+    if (limit != null && baseline >= limit) {
+      throw new QuotaExceededError(
+        `托管服务 ${serviceKey} 已达${label}限额（${baseline}/${limit}）`,
+        serviceKey,
+        period,
+        limit,
+      );
+    }
+    const now = new Date();
+    const rows = await database
+      .insert(platformServiceUsage)
+      .values({
+        id: newId(),
+        tenantId,
+        userId: PLATFORM_QUOTA_TOTAL_USER,
+        serviceKey,
+        period,
+        requestCount: baseline + 1,
+        errorCount: 0,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .onConflictDoUpdate({
+        target: [
+          platformServiceUsage.tenantId,
+          platformServiceUsage.userId,
+          platformServiceUsage.serviceKey,
+          platformServiceUsage.period,
+        ],
+        set: {
+          requestCount: sql`${platformServiceUsage.requestCount} + 1`,
+          updatedAt: now,
+        },
+        ...(limit != null
+          ? { setWhere: sql`${platformServiceUsage.requestCount} < ${limit}` }
+          : {}),
+      })
+      .returning();
+    if (!rows.length) {
+      throw new QuotaExceededError(
+        `托管服务 ${serviceKey} 已达${label}限额（${limit}/${limit}）`,
+        serviceKey,
+        period,
+        limit!,
+      );
+    }
+  }
+
   private async bump(
+    database: Db,
     tenantId: string,
     userId: string,
     serviceKey: string,
     period: string,
     asError: boolean,
   ) {
-    const existing = await this.db.query.platformServiceUsage.findFirst({
-      where: and(
-        eq(platformServiceUsage.tenantId, tenantId),
-        eq(platformServiceUsage.userId, userId),
-        eq(platformServiceUsage.serviceKey, serviceKey),
-        eq(platformServiceUsage.period, period),
-      ),
-    });
     const now = new Date();
-    if (existing) {
-      await this.db
-        .update(platformServiceUsage)
-        .set({
-          requestCount: asError ? existing.requestCount : existing.requestCount + 1,
-          errorCount: asError ? existing.errorCount + 1 : existing.errorCount,
+    await database
+      .insert(platformServiceUsage)
+      .values({
+        id: newId(), tenantId, userId, serviceKey, period,
+        requestCount: asError ? 0 : 1,
+        errorCount: asError ? 1 : 0,
+        createdAt: now, updatedAt: now,
+      })
+      .onConflictDoUpdate({
+        target: [
+          platformServiceUsage.tenantId,
+          platformServiceUsage.userId,
+          platformServiceUsage.serviceKey,
+          platformServiceUsage.period,
+        ],
+        set: {
+          requestCount: asError
+            ? platformServiceUsage.requestCount
+            : sql`${platformServiceUsage.requestCount} + 1`,
+          errorCount: asError
+            ? sql`${platformServiceUsage.errorCount} + 1`
+            : platformServiceUsage.errorCount,
           updatedAt: now,
-        })
-        .where(eq(platformServiceUsage.id, existing.id));
-      return;
-    }
-    await this.db.insert(platformServiceUsage).values({
-      id: newId(),
-      tenantId,
-      userId,
-      serviceKey,
-      period,
-      requestCount: asError ? 0 : 1,
-      errorCount: asError ? 1 : 0,
-      createdAt: now,
-      updatedAt: now,
-    });
+        },
+      });
   }
 }

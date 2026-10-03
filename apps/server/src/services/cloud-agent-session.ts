@@ -5,7 +5,7 @@
  * 序号走 INCR，实时 PUBLISH，高频 delta 先推送再异步批落库。
  * 仅当 REDIS_URL=off 时回退为「每事件同步写库 + 进程内 fan-out」。
  */
-import { and, asc, desc, eq, exists, gt, ilike, inArray, isNull, lt, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, exists, gt, ilike, inArray, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
 import { getTelemetry, recordPlatformFault } from "@zakura/core";
 import type {
   CloudAgentEvent,
@@ -181,10 +181,28 @@ export class CloudAgentSessionStore {
   private readonly cancellations = new RunCancellationRegistry((err) =>
     recordPlatformFault("cloud_agent.cancel_listener", err, { subsystem: "cloud_agent", dep: "redis" }),
   );
+  /**
+   * Reference-counted local admission barriers. Tenant deletion, suspension and
+   * member revocation can overlap; releasing one lifecycle lease must not reopen
+   * a session still owned by another drain.
+   */
+  private readonly drainingAgents = new Map<string, number>();
+  private readonly drainingSessions = new Map<string, number>();
+  private readonly drainingMembers = new Map<string, number>();
   /** 全局取消频道订阅（懒启动，跨实例即时传导） */
   private cancelSubReady: Promise<void> | null = null;
 
   constructor(private readonly db: Db) {}
+
+  private holdDrain(map: Map<string, number>, key: string): void {
+    map.set(key, (map.get(key) ?? 0) + 1);
+  }
+
+  private releaseDrain(map: Map<string, number>, key: string): void {
+    const count = map.get(key) ?? 0;
+    if (count <= 1) map.delete(key);
+    else map.set(key, count - 1);
+  }
 
   /** 供 Run 启动时预热：元数据 + Redis seq，避免首个 delta 踩 DB */
   async warmSession(sessionId: string, hint?: { tenantId: string; agentId: string; lastSeq: number }) {
@@ -666,6 +684,15 @@ export class CloudAgentSessionStore {
     draftText?: string;
     project?: string | null;
   }): Promise<CloudAgentSession> {
+    if (this.drainingAgents.has(`${input.tenantId}:${input.agentId}`)) {
+      throw new Error("Agent 正在删除，无法创建新会话");
+    }
+    if (
+      input.createdByUserId &&
+      this.drainingMembers.has(`${input.tenantId}:${input.createdByUserId}`)
+    ) {
+      throw new Error("成员访问正在撤销，无法创建新会话");
+    }
     const id = newId();
     const now = new Date();
     await this.db.insert(cloudAgentSessions).values({
@@ -1649,6 +1676,9 @@ export class CloudAgentSessionStore {
   }
 
   async createRun(sessionId: string): Promise<CloudAgentRun> {
+    if (this.drainingSessions.has(sessionId)) {
+      throw new Error("会话正在删除，无法启动新 Run");
+    }
     const id = newId();
     const now = new Date();
     // Claim the session before inserting the Run. The previous insert-then-update
@@ -2013,6 +2043,166 @@ export class CloudAgentSessionStore {
     const item = await this.messageQueue.remove(sessionId, messageId);
     if (item) await this.publishQueueSnapshot(sessionId);
     return item;
+  }
+
+  /** Clear both FIFO and immediate reservations before an aggregate is deleted. */
+  async clearQueued(sessionId: string): Promise<void> {
+    const visible = await this.messageQueue.list(sessionId);
+    await this.messageQueue.clear(sessionId);
+    if (visible.length > 0) await this.publishQueueSnapshot(sessionId);
+  }
+
+  private async beginSessionDrain(
+    sessionIds: string[],
+    heldBarriers: Array<{ map: Map<string, number>; key: string }>,
+    opts: { timeoutMs?: number; cleanupDeleted?: boolean } = {},
+  ): Promise<(deleted?: boolean) => Promise<void>> {
+    const ids = [...new Set(sessionIds.filter(Boolean))];
+    for (const sessionId of ids) this.holdDrain(this.drainingSessions, sessionId);
+
+    let released = false;
+    const release = async (deleted = false) => {
+      if (released) return;
+      released = true;
+      try {
+        if (deleted && opts.cleanupDeleted !== false) {
+          for (const sessionId of ids) {
+            this.listeners.delete(sessionId);
+            this.sessionMeta.delete(sessionId);
+            await this.messageQueue.clear(sessionId);
+            void this.releaseRedisSubscription(sessionId);
+          }
+          const redis = await getRedis();
+          if (redis && ids.length > 0) {
+            await redis.del(ids.flatMap((sessionId) => [
+              REDIS_KEYS.seq(sessionId),
+              REDIS_KEYS.pending(sessionId),
+              REDIS_KEYS.events(sessionId),
+              REDIS_KEYS.meta(sessionId),
+              REDIS_KEYS.queue(sessionId),
+              REDIS_KEYS.queueNext(sessionId),
+            ]));
+          }
+        }
+      } catch (error) {
+        recordPlatformFault("cloud_agent.delete_cleanup", error, {
+          subsystem: "cloud_agent",
+          dep: isRedisEnabled() ? "redis" : undefined,
+        });
+      } finally {
+        for (const sessionId of ids) this.releaseDrain(this.drainingSessions, sessionId);
+        for (const barrier of heldBarriers) this.releaseDrain(barrier.map, barrier.key);
+      }
+    };
+
+    try {
+      await Promise.all(ids.map((sessionId) => this.clearQueued(sessionId)));
+      const timeoutMs = Math.max(100, opts.timeoutMs ?? 10_000);
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        const active = ids.length === 0
+          ? []
+          : await this.db
+              .select({ id: cloudAgentSessions.id, activeRunId: cloudAgentSessions.activeRunId })
+              .from(cloudAgentSessions)
+              .where(
+                and(
+                  inArray(cloudAgentSessions.id, ids),
+                  isNotNull(cloudAgentSessions.activeRunId),
+                ),
+              );
+        if (active.length === 0) break;
+        await Promise.all(
+          active.map(async (session) => {
+            // Clear again in case a queue mutation raced the admission barrier.
+            await this.messageQueue.clear(session.id);
+            await this.requestCancel(session.id, session.activeRunId);
+          }),
+        );
+        if (Date.now() >= deadline) {
+          throw new Error("等待活跃 Run 取消超时，请稍后重试");
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      await Promise.all(ids.map((sessionId) => this.flushPending(sessionId)));
+      return release;
+    } catch (error) {
+      await release(false);
+      throw error;
+    }
+  }
+
+  /**
+   * Stop admission, discard queued follow-ups, cancel active runs, and wait for
+   * their normal tool/run terminal events before the owning rows are cascaded.
+   * The returned release must be held through the caller's delete transaction.
+   */
+  async beginAgentDeletionDrain(
+    tenantId: string,
+    agentIds: string[],
+    opts: { timeoutMs?: number } = {},
+  ): Promise<(deleted?: boolean) => Promise<void>> {
+    const ids = [...new Set(agentIds.filter(Boolean))];
+    if (ids.length === 0) return async () => {};
+    const agentKeys = ids.map((agentId) => `${tenantId}:${agentId}`);
+    for (const key of agentKeys) this.holdDrain(this.drainingAgents, key);
+    const barriers = agentKeys.map((key) => ({ map: this.drainingAgents, key }));
+
+    let sessions: Array<{ id: string }>;
+    try {
+      sessions = await this.db
+        .select({ id: cloudAgentSessions.id })
+        .from(cloudAgentSessions)
+        .where(
+          and(
+            eq(cloudAgentSessions.tenantId, tenantId),
+            inArray(cloudAgentSessions.agentId, ids),
+          ),
+        );
+    } catch (error) {
+      for (const barrier of barriers) this.releaseDrain(barrier.map, barrier.key);
+      throw error;
+    }
+    return this.beginSessionDrain(
+      sessions.map((session) => session.id),
+      barriers,
+      { ...opts, cleanupDeleted: true },
+    );
+  }
+
+  /**
+   * Drain only sessions created by one tenant member. This deliberately does
+   * not hold an Agent barrier: sibling users keep their sessions and shared
+   * Space computer while the revoked member's active runs terminate.
+   */
+  async beginMemberSessionDrain(
+    tenantId: string,
+    userId: string,
+    opts: { timeoutMs?: number } = {},
+  ): Promise<(deleted?: boolean) => Promise<void>> {
+    const memberKey = `${tenantId}:${userId}`;
+    this.holdDrain(this.drainingMembers, memberKey);
+    const barrier = { map: this.drainingMembers, key: memberKey };
+    let sessions: Array<{ id: string }>;
+    try {
+      sessions = await this.db
+        .select({ id: cloudAgentSessions.id })
+        .from(cloudAgentSessions)
+        .where(
+          and(
+            eq(cloudAgentSessions.tenantId, tenantId),
+            eq(cloudAgentSessions.createdByUserId, userId),
+          ),
+        );
+    } catch (error) {
+      this.releaseDrain(barrier.map, barrier.key);
+      throw error;
+    }
+    return this.beginSessionDrain(
+      sessions.map((session) => session.id),
+      [barrier],
+      { ...opts, cleanupDeleted: false },
+    );
   }
 
   /** Mark an item as interrupting and move it to the FIFO head. */

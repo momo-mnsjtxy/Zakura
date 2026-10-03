@@ -22,10 +22,13 @@ import {
   tenants,
   tenantMemberships,
   tenantDomains,
+  userWebauthnCredentials,
   users,
 } from "../src/db/schema.js";
 import { hashApiKey } from "@zakura/core";
 import { registerScimRoutes } from "../src/api/scim-routes.js";
+import { registerIdentityRoutes } from "../src/api/identity-routes.js";
+import type { AppConfig } from "../src/config.js";
 import { SecurityAuditService } from "../src/services/identity/audit.js";
 import {
   createScimToken,
@@ -274,12 +277,62 @@ describe("identity tenancy lifecycle on PGlite", () => {
       tenants: service,
       signSession: () => "signed",
       sessionFromLogin: () => "signed",
+      mfaForLogin: async (input: { tenantId: string }) =>
+        input.tenantId === lifecycleTenant.tenant.id
+          ? ({ action: "enroll" as const, ticket: "enrollment-ticket" })
+          : ({ action: "allow" as const }),
       switchTenantSession: async () => null,
       isSessionAdmin: (session: SaasSession) => session.role === "owner" || session.role === "admin",
       ensurePlatformMeta: async () => ({ setupCompleted: true, mode: "multi-tenant", version: "test" }),
+      resolveRegistrationJoin: async (email: string) =>
+        email.endsWith("@autojoin.example.test")
+          ? ({ action: "auto_join" as const, tenantId: lifecycleTenant.tenant.id, role: "member" as const })
+          : ({ action: "create_tenant" as const }),
       schema,
     } satisfies SaasHostDeps & { schema: typeof schema };
     registerSaasRoutes(app, deps);
+
+    const unverifiedAutoJoin = await app.request("http://test/api/auth/register", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        email: `unverified-${newId()}@autojoin.example.test`,
+        password: "registration-password",
+        tenantName: "Unverified personal tenant",
+      }),
+    });
+    assert.equal(unverifiedAutoJoin.status, 201, await unverifiedAutoJoin.clone().text());
+    const unverifiedBody = await unverifiedAutoJoin.json() as {
+      user: { id: string };
+      tenant: { id: string };
+    };
+    assert.notEqual(unverifiedBody.tenant.id, lifecycleTenant.tenant.id);
+    assert.equal(
+      await db.query.tenantMemberships.findFirst({
+        where: and(
+          eq(tenantMemberships.tenantId, lifecycleTenant.tenant.id),
+          eq(tenantMemberships.userId, unverifiedBody.user.id),
+        ),
+      }),
+      undefined,
+    );
+
+    await db.insert(tenantMemberships).values({
+      id: newId(), tenantId: lifecycleTenant.tenant.id, userId: routeOwner.id,
+      role: "member", status: "active", createdAt: now, updatedAt: now,
+    });
+    const blockedSwitch = await app.request("http://test/api/auth/switch-tenant", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ tenantId: lifecycleTenant.tenant.id }),
+    });
+    assert.equal(blockedSwitch.status, 200);
+    const blockedSwitchBody = await blockedSwitch.json() as {
+      code?: string;
+      mfaEnrollmentTicket?: string;
+    };
+    assert.equal(blockedSwitchBody.code, "mfa_enrollment_required");
+    assert.equal(blockedSwitchBody.mfaEnrollmentTicket, "enrollment-ticket");
 
     const missingDefaults = await app.request("http://test/api/admin/agent-defaults");
     assert.equal(missingDefaults.status, 503);
@@ -351,6 +404,27 @@ describe("identity tenancy lifecycle on PGlite", () => {
     );
     assert.equal(deleteSoleOwnerUser.status, 400, await deleteSoleOwnerUser.clone().text());
 
+    const concurrentOwnerA = await addUser(`concurrent-owner-a-${newId()}@example.test`);
+    const concurrentOwnerB = await addUser(`concurrent-owner-b-${newId()}@example.test`);
+    const concurrentTenant = await service.createTenant({
+      name: "Concurrent global owner guard",
+      slug: `global-owner-${newId()}`,
+      ownerUserId: concurrentOwnerA.id,
+    });
+    await db.insert(tenantMemberships).values({
+      id: newId(), tenantId: concurrentTenant.tenant.id, userId: concurrentOwnerB.id,
+      role: "owner", status: "active", createdAt: now, updatedAt: now,
+    });
+    const suspendGlobalOwner = (userId: string) =>
+      app.request(`http://test/api/admin/users/${userId}/suspend`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+      });
+    const concurrentSuspensions = await Promise.all([
+      suspendGlobalOwner(concurrentOwnerA.id),
+      suspendGlobalOwner(concurrentOwnerB.id),
+    ]);
+    assert.deepEqual(concurrentSuspensions.map((response) => response.status).sort(), [200, 400]);
+
     const suspendMember = await app.request(
       `http://test/api/admin/tenants/${routeTenant.tenant.id}/members/${routeMembership.id}`,
       {
@@ -418,6 +492,15 @@ describe("identity tenancy lifecycle on PGlite", () => {
       { id: newId(), ownerKey: `tenant:${tenantId}`, key: "identity.audit", value: "{}" },
     ]);
     assert.equal((await authenticateApiKey(db, rawKey))?.tenant.id, tenantId);
+    const directlyRevoked = `zak_test_${newId()}`;
+    const directHash = hashApiKey(directlyRevoked);
+    const [directRow] = await db.insert(apiKeys).values({
+      id: newId(), tenantId, name: "direct revoke", keyHash: directHash,
+      keyPrefix: directlyRevoked.slice(0, 8), scopes: '["*"]', createdAt: now,
+    }).returning();
+    assert.ok(await authenticateApiKey(db, directlyRevoked));
+    await db.delete(apiKeys).where(eq(apiKeys.id, directRow.id));
+    assert.equal(await authenticateApiKey(db, directlyRevoked), null);
 
     const lifecycle: string[] = [];
     const aggregate = new TenantService(db, [{
@@ -510,6 +593,22 @@ describe("identity tenancy lifecycle on PGlite", () => {
       ),
     });
     assert.equal(membership?.role, "admin");
+
+    const failedGroupReplace = await app.request(`http://test/scim/v2/Groups/${groupId}`, {
+      method: "PATCH",
+      headers: { authorization: `Bearer ${first.token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        Operations: [
+          { op: "replace", path: "members", value: [] },
+          { op: { invalid: true }, path: "members", value: [] },
+        ],
+      }),
+    });
+    assert.equal(failedGroupReplace.status, 400);
+    assert.equal(
+      (await db.query.tenantMemberships.findFirst({ where: eq(tenantMemberships.id, membership!.id) }))?.role,
+      "admin",
+    );
 
     const deactivate = await app.request(`http://test/scim/v2/Users/${provisioned.id}`, {
       method: "PATCH",
@@ -651,6 +750,31 @@ describe("identity tenancy lifecycle on PGlite", () => {
       assert.equal(secondLogin.user.email, "oidc-user@example.test");
       const identities = await db.select().from(oauthIdentities).where(eq(oauthIdentities.providerUserId, "subject-1"));
       assert.equal(identities.length, 1);
+
+      await db.insert(userWebauthnCredentials).values({
+        id: newId(), userId: firstLogin.user.id, credentialId: `sso-cred-${newId()}`,
+        publicKey: "AA", counter: 0, name: "SSO passkey", transportsJson: "[]", createdAt: new Date(),
+      });
+      const mfaStart = await startOidcSso(db, urls, "acme-a");
+      const mfaAuthorize = new URL(mfaStart.authorizeUrl);
+      expectedNonce = mfaAuthorize.searchParams.get("nonce")!;
+      assertedEmail = firstLogin.user.email;
+      const identityApp = new Hono();
+      registerIdentityRoutes(identityApp as never, {
+        db,
+        config: { secret, ...urls, dataDir: dir } as AppConfig,
+        audit: new SecurityAuditService(db),
+      });
+      const mfaCallback = await identityApp.request("http://test/api/auth/sso/oidc/callback", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ code: "mfa-code", state: mfaAuthorize.searchParams.get("state") }),
+      });
+      assert.equal(mfaCallback.status, 200, await mfaCallback.clone().text());
+      const mfaBody = await mfaCallback.json() as { session?: string; mfaRequired?: boolean; methods?: string[] };
+      assert.equal(mfaBody.session, undefined);
+      assert.equal(mfaBody.mfaRequired, true);
+      assert.deepEqual(mfaBody.methods, ["webauthn"]);
 
       await upsertTenantSso(db, secret, tenantB, {
         enabled: true,

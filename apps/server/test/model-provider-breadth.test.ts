@@ -479,6 +479,42 @@ describe("provider capability breadth over deterministic fake transports", () =>
     assert.match(prompts[0] ?? "", /User:\nquestion/);
   });
 
+  it("cancels a buffered Cursor prompt promptly and suppresses its late content", async () => {
+    setRouteHydrator(async (value) => value);
+    let release!: (value: string) => void;
+    let started!: () => void;
+    const promptStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    setCursorLoginApi({
+      login: async ({ onLoginUrl }) => {
+        onLoginUrl("https://cursor.invalid/login");
+        return { apiKey: "unused" };
+      },
+      listModels: async () => [],
+      prompt: async () => {
+        started();
+        return new Promise<string>((resolve) => {
+          release = resolve;
+        });
+      },
+    });
+    const controller = new AbortController();
+    const deltas: string[] = [];
+    const pending = executeChatStream(
+      route("cursor", "chat"),
+      [{ role: "user", content: "wait" }],
+      undefined,
+      { signal: controller.signal, onDelta: (delta) => deltas.push(delta) },
+    );
+    await promptStarted;
+    controller.abort();
+    await assert.rejects(pending, (error: unknown) => isAbortError(error));
+    release("late answer");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(deltas, []);
+  });
+
   it("covers TypeSafe evaluation and rejects empty success envelopes", async () => {
     let empty = false;
     let body: Record<string, unknown> | undefined;

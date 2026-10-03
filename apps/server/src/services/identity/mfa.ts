@@ -13,6 +13,7 @@ import type { Db } from "../../db/client.js";
 import {
   newId,
   settings,
+  tenantMemberships,
   userRecoveryCodes,
   userTotp,
   userWebauthnCredentials,
@@ -24,6 +25,10 @@ import { CredentialLifecycleService } from "./credential-lifecycle.js";
 
 const pendingChallenge = new Map<string, { challenge: string; expiresAt: number }>();
 const MFA_POLICY_KEY = "identity.mfa";
+
+function transactionDb(value: unknown): Db {
+  return value as Db;
+}
 
 export type TenantMfaPolicy = "optional" | "admins" | "all";
 
@@ -64,6 +69,21 @@ export async function setTenantMfaPolicy(
       set: { value },
     });
   return policy;
+}
+
+/** MFA factors are global to a user, so every active tenant policy must agree to removal. */
+export async function userRequiresMfaInAnyTenant(db: Db, userId: string): Promise<boolean> {
+  const memberships = await db.query.tenantMemberships.findMany({
+    where: and(
+      eq(tenantMemberships.userId, userId),
+      eq(tenantMemberships.status, "active"),
+    ),
+  });
+  for (const membership of memberships) {
+    const policy = await getTenantMfaPolicy(db, membership.tenantId);
+    if (tenantMfaPolicyRequires(policy, membership.role)) return true;
+  }
+  return false;
 }
 
 function setChallenge(key: string, challenge: string) {
@@ -163,6 +183,34 @@ export async function enableTotp(db: Db, appSecret: string, userId: string, code
   await db.update(userTotp).set({ enabledAt: now }).where(eq(userTotp.userId, userId));
   await db.update(users).set({ totpEnabledAt: now, updatedAt: now }).where(eq(users.id, userId));
   return issueRecoveryCodes(db, userId);
+}
+
+/** Verify setup, atomically consume the enrollment ticket, and enable TOTP. */
+export async function completeTotpEnrollment(
+  db: Db,
+  appSecret: string,
+  userId: string,
+  rawTicket: string,
+  code: string,
+): Promise<string[]> {
+  return db.transaction(async (tx) => {
+    const database = transactionDb(tx);
+    const row = await database.query.userTotp.findFirst({ where: eq(userTotp.userId, userId) });
+    if (!row || row.enabledAt) throw new Error("请先开始绑定验证器");
+    const base32 = decryptJson<string>(appSecret, row.secretEnc);
+    if (!verifyTotpCode(base32, code)) throw new Error("验证码不正确");
+    const consumed = await new CredentialLifecycleService(database).consumeAuth(
+      "mfa_enrollment",
+      rawTicket,
+    );
+    if (!consumed?.userId || consumed.userId !== userId) {
+      throw new Error("MFA enrollment ticket 无效或已过期");
+    }
+    const now = new Date();
+    await database.update(userTotp).set({ enabledAt: now }).where(eq(userTotp.userId, userId));
+    await database.update(users).set({ totpEnabledAt: now, updatedAt: now }).where(eq(users.id, userId));
+    return issueRecoveryCodes(database, userId);
+  });
 }
 
 export async function disableTotp(

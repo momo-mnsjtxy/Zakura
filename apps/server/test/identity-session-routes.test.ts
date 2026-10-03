@@ -100,10 +100,23 @@ describe("identity session lifecycle routes", () => {
     });
     await setTenantMfaPolicy(db,tenantId,"optional");assert.equal((await login(rows[0].email)).status,200);
     await setTenantMfaPolicy(db,tenantId,"admins");
-    for(const row of rows.slice(0,2)){const response=await login(row.email);assert.equal(response.status,403);assert.equal(((await response.json()) as {code?:string}).code,"mfa_enrollment_required")}
+    for(const row of rows.slice(0,2)){const response=await login(row.email);assert.equal(response.status,200);const body=await response.json() as {code?:string;mfaEnrollmentTicket?:string};assert.equal(body.code,"mfa_enrollment_required");assert.ok(body.mfaEnrollmentTicket)}
     assert.equal((await login(rows[2].email)).status,200);
     const enrolled=await login(rows[3].email);assert.equal(enrolled.status,200);const enrolledBody=await enrolled.json() as {mfaRequired?:boolean;methods?:string[]};assert.equal(enrolledBody.mfaRequired,true);assert.deepEqual(enrolledBody.methods,["webauthn"]);
-    await setTenantMfaPolicy(db,tenantId,"all");const allDenied=await login(rows[2].email);assert.equal(allDenied.status,403);assert.equal(((await allDenied.json()) as {code?:string}).code,"mfa_enrollment_required");
+    await setTenantMfaPolicy(db,tenantId,"all");const allDenied=await login(rows[2].email);assert.equal(allDenied.status,200);const allBody=await allDenied.json() as {code?:string;mfaEnrollmentTicket?:string};assert.equal(allBody.code,"mfa_enrollment_required");assert.ok(allBody.mfaEnrollmentTicket);
+    await setTenantMfaPolicy(db,tenantId,"optional");
+  });
+
+  it("enrolls required MFA with a tenant-bound one-time ticket",async()=>{
+    const schema=await import("../src/db/schema.js");const {issueAuthToken}=await import("../src/services/identity/tokens.js");const {setTenantMfaPolicy}=await import("../src/services/identity/mfa.js");const {Secret,TOTP}=await import("otpauth");
+    const userId=schema.newId();await db.insert(schema.users).values({id:userId,email:"mfa-enrollment@example.test",passwordHash:await bcrypt.hash("password-123",4)});await db.insert(schema.tenantMemberships).values({id:schema.newId(),tenantId,userId,role:"member",status:"active"});await setTenantMfaPolicy(db,tenantId,"all");
+    const ticket=await issueAuthToken(db,{kind:"mfa_enrollment",userId,meta:{tenantId,role:"member"}});
+    const start=await app.request("http://local/api/auth/mfa/enrollment/totp/start",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({ticket})});assert.equal(start.status,200,await start.clone().text());const setup=await start.json() as {secret:string};
+    const wrong=await app.request("http://local/api/auth/mfa/enrollment/totp/complete",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({ticket,code:"000000"})});assert.equal(wrong.status,400);
+    const code=new TOTP({issuer:"Zakura",label:"user",algorithm:"SHA1",digits:6,period:30,secret:Secret.fromBase32(setup.secret)}).generate();
+    const complete=()=>app.request("http://local/api/auth/mfa/enrollment/totp/complete",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({ticket,code})});const raced=await Promise.all([complete(),complete()]);assert.deepEqual(raced.map((response)=>response.status).sort(),[200,400]);const success=raced.find((response)=>response.status===200)!;const successBody=await success.json() as {session?:string;recoveryCodes?:string[]};assert.ok(successBody.session);assert.equal(successBody.recoveryCodes?.length,8);assert.equal((await complete()).status,400);
+    const expired=await issueAuthToken(db,{kind:"mfa_enrollment",userId,meta:{tenantId,role:"member"},ttlMs:-1});const expiredStart=await app.request("http://local/api/auth/mfa/enrollment/totp/start",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({ticket:expired})});assert.equal(expiredStart.status,400);
+    const foreign=await issueAuthToken(db,{kind:"mfa_enrollment",userId,meta:{tenantId:"foreign-tenant",role:"member"}});const foreignStart=await app.request("http://local/api/auth/mfa/enrollment/totp/start",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({ticket:foreign})});assert.equal(foreignStart.status,400);
     await setTenantMfaPolicy(db,tenantId,"optional");
   });
 

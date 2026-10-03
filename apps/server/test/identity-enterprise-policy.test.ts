@@ -8,6 +8,7 @@ import { Hono } from "hono";
 import type { AppConfig } from "../src/config.js";
 import type { Db } from "../src/db/client.js";
 import { newId, securityAuditLogs, settings, tenantMemberships, users } from "../src/db/schema.js";
+import * as schema from "../src/db/schema.js";
 import { registerIdentityRoutes } from "../src/api/identity-routes.js";
 import { registerUsageRoutes } from "../src/api/usage-routes.js";
 import { SecurityAuditService } from "../src/services/identity/audit.js";
@@ -15,6 +16,18 @@ import { addTenantDomain, maybeAutoJoinTenant, setDomainJoinMode, verifyTenantDo
 import { TenantAccessError, TenantService } from "../src/services/tenants.js";
 import { UserUsageStore } from "../src/services/user-usage.js";
 import type { SessionPayload } from "../src/services/auth.js";
+import { confirmEmailVerification } from "../src/services/identity/account.js";
+import { issueAuthToken } from "../src/services/identity/tokens.js";
+import { setTenantMfaPolicy } from "../src/services/identity/mfa.js";
+import {
+  checkSessionSuspended,
+  invalidateAllSuspensions,
+} from "../src/services/account-status.js";
+import {
+  completeOauthLogin,
+  saveProviderConfig,
+  startOauthLogin,
+} from "../../../packages/saas/src/server/oauth-login.js";
 
 describe("enterprise identity and tenancy policy on PGlite", () => {
   let dir: string, db: Db, close: () => Promise<void>, config: AppConfig;
@@ -82,6 +95,73 @@ describe("enterprise identity and tenancy policy on PGlite", () => {
     await db.insert(tenantMemberships).values({ id: newId(), tenantId: tenantA, userId: suspended.id, role: "member", status: "suspended", createdAt: new Date(), updatedAt: new Date() });
     await assert.rejects(tenantsService.acceptInvite({ token: invite.token, userId: suspended.id }), (error: unknown) => error instanceof TenantAccessError && error.status === 403);
     assert.equal((await tenantsService.getInviteByToken(invite.token))?.invite.acceptedAt, null);
+
+    const victim = await addUser(`existing-victim-${newId()}@example.test`);
+    const victimInvite = await tenantsService.createInvite({
+      tenantId: tenantA,
+      email: victim.email,
+      role: "member",
+      invitedByUserId: inviteActor!.userId,
+    });
+    await assert.rejects(
+      tenantsService.acceptInvite({ token: victimInvite.token, email: victim.email }),
+      (error: unknown) => error instanceof TenantAccessError && error.status === 401,
+    );
+    assert.equal(
+      await db.query.tenantMemberships.findFirst({
+        where: and(eq(tenantMemberships.tenantId, tenantA), eq(tenantMemberships.userId, victim.id)),
+      }),
+      undefined,
+    );
+  });
+
+  it("does not auto-link an unverified OAuth email to an existing global account", async () => {
+    const victim = await addUser(`oauth-victim-${newId()}@example.test`);
+    const deps = {
+      db,
+      schema,
+      secret: "oauth-secret",
+      webPublicUrl: "https://web.example.test",
+      encryptJson: (_secret: string, value: unknown) => JSON.stringify(value),
+      decryptJson: <T,>(_secret: string, value: string) => JSON.parse(value) as T,
+    };
+    await saveProviderConfig(deps, "google", {
+      enabled: true,
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      tokenUrl: "https://oauth.example.test/token",
+      userinfoUrl: "https://oauth.example.test/userinfo",
+    });
+    const start = await startOauthLogin(deps, "google");
+    const state = new URL(start.authorizeUrl).searchParams.get("state")!;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input) => {
+      const url = String(input);
+      if (url.endsWith("/token")) return Response.json({ access_token: "fake-access" });
+      if (url.endsWith("/userinfo")) {
+        return Response.json({
+          sub: `attacker-${newId()}`,
+          email: victim.email,
+          email_verified: false,
+          name: "Attacker",
+        });
+      }
+      throw new Error(`Unexpected URL ${url}`);
+    };
+    try {
+      await assert.rejects(
+        completeOauthLogin(deps, "google", { code: "fake-code", state }),
+        /Email already registered/,
+      );
+      assert.equal(
+        await db.query.oauthIdentities.findFirst({
+          where: eq(schema.oauthIdentities.provider, "google"),
+        }),
+        undefined,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   it("claims domains concurrently, verifies exact TXT and preserves suspension", async () => {
@@ -92,7 +172,31 @@ describe("enterprise identity and tenancy policy on PGlite", () => {
     await assert.rejects(setDomainJoinMode(db, tenantA, left.id, "auto_join"), /必须先验证/);
     await assert.rejects(verifyTenantDomain(db, tenantA, left.id, async () => [[`prefix-${left.txtToken}-suffix`]]), /未找到 TXT/);
     await verifyTenantDomain(db, tenantA, left.id, async () => [[left.txtToken.slice(0, 5), left.txtToken.slice(5)]]);
+    await assert.rejects(
+      setDomainJoinMode(db, tenantA, left.id, "sso_required"),
+      /完成并启用 SSO/,
+    );
     await setDomainJoinMode(db, tenantA, left.id, "auto_join");
+    const unverified = await addUser(`unverified@${domain}`);
+    await maybeAutoJoinTenant(db, {
+      userId: unverified.id,
+      email: unverified.email,
+      emailVerified: false,
+    });
+    assert.equal(
+      await db.query.tenantMemberships.findFirst({
+        where: and(eq(tenantMemberships.tenantId, tenantA), eq(tenantMemberships.userId, unverified.id)),
+      }),
+      undefined,
+    );
+    const verifyToken = await issueAuthToken(db, { kind: "email_verify", userId: unverified.id });
+    assert.equal(await confirmEmailVerification(db, verifyToken), true);
+    assert.equal(
+      (await db.query.tenantMemberships.findFirst({
+        where: and(eq(tenantMemberships.tenantId, tenantA), eq(tenantMemberships.userId, unverified.id)),
+      }))?.status,
+      "active",
+    );
     const autoUser = await addUser(`new@${domain}`);
     await Promise.all([
       maybeAutoJoinTenant(db, { userId: autoUser.id, email: autoUser.email, emailVerified: true }),
@@ -136,6 +240,16 @@ describe("enterprise identity and tenancy policy on PGlite", () => {
     assert.equal(status.status, 200); assert.equal(((await status.json()) as { required: boolean }).required, true);
     const disable = await app.request("http://test/api/me/mfa/totp/disable", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     assert.equal(disable.status, 409);
+    await db.insert(tenantMemberships).values({
+      id: newId(), tenantId: tenantB, userId: memberA, role: "member", status: "active",
+      createdAt: new Date(), updatedAt: new Date(),
+    });
+    await setTenantMfaPolicy(db, tenantA, "optional");
+    await setTenantMfaPolicy(db, tenantB, "all");
+    const crossTenantDisable = await app.request("http://test/api/me/mfa/totp/disable", {
+      method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+    });
+    assert.equal(crossTenantDisable.status, 409);
     assert.equal((await app.request("http://test/api/usage/me?category=invalid")).status, 400);
     session = { userId: adminA, tenantId: tenantA, email: "enterprise-admin@example.test", role: "admin" };
     assert.equal((await app.request(`http://test/api/usage/users?tenantId=${tenantB}`)).status, 403);
@@ -143,5 +257,16 @@ describe("enterprise identity and tenancy policy on PGlite", () => {
     session = { ...session, isPlatformAdmin: true };
     const crossTenant = await app.request(`http://test/api/usage/users?tenantId=${tenantB}`);
     assert.equal(crossTenant.status, 200, await crossTenant.clone().text());
+
+    process.env.REDIS_URL = "off";
+    invalidateAllSuspensions();
+    assert.equal(await checkSessionSuspended(db, { userId: ownerB, tenantId: tenantB }), null);
+    await db.update(schema.tenants).set({ suspendedAt: new Date(), suspendedReason: "replica" }).where(eq(schema.tenants.id, tenantB));
+    process.env.REDIS_URL = "redis://distributed-cache-enabled.example";
+    const distributed = await checkSessionSuspended(db, { userId: ownerB, tenantId: tenantB });
+    assert.equal(distributed?.scope, "tenant");
+    process.env.REDIS_URL = "off";
+    await db.update(schema.tenants).set({ suspendedAt: null, suspendedReason: null }).where(eq(schema.tenants.id, tenantB));
+    invalidateAllSuspensions();
   });
 });

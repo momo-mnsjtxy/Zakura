@@ -235,12 +235,13 @@ export class FileShareService {
     agentIds: string[],
     fromPrefix: string,
     toPrefix: string,
+    database: Db = this.db,
   ): Promise<number> {
     if (agentIds.length === 0) return 0;
     const normalize = (value: string) => value.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
     const from = normalize(fromPrefix);
     const to = normalize(toPrefix);
-    const rows = await this.db
+    const rows = await database
       .select()
       .from(fileShares)
       .where(
@@ -256,7 +257,7 @@ export class FileShareService {
       if (path !== from && !path.startsWith(`${from}/`)) continue;
       const suffix = path.slice(from.length);
       const rebased = `${row.path.startsWith("/") ? "/" : ""}${to}${suffix}`;
-      const updated = await this.db
+      const updated = await database
         .update(fileShares)
         .set({ path: rebased, updatedAt: new Date() })
         .where(
@@ -277,10 +278,11 @@ export class FileShareService {
     tenantId: string,
     agentIds: string[],
     prefix: string,
+    database: Db = this.db,
   ): Promise<number> {
     if (agentIds.length === 0) return 0;
     const normalizedPrefix = prefix.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
-    const rows = await this.db
+    const rows = await database
       .select()
       .from(fileShares)
       .where(
@@ -298,7 +300,7 @@ export class FileShareService {
       .map((row) => row.id);
     if (ids.length === 0) return 0;
     const now = new Date();
-    const revoked = await this.db
+    const revoked = await database
       .update(fileShares)
       .set({ status: "revoked", revokedAt: now, updatedAt: now })
       .where(

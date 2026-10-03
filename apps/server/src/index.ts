@@ -478,6 +478,9 @@ async function main() {
   });
   runnerHub.attach(server as import("node:http").Server);
   apiApp.zakurabotGateway?.attach(server as import("node:http").Server);
+  server.on("close", () => {
+    void apiApp.tenantContentLifecycle?.stop();
+  });
 }
 
 main().catch((err) => {

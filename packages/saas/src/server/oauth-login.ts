@@ -643,8 +643,9 @@ async function linkOrCreateUserFromOauth(
       throw new RegisterError(`${def.name} 未返回可用邮箱，无法登录`, 400);
     }
 
-    // Auto email merge: same verified/real email → link identity to existing user
-    const canMerge = !isSyntheticEmail(email);
+    // Email equality is not account ownership. Only a provider-verified, real
+    // address may auto-link; an existing provider subject remains authoritative.
+    const canMerge = profile.emailVerified && !isSyntheticEmail(email);
     const existingUser = canMerge
       ? await db.query.users.findFirst({ where: eq(users.email, email) })
       : null;

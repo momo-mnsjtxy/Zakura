@@ -454,6 +454,55 @@ export class MemoryProvidersService {
     return { status: "unknown" as const, message: kind };
   }
 
+  /**
+   * Purge externally stored memory while provider credentials and agent IDs are
+   * still available. Local memory rows remain covered by tenant FK cascades.
+   */
+  async cleanupTenantExternalData(tenantId: string): Promise<void> {
+    const [providerRows, agentRows] = await Promise.all([
+      this.db.select().from(memoryProviders).where(eq(memoryProviders.tenantId, tenantId)),
+      this.db
+        .select({ id: agents.id, memoryProviderId: agents.memoryProviderId })
+        .from(agents)
+        .where(eq(agents.tenantId, tenantId)),
+    ]);
+    const failures: string[] = [];
+    for (const provider of providerRows) {
+      if (provider.kind !== "mem0") continue;
+      let config: Record<string, unknown>;
+      try {
+        config = decodeProviderConfig(provider.configJson, this.secret);
+      } catch (error) {
+        failures.push(error instanceof Error ? error.message : String(error));
+        continue;
+      }
+      const bound = agentRows.filter(
+        (agent) => agent.memoryProviderId === provider.id ||
+          (agent.memoryProviderId == null && provider.isDefault),
+      );
+      try {
+        const { Mem0Client } = await import("./mem0-client.js");
+        const client = Mem0Client.fromConfig(config);
+        for (const agent of bound) {
+          await client.purgeAgent({
+            agentId: agent.id,
+            userId:
+              typeof config.defaultUserId === "string" ? config.defaultUserId : "default",
+          });
+        }
+      } catch (error) {
+        failures.push(
+          `${provider.name}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    if (failures.length) {
+      throw new Error(
+        `External memory cleanup failed (${failures.length}): ${failures.slice(0, 3).join("; ")}`,
+      );
+    }
+  }
+
   private async clearDefault(tenantId: string, database: Db = this.db) {
     await database
       .update(memoryProviders)

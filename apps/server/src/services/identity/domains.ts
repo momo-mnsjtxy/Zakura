@@ -1,7 +1,13 @@
 import { and, eq, isNotNull } from "drizzle-orm";
 import { promises as dns } from "node:dns";
 import type { Db } from "../../db/client.js";
-import { newId, tenantDomains, tenantMemberships, tenants } from "../../db/schema.js";
+import {
+  newId,
+  tenantDomains,
+  tenantMemberships,
+  tenants,
+  tenantSsoConfigs,
+} from "../../db/schema.js";
 import { emailDomain, newSecretToken, normalizeDomain } from "./util.js";
 
 export { normalizeDomain };
@@ -23,7 +29,10 @@ export function txtHost(domain: string): string {
 }
 
 export function txtRecordsContain(records: string[][], token: string): boolean {
-  return records.some((chunks) => chunks.join("").trim() === token);
+  return records.some((chunks) => {
+    const record = chunks.join("").trim();
+    return record === token || record === `zakura-verify=${token}`;
+  });
 }
 
 function isJoinMode(value: unknown): value is JoinMode {
@@ -95,6 +104,17 @@ export async function setDomainJoinMode(db: Db, tenantId: string, domainId: stri
   if (!existing) throw new Error("域名不存在");
   if (joinMode !== "invite_only" && !existing.verifiedAt) {
     throw new Error("启用自动加入或强制 SSO 前必须先验证域名");
+  }
+  if (joinMode === "sso_required") {
+    const sso = await db.query.tenantSsoConfigs.findFirst({
+      where: eq(tenantSsoConfigs.tenantId, tenantId),
+    });
+    const complete =
+      sso?.enabled === true &&
+      (sso.protocol === "saml"
+        ? Boolean(sso.idpEntityId && sso.idpSsoUrl && sso.idpCertificateEnc)
+        : Boolean(sso.clientId && (sso.issuer || sso.authorizeUrl)));
+    if (!complete) throw new Error("启用强制 SSO 前必须先完成并启用 SSO 配置");
   }
   const [row] = await db
     .update(tenantDomains)

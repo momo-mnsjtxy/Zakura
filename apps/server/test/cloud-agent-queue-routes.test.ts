@@ -66,7 +66,7 @@ function harness(options: {
     async startTurn(input: RuntimeCall) {
       calls.start.push(input);
       if (options.startError) throw options.startError;
-      return { sessionId: "session", runId: "run-new" };
+      return { runId: "run-new" };
     },
     async enqueueFollowUp(input: RuntimeCall) {
       calls.enqueue.push(input);
@@ -74,7 +74,7 @@ function harness(options: {
     },
     async interruptWithQueued(input: RuntimeCall) {
       calls.interrupt.push(input);
-      return { ok: true, runId: "run-active", messageId: input.messageId };
+      return { ok: true };
     },
     async startNextQueued() {},
   };
@@ -130,7 +130,7 @@ describe("cloud agent queue routes", () => {
     );
 
     assert.equal(response.status, 202);
-    assert.deepEqual(await response.json(), { sessionId: "session", runId: "run-new" });
+    assert.deepEqual(await response.json(), { runId: "run-new" });
     assert.equal(calls.start.length, 1);
     assert.equal(calls.enqueue.length, 0);
     assert.deepEqual(calls.start[0], {
@@ -212,11 +212,7 @@ describe("cloud agent queue routes", () => {
       "POST",
     );
     assert.equal(interrupt.status, 200);
-    assert.deepEqual(await interrupt.json(), {
-      ok: true,
-      runId: "run-active",
-      messageId: "m1",
-    });
+    assert.deepEqual(await interrupt.json(), { ok: true });
     assert.deepEqual(calls.interrupt[0], {
       tenantId: "tenant",
       agentId: "agent",

@@ -110,6 +110,8 @@ import { registerAutomationRoutes } from "./automation-routes.js";
 import { registerRuntimeNodeRoutes } from "./runtime-node-routes.js";
 import { CloudAgentSessionStore } from "../services/cloud-agent-session.js";
 import { CloudAgentRuntime } from "../services/cloud-agent-runtime.js";
+import { AgentTenantLifecycleService } from "../services/agent-tenant-lifecycle.js";
+import { TenantContentLifecycleService } from "../services/tenant-content-lifecycle.js";
 import { AgentAutomationService } from "../services/agent-automation.js";
 import { AskUserService } from "../services/ask-user.js";
 import { ToolApprovalService } from "../services/tool-approval.js";
@@ -378,6 +380,9 @@ export async function createApiApp(deps: {
   const tenantService = new TenantService(db);
   const securityAudit = new SecurityAuditService(db);
   const app = new Hono<{ Variables: AppVariables }>();
+  agentService.setSessionDrainer((tenantId, agentIds) =>
+    cloudSessionStore.beginAgentDeletionDrain(tenantId, agentIds),
+  );
 
   // 全局错误兜底：未在路由内 try/catch 的异常统一转结构化 JSON。
   // 节点掉线 / 排空 / 未注册 / 鉴权失效映射到 503，让前端能区分"上游暂时不可用"
@@ -405,6 +410,7 @@ export async function createApiApp(deps: {
   let emailInbound: EmailInboundService | null = null;
   let remoteIngress: RemoteAgentIngress | null = null;
   let remoteRuntime: RemoteChannelRuntime | null = null;
+  let tenantContentLifecycle: TenantContentLifecycleService | null = null;
   let zakurabotGateway: ZakurabotGateway | null = null;
   let cloudAgentRuntime: CloudAgentRuntime | null = null;
   const automation = new AgentAutomationService(db, {
@@ -429,6 +435,8 @@ export async function createApiApp(deps: {
       "/api/auth/verify-email",
       "/api/auth/mfa/complete",
       "/api/auth/mfa/webauthn/options",
+      "/api/auth/mfa/enrollment/totp/start",
+      "/api/auth/mfa/enrollment/totp/complete",
       "/api/auth/sso/discover",
       "/api/auth/sso/oidc/callback",
       "/api/auth/sso/ticket",
@@ -868,10 +876,17 @@ export async function createApiApp(deps: {
       tenantMfaPolicyRequires(tenantMfaPolicy, result.membership.role) &&
       factors.methods.length === 0
     ) {
-      return c.json(
-        { error: "团队策略要求先配置 MFA", code: "mfa_enrollment_required" },
-        403,
-      );
+      const ticket = await issueAuthToken(db, {
+        kind: "mfa_enrollment",
+        userId: result.user.id,
+        meta: { tenantId: result.tenant.id, role: result.membership.role },
+      });
+      return c.json({
+        mfaEnrollmentRequired: true,
+        mfaEnrollmentTicket: ticket,
+        methods: ["totp"],
+        code: "mfa_enrollment_required",
+      });
     }
     if (mfaRequired(factors)) {
       const ticket = await issueAuthToken(db, {
@@ -2488,7 +2503,12 @@ export async function createApiApp(deps: {
   }
 
   if (modelRouter && modelUpstreams && modelRoutes) {
-    const modelUpstreamAuth = new ModelUpstreamAuthService(db, config.secret);
+    const modelUpstreamAuth = new ModelUpstreamAuthService(
+      db,
+      config.secret,
+      undefined,
+      (tenantId) => modelRouter.invalidateCache(tenantId),
+    );
     bindOauthSecret(config.secret);
     setRouteHydrator((route, opts) => modelUpstreamAuth.hydrateRoute(route, opts));
     registerModelRouterRoutes(app, {
@@ -2556,6 +2576,28 @@ export async function createApiApp(deps: {
           subsystem: "cloud_agent",
         }),
       );
+    remoteRuntime = new RemoteChannelRuntime(
+      config,
+      connectorAuth,
+      remoteIngress,
+      cloudStore,
+    );
+    const agentTenantLifecycle = new AgentTenantLifecycleService(
+      db,
+      agentService.workspace,
+      cloudStore,
+    );
+    tenantContentLifecycle = new TenantContentLifecycleService(db, {
+      stopChannels: (tenantId) => remoteRuntime!.stopTenant(tenantId),
+      agentLifecycle: agentTenantLifecycle.callbacks(),
+      cleanupChannelState: (tenantId) => remoteRuntime!.purgeTenantState(tenantId),
+      cleanupSkillFiles: (tenantId) => skills?.cleanupTenant(tenantId) ?? Promise.resolve(),
+      cleanupConnectorSecrets: (tenantId) => connectorAuth.cleanupTenantSecrets(tenantId),
+      cleanupExternalMemory: (tenantId) => memoryProviders.cleanupTenantExternalData(tenantId),
+      afterTenantDeleted: (tenantId) => skills?.afterTenantDeleted(tenantId),
+    });
+    tenantService.registerLifecycleHook(tenantContentLifecycle.lifecycleHook());
+    tenantContentLifecycle.start();
     if (modelRouter) {
       const { AgentHooksService } = await import("../services/agent-hooks.js");
       const agentHooks = new AgentHooksService(agentService.workspace);
@@ -2565,13 +2607,6 @@ export async function createApiApp(deps: {
         const tools = await gateway.listToolsForAgent(agent);
         return tools.find((t) => t.qualifiedName === qualifiedName)?.annotations;
       };
-      remoteRuntime = new RemoteChannelRuntime(
-        config,
-        connectorAuth,
-        remoteIngress!,
-        cloudStore,
-      );
-      tenantService.registerLifecycleHook(remoteRuntime.lifecycleHook());
       const cloudRuntime = new CloudAgentRuntime({
         store: cloudStore,
         gateway,
@@ -2995,6 +3030,34 @@ export async function createApiApp(deps: {
           role: string;
           isPlatformAdmin?: boolean;
         }) => createUserSession(db, config.secret, payload),
+        mfaForLogin: async ({ userId, tenantId, role, authenticatedSession }: {
+          userId: string;
+          tenantId: string;
+          role: string;
+          authenticatedSession?: boolean;
+        }) => {
+          const [factors, policy] = await Promise.all([
+            mfaStatus(db, userId),
+            getTenantMfaPolicy(db, tenantId),
+          ]);
+          if (tenantMfaPolicyRequires(policy, role) && factors.methods.length === 0) {
+            const ticket = await issueAuthToken(db, {
+              kind: "mfa_enrollment",
+              userId,
+              meta: { tenantId, role },
+            });
+            return { action: "enroll" as const, ticket };
+          }
+          if (authenticatedSession || !mfaRequired(factors)) {
+            return { action: "allow" as const };
+          }
+          const ticket = await issueAuthToken(db, {
+            kind: "mfa_login",
+            userId,
+            meta: { tenantId, role },
+          });
+          return { action: "challenge" as const, ticket, methods: factors.methods };
+        },
         switchTenantSession,
         isSessionAdmin,
         ensurePlatformMeta,
@@ -3492,5 +3555,5 @@ export async function createApiApp(deps: {
     });
   }
 
-  return Object.assign(app, { zakurabotGateway });
+  return Object.assign(app, { zakurabotGateway, tenantContentLifecycle });
 }

@@ -14,6 +14,7 @@ import type { ChatStreamCallbacks, ModelProtocolAdapter } from "./adapter.js";
 import {
   isAbortError,
   isRetryableModelError,
+  ModelCallAbortedError,
   withModelRetries,
 } from "./http.js";
 import { normalizeToolCallHistory } from "./messages.js";
@@ -72,6 +73,7 @@ async function invokeOnRoute<T>(
   route: ResolvedRoute,
   capability: ModelCapability,
   operation: (adapter: ModelProtocolAdapter, route: ResolvedRoute) => Promise<T>,
+  options?: { allowUnauthorizedRetry?: () => boolean },
 ): Promise<T> {
   assertCapability(route, capability);
   let hydrated = await hydrateRoute(route);
@@ -79,7 +81,13 @@ async function invokeOnRoute<T>(
   try {
     return await operation(adapter, hydrated);
   } catch (error) {
-    if (!isUnauthorizedUpstream(error) || isAbortError(error)) throw error;
+    if (
+      !isUnauthorizedUpstream(error) ||
+      isAbortError(error) ||
+      options?.allowUnauthorizedRetry?.() === false
+    ) {
+      throw error;
+    }
     hydrated = await hydrateRoute(hydrated, { forceRefresh: true });
     adapter = resolveAdapterForCapability(hydrated.upstream.protocol, capability);
     return operation(adapter, hydrated);
@@ -156,15 +164,55 @@ export async function executeChatStream(
   options: ModelChatInvokeOptions | undefined,
   callbacks: ChatStreamCallbacks,
 ): Promise<ModelChatResult> {
-  return invokeOnRoute(route, "chat", (adapter, hydrated) =>
-    executeChatStreamWithAdapter(
-      adapter,
-      hydrated,
-      messages,
-      options,
-      callbacks,
-    ),
+  let emitted = false;
+  const guardedCallbacks: ChatStreamCallbacks = {
+    signal: callbacks.signal,
+    onDelta: (text) => {
+      if (text) emitted = true;
+      callbacks.onDelta?.(text);
+    },
+    onReasoningDelta: (text) => {
+      if (text) emitted = true;
+      callbacks.onReasoningDelta?.(text);
+    },
+  };
+  return invokeOnRoute(
+    route,
+    "chat",
+    (adapter, hydrated) =>
+      executeChatStreamWithAdapter(
+        adapter,
+        hydrated,
+        messages,
+        options,
+        guardedCallbacks,
+      ),
+    { allowUnauthorizedRetry: () => !emitted },
   );
+}
+
+/** Reject promptly on caller cancellation even when an adapter is buffered. */
+async function awaitBufferedChat<T>(
+  operation: Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (!signal) return operation;
+  if (signal.aborted) throw new ModelCallAbortedError();
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const onAbort = () => finish(() => reject(new ModelCallAbortedError()));
+    signal.addEventListener("abort", onAbort, { once: true });
+    operation.then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error)),
+    );
+  });
 }
 
 export async function executeChatStreamWithAdapter(
@@ -180,7 +228,10 @@ export async function executeChatStreamWithAdapter(
     return adapter.chatStream(configured, history, options, callbacks);
   }
   if (!adapter.chat) throw new Error(`协议 ${adapter.protocol} 未实现 chat`);
-  const result = await adapter.chat(configured, history, options);
+  const result = await awaitBufferedChat(
+    adapter.chat(configured, history, options),
+    callbacks.signal,
+  );
   if (result.content) callbacks.onDelta?.(result.content);
   return result;
 }

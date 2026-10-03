@@ -83,6 +83,14 @@ export type PlatformEvent =
       platform: string;
       level: "info" | "warn" | "error" | "ok";
       message: string;
+    }
+  | {
+      /** Cross-replica control event; durable tombstone lives in cleanup outbox. */
+      type: "tenant_lifecycle";
+      ts: number;
+      tenantId: string;
+      action: "tenant_suspended" | "member_access_revoked" | "tenant_deleted";
+      jobId: string;
     };
 
 export type PlatformEventInput = PlatformEvent extends infer Event
@@ -190,6 +198,7 @@ export class PlatformEventBus {
   private readonly now: () => number;
   private readonly transport: PlatformEventTransport;
   private readonly listeners = new Map<string, Map<symbol, Listener>>();
+  private readonly allListeners = new Map<symbol, Listener>();
   private readonly tenantLeases = new Map<string, ChannelLease>();
   private readonly channelTransitions = new Map<string, Promise<void>>();
   private allLease: ChannelLease | null = null;
@@ -227,6 +236,21 @@ export class PlatformEventBus {
     };
   }
 
+  /** Subscribe to the cross-tenant control channel (one lease per process). */
+  subscribeAll(listener: Listener): () => void {
+    if (this.closed) return () => undefined;
+    const id = Symbol("all");
+    this.allListeners.set(id, listener);
+    this.ensureAllLease();
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this.allListeners.delete(id);
+      this.releaseAllLeaseIfUnused();
+    };
+  }
+
   publish(tenantId: string, event: PlatformEventInput): void {
     if (this.closed) return;
     const full = { ...event, ts: this.now() } as PlatformEvent;
@@ -237,7 +261,10 @@ export class PlatformEventBus {
   publishAll(event: PlatformEventInput): void {
     if (this.closed) return;
     const full = { ...event, ts: this.now() } as PlatformEvent;
-    for (const tenantId of this.listeners.keys()) this.emitTenant(tenantId, full);
+    for (const listener of this.allListeners.values()) listener(full);
+    if (full.type !== "tenant_lifecycle") {
+      for (const tenantId of this.listeners.keys()) this.emitTenant(tenantId, full);
+    }
     this.publishRemote(REDIS_KEYS.platformChannelAll, "*", full);
   }
 
@@ -249,6 +276,7 @@ export class PlatformEventBus {
     if (this.closed) return;
     this.closed = true;
     this.listeners.clear();
+    this.allListeners.clear();
     const leases = [...this.tenantLeases.values()];
     this.tenantLeases.clear();
     if (this.allLease) leases.push(this.allLease);
@@ -272,11 +300,7 @@ export class PlatformEventBus {
       tenantId,
       this.createLease(channel, (message) => this.receiveTenant(message)),
     );
-    if (!this.allLease) {
-      this.allLease = this.createLease(REDIS_KEYS.platformChannelAll, (message) =>
-        this.receiveAll(message),
-      );
-    }
+    this.ensureAllLease();
   }
 
   private releaseTenant(tenantId: string): void {
@@ -284,7 +308,18 @@ export class PlatformEventBus {
     if (!lease) return;
     this.tenantLeases.delete(tenantId);
     void lease.release();
-    if (this.tenantLeases.size === 0 && this.allLease) {
+    this.releaseAllLeaseIfUnused();
+  }
+
+  private ensureAllLease(): void {
+    if (this.closed || this.allLease) return;
+    this.allLease = this.createLease(REDIS_KEYS.platformChannelAll, (message) =>
+      this.receiveAll(message),
+    );
+  }
+
+  private releaseAllLeaseIfUnused(): void {
+    if (this.tenantLeases.size === 0 && this.allListeners.size === 0 && this.allLease) {
       const all = this.allLease;
       this.allLease = null;
       void all.release();
@@ -341,7 +376,10 @@ export class PlatformEventBus {
   private receiveAll(message: string): void {
     const envelope = this.parseEnvelope(message, "platform_events.broadcast_parse");
     if (!envelope || envelope.from === this.instanceId) return;
-    for (const tenantId of this.listeners.keys()) this.emitTenant(tenantId, envelope.event);
+    for (const listener of this.allListeners.values()) listener(envelope.event);
+    if (envelope.event.type !== "tenant_lifecycle") {
+      for (const tenantId of this.listeners.keys()) this.emitTenant(tenantId, envelope.event);
+    }
   }
 
   private parseEnvelope(message: string, faultKind: string): FanoutEnvelope | null {

@@ -11,12 +11,12 @@ This ledger separates rewritten implementation logic from compatibility material
 | Web assets/icons/WASM/service worker metadata | Intentionally preserved assets | Production build and browser smoke pass |
 | Web HTTP/session/error/recovery and chat stream state | Substantively reorganized behind preserved API | Unit/component tests, typecheck, production build, browser interrupted/repeated-flow smoke |
 | Server DB target/lifecycle foundation | Substantively reorganized behind preserved schema | Focused policy/lifecycle tests plus full server suite |
-| Server routes/business services/providers | Compatibility baseline currently retained except fixes discovered by tests | 439-route manifest parity, all server tests, fake-upstream suites; further coherent rewrites required before claiming complete rewrite |
-| SaaS routes/admin logic | Compatibility baseline retained | SaaS typecheck/tests and admin browser smoke; further rewrite required before claiming complete rewrite |
+| Server routes/business services/providers | Identity, cloud queue/run/event, model routing/providers, connector/channel, skill/memory, Space/project/share, platform lifecycle and tenant cleanup are substantively rewritten; compatible auxiliary modules remain | 439-route manifest parity, all server tests and fake-upstream suites; preserved modules stay explicitly classified below |
+| SaaS routes/admin logic | Registration, MFA issuance, tenant/member/owner and suspension lifecycle substantively rewritten; compatible admin operations remain | SaaS typecheck/tests and admin browser smoke |
 | Go RPC dispatch/error/path boundary | Substantively reorganized behind preserved wire protocol | `go test ./...`, `go vet ./...`, traversal/lifecycle tests |
 | OAuth bridge app/bootstrap/state/PKCE boundary | Substantively reorganized behind preserved endpoints | Typecheck/build and local no-network OAuth tests |
 | Core Docker mux transport | Substantively extracted behind compatibility exports | Core full suite including fragmented and binary frames |
-| Remaining core runtime orchestration | Compatibility baseline retained | Core suite, cancellation/timeout/process tests; further rewrite required before claiming complete rewrite |
+| Remaining core runtime orchestration | Runner request/stream/workspace/archive, process/container recovery and JSON-RPC transport substantively rewritten; OS-specific adapters preserved | Core suite and cancellation/timeout/process tests |
 | MCP JSON tool manifests/catalog data | Intentionally preserved protocol data | Schema/catalog/conformance validation |
 | Database migrations | Intentionally preserved ordered compatibility history | Fresh and upgrade migration tests on supported DB targets |
 | Docker/Caddy/headscale/deployment definitions | Preserved operational interface, not executed locally | Static validation only until live-infrastructure authorization/environment exists |
@@ -31,13 +31,13 @@ Generated build output is excluded. These counts prevent a carried-over compatib
 
 | Scope | Baseline-identical files | Changed files | Added files | Missing files |
 |---|---:|---:|---:|---:|
-| `apps/server` | 426 | 97 | 61 | 0 |
-| `packages/saas` | 8 | 5 | 4 | 0 |
-| `apps/web` | 255 | 43 | 43 | 0 |
-| `packages/core` | 35 | 8 | 20 | 0 |
+| `apps/server` | 421 | 102 | 63 | 0 |
+| `packages/saas` | 7 | 6 | 2 | 0 |
+| `apps/web` | 253 | 45 | 43 | 0 |
+| `packages/core` | 35 | 8 | 18 | 0 |
 | `go` | 43 | 3 | 10 | 0 |
-| `apps/oauth-bridge` | 1 | 3 | 8 | 0 |
+| `apps/oauth-bridge` | 1 | 3 | 5 | 0 |
 | `mcps` | 128 | 0 | 0 | 0 |
-| `packages/shared` | 53 | 0 | 3 | 0 |
+| `packages/shared` | 53 | 0 | 1 | 0 |
 
-The large baseline-identical counts mean the repository is currently a compatibility-preserving foundation plus targeted architectural rewrites. It is not yet a complete rewrite of all business logic. Follow `MIGRATION_PLAN.md` stage by stage until the remaining logic has been replaced and every acceptance gate is green.
+Baseline-identical files are mostly presentation/assets, static protocol data, schemas, migrations and still-classified auxiliary business modules. They are not counted as rewritten merely because the complete product remains present. The largest remaining implementation scopes are network/tunnel/exposure, observability/deployment, OS-specific desktop/CDP adapters, several auxiliary agent/automation services, and presentational web composition. Follow `MIGRATION_PLAN.md` until those modules are either substantively migrated or deliberately classified compatibility data and every Stage 9 gate is green.

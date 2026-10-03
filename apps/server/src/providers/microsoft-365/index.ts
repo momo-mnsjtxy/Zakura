@@ -33,6 +33,11 @@ let appConfigRef: AppConfig | null = null;
 let dbRef: any = null;
 const refreshes = new Map<string, Promise<Record<string, unknown>>>();
 
+function refreshKey(handle: InstanceHandle): string {
+  const agentId = typeof handle.config.agentId === "string" ? handle.config.agentId : "";
+  return `${handle.tenantId}:${agentId}:${handle.id}`;
+}
+
 export function injectMicrosoft365Runtime(config: AppConfig, db: unknown): void {
   appConfigRef = config;
   dbRef = db;
@@ -154,7 +159,8 @@ async function accessToken(handle: InstanceHandle): Promise<string> {
   let current = { ...handle.config };
   const expiresAt = Number(current.oauthExpiresAt ?? 0);
   if ((!current.oauthAccessToken || expiresAt <= Math.floor(Date.now() / 1000) + 120) && current.oauthRefreshToken && current.oauthClientId && appConfigRef) {
-    const existing = refreshes.get(handle.id);
+    const key = refreshKey(handle);
+    const existing = refreshes.get(key);
     const operation = existing ?? (async () => {
       const tokenEndpoint = String(current.oauthTokenEndpoint ?? "").trim();
       if (!tokenEndpoint) throw new Error("Microsoft OAuth 配置缺少 token endpoint");
@@ -177,9 +183,9 @@ async function accessToken(handle: InstanceHandle): Promise<string> {
     })();
     if (!existing) {
       const tracked = operation.finally(() => {
-        if (refreshes.get(handle.id) === tracked) refreshes.delete(handle.id);
+        if (refreshes.get(key) === tracked) refreshes.delete(key);
       });
-      refreshes.set(handle.id, tracked);
+      refreshes.set(key, tracked);
       current = await tracked;
     } else {
       current = await existing;

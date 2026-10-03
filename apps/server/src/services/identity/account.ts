@@ -7,6 +7,7 @@ import { tenantMemberships, users } from "../../db/schema.js";
 import { consumeAuthToken, issueAuthToken } from "./tokens.js";
 import { sendResetPasswordEmail, sendVerifyEmail } from "./mail.js";
 import { revokeAllUserSessions } from "./sessions.js";
+import { maybeAutoJoinTenant } from "./domains.js";
 
 export const TITLE_MAX = 80;
 export const BIO_MAX = 280;
@@ -84,6 +85,12 @@ export async function confirmEmailVerification(db: Db, token: string): Promise<b
     .update(users)
     .set({ emailVerifiedAt: new Date(), updatedAt: new Date() })
     .where(eq(users.id, consumed.userId));
+  // Domain membership is granted only after control of the mailbox is proven.
+  await maybeAutoJoinTenant(db, {
+    userId: user.id,
+    email: user.email,
+    emailVerified: true,
+  });
   return true;
 }
 

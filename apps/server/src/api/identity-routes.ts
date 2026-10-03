@@ -34,12 +34,14 @@ import {
   beginWebauthnLogin,
   beginWebauthnRegistration,
   cancelTotpSetup,
+  completeTotpEnrollment,
   deleteWebauthnCredential,
   disableTotp,
   enableTotp,
   finishWebauthnLogin,
   finishWebauthnRegistration,
   getTenantMfaPolicy,
+  mfaRequired,
   mfaStatus,
   regenerateRecoveryCodes,
   renameWebauthnCredential,
@@ -47,6 +49,7 @@ import {
   setTenantMfaPolicy,
   tenantMfaPolicyRequires,
   type TenantMfaPolicy,
+  userRequiresMfaInAnyTenant,
   verifyUserTotp,
   consumeRecoveryCode,
 } from "../services/identity/mfa.js";
@@ -163,6 +166,41 @@ export function registerIdentityRoutes(
         code: body.code ?? "",
         state: body.state ?? "",
       });
+      const [factors, policy] = await Promise.all([
+        mfaStatus(db, result.user.id),
+        getTenantMfaPolicy(db, result.tenant.id),
+      ]);
+      if (tenantMfaPolicyRequires(policy, result.membership.role) && factors.methods.length === 0) {
+        const enrollmentTicket = await issueAuthToken(db, {
+          kind: "mfa_enrollment",
+          userId: result.user.id,
+          meta: { tenantId: result.tenant.id, role: result.membership.role },
+        });
+        return c.json({
+          mfaEnrollmentRequired: true,
+          mfaEnrollmentTicket: enrollmentTicket,
+          methods: ["totp"],
+          code: "mfa_enrollment_required",
+        });
+      }
+      if (mfaRequired(factors)) {
+        const mfaTicket = await issueAuthToken(db, {
+          kind: "mfa_login",
+          userId: result.user.id,
+          meta: { tenantId: result.tenant.id, role: result.membership.role },
+        });
+        return c.json({
+          mfaRequired: true,
+          mfaTicket,
+          methods: factors.methods,
+          tenant: {
+            id: result.tenant.id,
+            slug: result.tenant.slug,
+            name: result.tenant.name,
+            onboardingCompleted: result.tenant.onboardingCompleted,
+          },
+        });
+      }
       await touchLastLogin(db, result.user.id);
       const ip = clientIpFromHeaders((name) => c.req.header(name));
       const session = await createUserSession(
@@ -205,6 +243,47 @@ export function registerIdentityRoutes(
         SAMLResponse: String(form.SAMLResponse ?? ""),
         RelayState: form.RelayState ? String(form.RelayState) : undefined,
       });
+      const [factors, policy] = await Promise.all([
+        mfaStatus(db, result.user.id),
+        getTenantMfaPolicy(db, result.tenant.id),
+      ]);
+      if (tenantMfaPolicyRequires(policy, result.membership.role) && factors.methods.length === 0) {
+        const enrollmentTicket = await issueAuthToken(db, {
+          kind: "mfa_enrollment",
+          userId: result.user.id,
+          meta: { tenantId: result.tenant.id, role: result.membership.role },
+        });
+        const exchangeTicket = await issueAuthToken(db, {
+          kind: "sso_exchange",
+          userId: result.user.id,
+          meta: {
+            mfaEnrollmentTicket: enrollmentTicket,
+            tenantOnboarding: result.tenant.onboardingCompleted,
+          },
+        });
+        return c.redirect(
+          `${config.webPublicUrl}/console/sso/callback?ticket=${encodeURIComponent(exchangeTicket)}`,
+        );
+      }
+      if (mfaRequired(factors)) {
+        const mfaTicket = await issueAuthToken(db, {
+          kind: "mfa_login",
+          userId: result.user.id,
+          meta: { tenantId: result.tenant.id, role: result.membership.role },
+        });
+        const exchangeTicket = await issueAuthToken(db, {
+          kind: "sso_exchange",
+          userId: result.user.id,
+          meta: {
+            mfaTicket,
+            methods: factors.methods,
+            tenantOnboarding: result.tenant.onboardingCompleted,
+          },
+        });
+        return c.redirect(
+          `${config.webPublicUrl}/console/sso/callback?ticket=${encodeURIComponent(exchangeTicket)}`,
+        );
+      }
       await touchLastLogin(db, result.user.id);
       const ip = clientIpFromHeaders((name) => c.req.header(name));
       const session = await createUserSession(
@@ -251,6 +330,28 @@ export function registerIdentityRoutes(
   app.post("/api/auth/sso/ticket", async (c) => {
     const body = await c.req.json<{ ticket?: string }>().catch(() => ({}) as never);
     const consumed = body.ticket ? await consumeAuthToken(db, "sso_exchange", body.ticket) : null;
+    const enrollmentTicket =
+      typeof consumed?.meta.mfaEnrollmentTicket === "string"
+        ? consumed.meta.mfaEnrollmentTicket
+        : null;
+    if (enrollmentTicket && consumed) {
+      return c.json({
+        mfaEnrollmentRequired: true,
+        mfaEnrollmentTicket: enrollmentTicket,
+        methods: ["totp"],
+        code: "mfa_enrollment_required",
+        next: consumed.meta.tenantOnboarding === false ? "/onboarding" : "/dashboard/agents",
+      });
+    }
+    const mfaTicket = typeof consumed?.meta.mfaTicket === "string" ? consumed.meta.mfaTicket : null;
+    if (mfaTicket && consumed) {
+      return c.json({
+        mfaRequired: true,
+        mfaTicket,
+        methods: Array.isArray(consumed.meta.methods) ? consumed.meta.methods : [],
+        next: consumed.meta.tenantOnboarding === false ? "/onboarding" : "/dashboard/agents",
+      });
+    }
     const session = typeof consumed?.meta.session === "string" ? consumed.meta.session : null;
     if (!session || !consumed) return c.json({ error: "ticket 无效" }, 400);
     return c.json({
@@ -284,7 +385,6 @@ export function registerIdentityRoutes(
     if (!pending?.userId) return c.json({ error: "登录已过期，请重新登录" }, 400);
     const userId = pending.userId;
     const tenantId = String(pending.meta.tenantId ?? "");
-    const role = String(pending.meta.role ?? "member");
     const user = await db.query.users.findFirst({ where: eq(users.id, userId) });
     const tenant = await db.query.tenants.findFirst({ where: eq(tenants.id, tenantId) });
     if (!user || !tenant) return c.json({ error: "账号不存在" }, 400);
@@ -315,7 +415,7 @@ export function registerIdentityRoutes(
         userId: user.id,
         tenantId: tenant.id,
         email: user.email,
-        role,
+        role: membership.role,
         isPlatformAdmin: config.multiTenant && user.isPlatformAdmin,
       },
       { ip, userAgent: c.req.header("user-agent") },
@@ -334,6 +434,87 @@ export function registerIdentityRoutes(
         onboardingCompleted: tenant.onboardingCompleted,
       },
     });
+  });
+
+  async function enrollmentPrincipal(rawTicket: string | undefined) {
+    const pending = rawTicket
+      ? await peekAuthToken(db, "mfa_enrollment", rawTicket)
+      : null;
+    if (!pending?.userId) return null;
+    const tenantId = String(pending.meta.tenantId ?? "");
+    if (!tenantId) return null;
+    const [user, tenant, membership] = await Promise.all([
+      db.query.users.findFirst({ where: eq(users.id, pending.userId) }),
+      db.query.tenants.findFirst({ where: eq(tenants.id, tenantId) }),
+      db.query.tenantMemberships.findFirst({
+        where: and(
+          eq(tenantMemberships.userId, pending.userId),
+          eq(tenantMemberships.tenantId, tenantId),
+          eq(tenantMemberships.status, "active"),
+        ),
+      }),
+    ]);
+    if (!user || user.suspendedAt || !tenant || tenant.suspendedAt || !membership) return null;
+    return { pending, user, tenant, membership };
+  }
+
+  app.post("/api/auth/mfa/enrollment/totp/start", async (c) => {
+    const body = await readJson<{ ticket?: string }>(c, {});
+    const principal = await enrollmentPrincipal(body.ticket);
+    if (!principal) return c.json({ error: "MFA enrollment ticket 无效或已过期" }, 400);
+    try {
+      return c.json(await startTotpSetup(db, config.secret, principal.user));
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+  });
+
+  app.post("/api/auth/mfa/enrollment/totp/complete", async (c) => {
+    const body = await readJson<{ ticket?: string; code?: string }>(c, {});
+    const principal = await enrollmentPrincipal(body.ticket);
+    if (!principal || !body.ticket) {
+      return c.json({ error: "MFA enrollment ticket 无效或已过期" }, 400);
+    }
+    try {
+      const recoveryCodes = await completeTotpEnrollment(
+        db,
+        config.secret,
+        principal.user.id,
+        body.ticket,
+        body.code ?? "",
+      );
+      await touchLastLogin(db, principal.user.id);
+      const ip = clientIpFromHeaders((name) => c.req.header(name));
+      const session = await createUserSession(
+        db,
+        config.secret,
+        {
+          userId: principal.user.id,
+          tenantId: principal.tenant.id,
+          email: principal.user.email,
+          role: principal.membership.role,
+          isPlatformAdmin: config.multiTenant && principal.user.isPlatformAdmin,
+        },
+        { ip, userAgent: c.req.header("user-agent") },
+      );
+      await audit.append(principal.tenant.id, "mfa.enrollment", {
+        actor: { type: "user", id: principal.user.id, ip },
+        targetType: "user",
+        targetId: principal.user.id,
+      });
+      return c.json({
+        session,
+        recoveryCodes,
+        tenant: {
+          id: principal.tenant.id,
+          slug: principal.tenant.slug,
+          name: principal.tenant.name,
+          onboardingCompleted: principal.tenant.onboardingCompleted,
+        },
+      });
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
   });
 
   app.patch("/api/me", async (c) => {
@@ -500,11 +681,11 @@ export function registerIdentityRoutes(
     const session = c.get("session")!;
     const body = await c.req.json<{ code?: string; recoveryCode?: string }>().catch(() => ({}) as never);
     try {
-      const [policy, status] = await Promise.all([
-        getTenantMfaPolicy(db, session.tenantId),
+      const [requiredAnywhere, status] = await Promise.all([
+        userRequiresMfaInAnyTenant(db, session.userId),
         mfaStatus(db, session.userId),
       ]);
-      if (tenantMfaPolicyRequires(policy, session.role) && status.credentials.length === 0) {
+      if (requiredAnywhere && status.credentials.length === 0) {
         return c.json({ error: "团队策略要求保留至少一种 MFA 方式" }, 409);
       }
       await disableTotp(db, session.userId, config.secret, {
@@ -570,14 +751,14 @@ export function registerIdentityRoutes(
 
   app.delete("/api/me/mfa/webauthn/:id", async (c) => {
     const session = c.get("session")!;
-    const [policy, status] = await Promise.all([
-      getTenantMfaPolicy(db, session.tenantId),
+    const [requiredAnywhere, status] = await Promise.all([
+      userRequiresMfaInAnyTenant(db, session.userId),
       mfaStatus(db, session.userId),
     ]);
     const ownsCredential = status.credentials.some((item) => item.id === c.req.param("id"));
     if (
       ownsCredential &&
-      tenantMfaPolicyRequires(policy, session.role) &&
+      requiredAnywhere &&
       !status.totp &&
       status.credentials.length <= 1
     ) {

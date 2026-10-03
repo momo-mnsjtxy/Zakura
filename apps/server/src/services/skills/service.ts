@@ -755,6 +755,48 @@ export class SkillsService {
   }
 
   /**
+   * Fail-closed tenant deletion cleanup. Installation rows are retained when a
+   * workspace is unavailable so the durable cleanup worker can retry later.
+   */
+  async cleanupTenant(tenantId: string): Promise<void> {
+    const installs = await this.db
+      .select({ agentId: agentSkills.agentId, name: agentSkills.name })
+      .from(agentSkills)
+      .where(eq(agentSkills.tenantId, tenantId));
+    const failures: string[] = [];
+    for (const install of installs) {
+      try {
+        await this.uninstall(tenantId, install.agentId, install.name);
+      } catch (error) {
+        failures.push(error instanceof Error ? error.message : String(error));
+      }
+    }
+    if (failures.length) {
+      throw new SkillSourceError(
+        `租户技能文件清理失败（${failures.length}）：${failures.slice(0, 3).join("；")}`,
+      );
+    }
+    await this.tokens.removeTenant(tenantId);
+  }
+
+  /** Drop process-local private content and prompt state after delete commits. */
+  afterTenantDeleted(tenantId: string): void {
+    for (const key of this.privateRepoCache.keys()) {
+      if (key.startsWith(`${tenantId}:`)) this.privateRepoCache.delete(key);
+    }
+    for (const key of this.inflight.keys()) {
+      if (key.startsWith(`tenant:${tenantId}:`)) this.inflight.delete(key);
+    }
+    for (const key of this.installInflight.keys()) {
+      if (key.startsWith(`${tenantId}:`)) this.installInflight.delete(key);
+    }
+    this.builtinSynced.delete(tenantId);
+    this.builtinSyncInflight.delete(tenantId);
+    this.builtinBackfilled.delete(tenantId);
+    this.promptSummaryCache.invalidatePrefix(`${tenantId}:`);
+  }
+
+  /**
    * 一轮后台维护：先把平台缓存刷新到最新，再让各租户的技能追上缓存。
    *
    * 顺序很重要——缓存没刷新就去比版本，只会得出"已是最新"的结论。

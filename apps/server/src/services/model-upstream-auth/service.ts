@@ -148,6 +148,7 @@ export class ModelUpstreamAuthService {
     private readonly db: Db,
     private readonly secret: string,
     private readonly http: JsonHttp = defaultJsonHttp(),
+    private readonly onMutate?: (tenantId: string) => void,
   ) {}
 
   async start(tenantId: string, upstreamId: string): Promise<AuthSessionSnapshot> {
@@ -403,6 +404,7 @@ export class ModelUpstreamAuthService {
         updatedAt: new Date(),
       })
       .where(and(eq(modelUpstreams.id, upstreamId), eq(modelUpstreams.tenantId, tenantId)));
+    this.onMutate?.(tenantId);
   }
 
   async hydrateRoute(
@@ -417,6 +419,7 @@ export class ModelUpstreamAuthService {
       throw new Error("尚未登录订阅，请先在上游里完成登录");
     }
     let tokens = decryptTokens(this.secret, enc);
+    let hydratedOauthEnc = enc;
     if (opts?.forceRefresh || needsRefresh(tokens)) {
       let refreshing = this.refreshInFlight.get(route.upstream.id);
       if (!refreshing) {
@@ -433,6 +436,10 @@ export class ModelUpstreamAuthService {
       }
       try {
         tokens = await refreshing;
+        // Keep the in-flight route coherent with rotated refresh tokens. The
+        // resolver cache is invalidated for the next call, but a same-call 401
+        // refresh must not decrypt the stale token that initiated this call.
+        hydratedOauthEnc = encryptTokens(this.secret, tokens);
       } finally {
         if (this.refreshInFlight.get(route.upstream.id) === refreshing) {
           this.refreshInFlight.delete(route.upstream.id);
@@ -459,6 +466,7 @@ export class ModelUpstreamAuthService {
         config: {
           ...route.upstream.config,
           apiKey,
+          oauthEnc: hydratedOauthEnc,
           extraHeaders,
         },
       },
@@ -504,6 +512,7 @@ export class ModelUpstreamAuthService {
       .update(modelUpstreams)
       .set({ configJson: JSON.stringify(config), status: "ready", lastError: null, updatedAt: new Date() })
       .where(and(eq(modelUpstreams.id, upstreamId), eq(modelUpstreams.tenantId, tenantId)));
+    this.onMutate?.(tenantId);
   }
 
   private async saveTokensByUpstreamId(
@@ -522,6 +531,7 @@ export class ModelUpstreamAuthService {
       .update(modelUpstreams)
       .set({ configJson: JSON.stringify(config), updatedAt: new Date() })
       .where(eq(modelUpstreams.id, upstreamId));
+    this.onMutate?.(row.tenantId);
   }
 
   private async requireProtocol(tenantId: string, upstreamId: string): Promise<ModelUpstreamProtocol> {

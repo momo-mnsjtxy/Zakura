@@ -293,6 +293,39 @@ export class RemoteChannelRuntime {
     await Promise.all([...ids].map((bindingId) => this.invalidate(bindingId)));
   }
 
+  /**
+   * Delete Chat SDK state that lives outside Zakura's FK-owned tables. This is
+   * called only for tenant deletion, after adapters have been shut down and
+   * before binding rows disappear.
+   */
+  async purgeTenantState(tenantId: string): Promise<void> {
+    const bindings = await this.ingress.listBindings(tenantId);
+    await this.stopTenant(tenantId);
+    if (this.config.databaseUrl.startsWith("pglite:") || bindings.length === 0) return;
+    const prefixes = bindings.map(
+      (binding) => `recloud:remote:${tenantId}:${binding.id}`,
+    );
+    const state = createPostgresState({
+      url: this.config.databaseUrl,
+      keyPrefix: `recloud:cleanup:${tenantId}`,
+    });
+    await state.connect();
+    try {
+      const client = state.getClient();
+      for (const table of [
+        "chat_state_subscriptions",
+        "chat_state_locks",
+        "chat_state_cache",
+        "chat_state_lists",
+        "chat_state_queues",
+      ]) {
+        await client.query(`DELETE FROM ${table} WHERE key_prefix = ANY($1::text[])`, [prefixes]);
+      }
+    } finally {
+      await state.disconnect();
+    }
+  }
+
   /** Compatible with TenantService.registerLifecycleHook. */
   lifecycleHook(): {
     beforeDelete: (tenantId: string) => Promise<void>;

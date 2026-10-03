@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import type { InstanceHandle, ProviderPlugin } from "@zakura/core";
-import { createGitlabProvider } from "../src/providers/gitlab/index.js";
+import { createGitlabProvider, injectGitlabRuntime } from "../src/providers/gitlab/index.js";
 import { createJiraProvider } from "../src/providers/jira/index.js";
 import { createLinearProvider } from "../src/providers/linear/index.js";
 import { createNotionProvider } from "../src/providers/notion/index.js";
@@ -50,7 +50,13 @@ describe("remaining connector providers against deterministic fake transports", 
 
       if (url.includes("oauth2.test/token")) {
         await new Promise((resolve) => setTimeout(resolve, 15));
-        return Response.json({ access_token: "refreshed-token", refresh_token: "next-refresh", expires_in: 3600 });
+        const refresh = new URLSearchParams(body).get("refresh_token") ?? "";
+        const isolated = refresh.startsWith("isolation-");
+        return Response.json({
+          access_token: isolated ? `${refresh}-access` : "refreshed-token",
+          refresh_token: isolated ? `${refresh}-next` : "next-refresh",
+          expires_in: 3600,
+        });
       }
 
       if (url.endsWith("/oauth/token/accessible-resources")) {
@@ -216,6 +222,58 @@ describe("remaining connector providers against deterministic fake transports", 
     assert.equal(googleHandle.config.oauthAccessToken, "refreshed-token");
     assert.equal(microsoftHandle.config.oauthAccessToken, "refreshed-token");
     minimumRefreshesBeforeApi = 0;
+  });
+
+  it("never coalesces OAuth refreshes across tenants or agents with the same handle id", async () => {
+    const db = { update: () => ({ set: () => ({ where: async () => {} }) }) };
+    const appConfig = { secret: "provider-refresh-isolation", dataDir: "/tmp" } as never;
+    injectGoogleWorkspaceRuntime(appConfig, db);
+    injectMicrosoft365Runtime(appConfig, db);
+    injectGitlabRuntime(appConfig, db);
+
+    const isolatedHandle = (
+      providerId: string,
+      product: string,
+      tenantId: string,
+      agentId: string,
+      refreshToken: string,
+    ): InstanceHandle => ({
+      ...handle(providerId, product, {
+        agentId,
+        oauthAccessToken: "",
+        oauthRefreshToken: refreshToken,
+        oauthClientId: `${tenantId}-client`,
+        oauthTokenEndpoint: `https://oauth2.test/token/${providerId}`,
+        oauthExpiresAt: 0,
+      }),
+      id: `connector:${providerId}:shared-old-id`,
+      tenantId,
+    });
+
+    const cases: Array<{
+      provider: ProviderPlugin;
+      product: string;
+      tool: string;
+      args: Record<string, unknown>;
+    }> = [
+      { provider: createGoogleWorkspaceProvider(), product: "people", tool: "get_user_profile", args: {} },
+      { provider: createMicrosoft365Provider(), product: "directory", tool: "get_my_profile", args: {} },
+      { provider: createGitlabProvider(), product: "projects", tool: "get_current_user", args: {} },
+    ];
+    for (const [index, entry] of cases.entries()) {
+      const aRefresh = `isolation-a-${index}`;
+      const bRefresh = `isolation-b-${index}`;
+      const a = isolatedHandle(entry.provider.id, entry.product, "tenant-a", "agent-a", aRefresh);
+      const b = isolatedHandle(entry.provider.id, entry.product, "tenant-b", "agent-b", bRefresh);
+      const results = await Promise.all([
+        entry.provider.callTool(a, entry.tool, entry.args),
+        entry.provider.callTool(b, entry.tool, entry.args),
+      ]);
+      assert.ok(results.every((result) => !result.isError));
+      assert.equal(a.config.oauthAccessToken, `${aRefresh}-access`);
+      assert.equal(b.config.oauthAccessToken, `${bRefresh}-access`);
+      assert.notEqual(a.config.oauthAccessToken, b.config.oauthAccessToken);
+    }
   });
 
   it("maps Resend payloads through the shared mutation transport", async () => {

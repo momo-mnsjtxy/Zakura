@@ -477,6 +477,13 @@
       "when": 1790380800000,
       "tag": "0067_memory_invariants",
       "breakpoints": true
+    },
+    {
+      "idx": 68,
+      "version": "7",
+      "when": 1790467200000,
+      "tag": "0068_tenant_content_cleanup_outbox",
+      "breakpoints": true
     }
   ]
 }

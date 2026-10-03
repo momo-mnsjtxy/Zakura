@@ -11,6 +11,11 @@ export type SaasSession = {
 
 export type SaasTenantRole = "owner" | "admin" | "member";
 
+export type SaasMfaDecision =
+  | { action: "allow" }
+  | { action: "enroll"; ticket: string }
+  | { action: "challenge"; ticket: string; methods: string[] };
+
 /** Host-injected dependencies — keeps @zakura/saas free of a hard dep on @zakura/server. */
 export type SaasHostDeps = {
   db: unknown;
@@ -141,6 +146,13 @@ export type SaasHostDeps = {
       membership: { role: string };
     },
   ) => string | Promise<string>;
+  /** Host identity policy gate applied before every newly minted login session. */
+  mfaForLogin?: (input: {
+    userId: string;
+    tenantId: string;
+    role: string;
+    authenticatedSession: boolean;
+  }) => Promise<SaasMfaDecision>;
   switchTenantSession: (
     db: unknown,
     secret: string,

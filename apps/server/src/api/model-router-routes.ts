@@ -151,7 +151,13 @@ export function registerModelRouterRoutes(
       const body = await c.req.json<{ loginId?: string }>().catch(() => ({ loginId: undefined }));
       if (!body.loginId?.trim()) return c.json({ error: "loginId 必填" }, 400);
       try {
-        return c.json(await auth.poll(session.tenantId, c.req.param("id"), body.loginId.trim()));
+        const result = await auth.poll(
+          session.tenantId,
+          c.req.param("id"),
+          body.loginId.trim(),
+        );
+        if (result.status === "complete") router.invalidateCache(session.tenantId);
+        return c.json(result);
       } catch (err) {
         return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
       }
@@ -171,7 +177,9 @@ export function registerModelRouterRoutes(
         credentialsJson: undefined,
       }));
       try {
-        return c.json(await auth.submit(session.tenantId, c.req.param("id"), body));
+        const result = await auth.submit(session.tenantId, c.req.param("id"), body);
+        if (result.status === "complete") router.invalidateCache(session.tenantId);
+        return c.json(result);
       } catch (err) {
         return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
       }
@@ -191,6 +199,7 @@ export function registerModelRouterRoutes(
       const session = c.get("session")!;
       try {
         await auth.logout(session.tenantId, c.req.param("id"));
+        router.invalidateCache(session.tenantId);
         return c.json({ ok: true });
       } catch (err) {
         return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);

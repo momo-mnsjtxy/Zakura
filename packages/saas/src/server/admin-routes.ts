@@ -512,47 +512,50 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
     }
     if (target.suspendedAt) return c.json({ error: "该用户已被封禁" }, 409);
 
-    const targetMemberships = (await db
-      .select({
-        tenantId: tenantMemberships.tenantId,
-        role: tenantMemberships.role,
-        status: tenantMemberships.status,
-      })
-      .from(tenantMemberships)
-      .where(eq(tenantMemberships.userId, target.id))) as Array<{
-      tenantId: string;
-      role: string;
-      status: string;
-    }>;
-    for (const membership of targetMemberships) {
-      if (membership.role !== "owner" || membership.status !== "active") continue;
-      const [otherOwner] = await db
-        .select({ n: count() })
-        .from(tenantMemberships)
-        .where(
-          and(
-            eq(tenantMemberships.tenantId, membership.tenantId),
-            eq(tenantMemberships.role, "owner"),
-            eq(tenantMemberships.status, "active"),
-            ne(tenantMemberships.userId, target.id),
-          ),
-        );
-      if (Number(otherOwner?.n ?? 0) === 0) {
-        return c.json({ error: "请先为团队指定另一位活跃 owner" }, 400);
+    let result:
+      | { error: string }
+      | { updated: Record<string, any>; memberships: Array<{ tenantId: string; role: string; status: string }> };
+    result = await db.transaction(async (tx: AnyDb) => {
+      await tx.execute(sql`select id from ${users} where is_platform_admin = true for update`);
+      await tx.execute(sql`select id from ${tenantMemberships} where role = 'owner' for update`);
+      const lockedTarget = await tx.query.users.findFirst({ where: eq(users.id, id) });
+      if (!lockedTarget || lockedTarget.suspendedAt) return { error: "该用户已被封禁" };
+      if (lockedTarget.isPlatformAdmin) {
+        const [otherAdmin] = await tx
+          .select({ n: count() })
+          .from(users)
+          .where(
+            and(
+              eq(users.isPlatformAdmin, true),
+              isNull(users.suspendedAt),
+              ne(users.id, lockedTarget.id),
+            ),
+          );
+        if (Number(otherAdmin?.n ?? 0) === 0) return { error: "至少保留一个未封禁的平台管理员" };
       }
-    }
-
-    const now = new Date();
-    const [updated] = await db
-      .update(users)
-      .set({
-        suspendedAt: now,
-        suspendedReason: body.reason?.trim() || null,
-        suspendedByUserId: session.userId,
-        updatedAt: now,
-      })
-      .where(eq(users.id, target.id))
-      .returning();
+      const memberships = (await tx
+        .select({ tenantId: tenantMemberships.tenantId, role: tenantMemberships.role, status: tenantMemberships.status })
+        .from(tenantMemberships)
+        .where(eq(tenantMemberships.userId, lockedTarget.id))) as Array<{ tenantId: string; role: string; status: string }>;
+      for (const membership of memberships) {
+        if (membership.role !== "owner" || membership.status !== "active") continue;
+        const [otherOwner] = await tx
+          .select({ n: count() })
+          .from(tenantMemberships)
+          .innerJoin(users, eq(users.id, tenantMemberships.userId))
+          .where(and(eq(tenantMemberships.tenantId, membership.tenantId), eq(tenantMemberships.role, "owner"), eq(tenantMemberships.status, "active"), ne(tenantMemberships.userId, lockedTarget.id), isNull(users.suspendedAt)));
+        if (Number(otherOwner?.n ?? 0) === 0) return { error: "请先为团队指定另一位活跃 owner" };
+      }
+      const now = new Date();
+      const [updated] = await tx
+        .update(users)
+        .set({ suspendedAt: now, suspendedReason: body.reason?.trim() || null, suspendedByUserId: session.userId, updatedAt: now })
+        .where(eq(users.id, lockedTarget.id))
+        .returning();
+      return { updated, memberships };
+    });
+    if ("error" in result) return c.json({ error: result.error }, 400);
+    const { updated, memberships: targetMemberships } = result;
 
     bumpUser(target.id);
     await Promise.all(
@@ -607,7 +610,7 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
       return c.json({ error: "至少保留一个平台管理员" }, 400);
     }
 
-    const userMemberships = (await db
+    let userMemberships = (await db
       .select({
         tenantId: tenantMemberships.tenantId,
         role: tenantMemberships.role,
@@ -636,12 +639,14 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
       const [otherOwner] = await db
         .select({ n: count() })
         .from(tenantMemberships)
+        .innerJoin(users, eq(users.id, tenantMemberships.userId))
         .where(
           and(
             eq(tenantMemberships.tenantId, row.tenantId),
             eq(tenantMemberships.role, "owner"),
             eq(tenantMemberships.status, "active"),
             ne(tenantMemberships.userId, id),
+            isNull(users.suspendedAt),
           ),
         );
       if (Number(otherOwner?.n ?? 0) > 0) continue;
@@ -649,10 +654,40 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
       else return c.json({ error: "请先为团队指定另一位活跃 owner" }, 400);
     }
 
-    for (const tenantId of orphanTenantIds) {
-      await deleteTenantAggregate(tenantId);
+    if (orphanTenantIds.length === 0) {
+      const deletion = await db.transaction(async (tx: AnyDb) => {
+        await tx.execute(sql`select id from ${users} where is_platform_admin = true for update`);
+        await tx.execute(sql`select id from ${tenantMemberships} where role = 'owner' for update`);
+        const lockedTarget = await tx.query.users.findFirst({ where: eq(users.id, id) });
+        if (!lockedTarget) return { error: "Not found" } as const;
+        if (lockedTarget.isPlatformAdmin) {
+          const [otherAdmin] = await tx.select({ n: count() }).from(users).where(
+            and(eq(users.isPlatformAdmin, true), isNull(users.suspendedAt), ne(users.id, id)),
+          );
+          if (Number(otherAdmin?.n ?? 0) === 0) return { error: "至少保留一个平台管理员" } as const;
+        }
+        const memberships = (await tx
+          .select({ tenantId: tenantMemberships.tenantId, role: tenantMemberships.role, status: tenantMemberships.status })
+          .from(tenantMemberships)
+          .where(eq(tenantMemberships.userId, id))) as Array<{ tenantId: string; role: string; status: string }>;
+        for (const membership of memberships) {
+          if (membership.role !== "owner" || membership.status !== "active") continue;
+          const [otherOwner] = await tx
+            .select({ n: count() })
+            .from(tenantMemberships)
+            .innerJoin(users, eq(users.id, tenantMemberships.userId))
+            .where(and(eq(tenantMemberships.tenantId, membership.tenantId), eq(tenantMemberships.role, "owner"), eq(tenantMemberships.status, "active"), ne(tenantMemberships.userId, id), isNull(users.suspendedAt)));
+          if (Number(otherOwner?.n ?? 0) === 0) return { error: "请先为团队指定另一位活跃 owner" } as const;
+        }
+        await tx.delete(users).where(eq(users.id, id));
+        return { memberships } as const;
+      });
+      if ("error" in deletion) return c.json({ error: deletion.error }, 400);
+      userMemberships = deletion.memberships;
+    } else {
+      for (const tenantId of orphanTenantIds) await deleteTenantAggregate(tenantId);
+      await db.delete(users).where(eq(users.id, id));
     }
-    await db.delete(users).where(eq(users.id, id));
     const orphanSet = new Set(orphanTenantIds);
     await Promise.all(
       userMemberships

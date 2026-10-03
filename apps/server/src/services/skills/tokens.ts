@@ -146,6 +146,12 @@ export class SkillTokenStore {
       );
   }
 
+  async removeTenant(tenantId: string): Promise<void> {
+    await this.db
+      .delete(skillSourceTokens)
+      .where(eq(skillSourceTokens.scopeKey, tenantId));
+  }
+
   /** 记录使用时间，方便管理员判断令牌是否还在被用 */
   async markUsed(scopeKey: string, provider: SkillTokenProvider): Promise<void> {
     await this.db

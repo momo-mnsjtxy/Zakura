@@ -229,7 +229,10 @@ function directConnectorHandle(
       : {}),
   };
   return {
-    id: `connector:${target.connectorRef}:${target.capabilityRef}`,
+    // Direct connector handles are ephemeral, but provider refresh single-flight
+    // state is process-wide. Keep the identity tenant/agent scoped so two users
+    // refreshing the same provider can never share a token rotation.
+    id: `connector:${tenantId}:${target.agentId ?? "tenant"}:${target.connectorRef}:${target.capabilityRef}`,
     tenantId,
     providerId: target.providerId,
     name: target.connectorName,

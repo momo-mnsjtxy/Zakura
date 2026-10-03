@@ -15,6 +15,7 @@ describe("connector auth persistence lifecycle", () => {
   let tenantB = "";
   let agentA = "";
   let agentB = "";
+  let spaceA = "";
 
   before(async () => {
     dataDir = mkdtempSync(join(tmpdir(), "zakura-connector-auth-"));
@@ -35,7 +36,7 @@ describe("connector auth persistence lifecycle", () => {
       { id: tenantA, slug: `connector-a-${tenantA}`, name: "Connector A", isDefault: true, createdAt: now, updatedAt: now },
       { id: tenantB, slug: `connector-b-${tenantB}`, name: "Connector B", isDefault: false, createdAt: now, updatedAt: now },
     ]);
-    const spaceA = await ensureTestSpace(db, tenantA, { enableComputer: false });
+    spaceA = await ensureTestSpace(db, tenantA, { enableComputer: false });
     const spaceB = await ensureTestSpace(db, tenantB, { enableComputer: false });
     await db.insert(agents).values([
       {
@@ -149,5 +150,61 @@ describe("connector auth persistence lifecycle", () => {
     assert.equal(rows[0]?.configEnc.includes("access-secret"), false);
     const view = await auth.listInstallations(tenantA, { agentId: agentA });
     assert.equal(view[0]?.authorized, true);
+  });
+
+  it("purges only the deleting tenant's workspace-owned connector secrets", async () => {
+    const {
+      agentChannelBindings,
+      agentConnectorInstallations,
+      connectorAuthProfiles,
+      connectorSettings,
+      emailConnectorInstances,
+      newId,
+    } = await import("../src/db/schema.js");
+    const now = new Date();
+    await auth.saveProfile(tenantB, "keep-profile", {
+      kind: "custom", enabled: true, values: { token: "keep" },
+    });
+    await db.insert(emailConnectorInstances).values({
+      id: newId(), tenantId: tenantA, name: "mail", product: "resendapi",
+      enabled: true, configEnc: "encrypted-email", createdAt: now, updatedAt: now,
+    });
+    await db.insert(agentChannelBindings).values({
+      id: newId(), tenantId: tenantA, spaceId: spaceA, agentId: agentA,
+      platform: "slack", profileKey: "remote-slack", label: "slack", enabled: true,
+      settingsJson: "{}", configEnc: "encrypted-channel", createdAt: now, updatedAt: now,
+    });
+
+    await auth.cleanupTenantSecrets(tenantA);
+    assert.equal(
+      (await db.select().from(agentConnectorInstallations)
+        .where(eq(agentConnectorInstallations.tenantId, tenantA))).length,
+      0,
+    );
+    assert.equal(
+      (await db.select().from(agentChannelBindings)
+        .where(eq(agentChannelBindings.tenantId, tenantA))).length,
+      0,
+    );
+    assert.equal(
+      (await db.select().from(emailConnectorInstances)
+        .where(eq(emailConnectorInstances.tenantId, tenantA))).length,
+      0,
+    );
+    assert.equal(
+      (await db.select().from(connectorAuthProfiles)
+        .where(eq(connectorAuthProfiles.scopeKey, tenantA))).length,
+      0,
+    );
+    assert.equal(
+      (await db.select().from(connectorSettings)
+        .where(eq(connectorSettings.scopeKey, tenantA))).length,
+      0,
+    );
+    assert.ok(
+      await db.query.connectorAuthProfiles.findFirst({
+        where: eq(connectorAuthProfiles.scopeKey, tenantB),
+      }),
+    );
   });
 });

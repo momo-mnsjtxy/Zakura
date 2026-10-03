@@ -43,6 +43,11 @@ export function createOauthRestProvider(spec: OauthRestProviderSpec) {
   const productSet = new Set(spec.products);
   const refreshes = new Map<string, Promise<Record<string, unknown>>>();
 
+  function refreshKey(handle: InstanceHandle): string {
+    const agentId = typeof handle.config.agentId === "string" ? handle.config.agentId : "";
+    return `${handle.tenantId}:${agentId}:${handle.id}`;
+  }
+
   function builtinUrl(product: string): string {
     return `zakura://${spec.id}/${product}`;
   }
@@ -90,7 +95,8 @@ export function createOauthRestProvider(spec: OauthRestProviderSpec) {
     current: Record<string, unknown>,
     appConfig: AppConfig,
   ): Promise<Record<string, unknown>> {
-    const existing = refreshes.get(handle.id);
+    const key = refreshKey(handle);
+    const existing = refreshes.get(key);
     if (existing) return existing;
     const operation = (async () => {
       const tokenEndpoint = String(current.oauthTokenEndpoint ?? "").trim();
@@ -119,9 +125,9 @@ export function createOauthRestProvider(spec: OauthRestProviderSpec) {
       handle.config = next;
       return next;
     })().finally(() => {
-      if (refreshes.get(handle.id) === operation) refreshes.delete(handle.id);
+      if (refreshes.get(key) === operation) refreshes.delete(key);
     });
-    refreshes.set(handle.id, operation);
+    refreshes.set(key, operation);
     return operation;
   }
 

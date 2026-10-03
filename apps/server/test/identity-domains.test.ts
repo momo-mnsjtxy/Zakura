@@ -25,6 +25,7 @@ describe("identity domains", () => {
 
   it("验证 TXT 记录是否含 token", () => {
     assert.equal(txtRecordsContain([["zakura-verify=", "tok_abc"]], "tok_abc"), true);
+    assert.equal(txtRecordsContain([["prefix-tok_abc-suffix"]], "tok_abc"), false);
     assert.equal(txtRecordsContain([["unrelated"]], "tok_abc"), false);
   });
 

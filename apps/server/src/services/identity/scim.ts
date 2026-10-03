@@ -607,8 +607,13 @@ export async function scimPatchGroup(
   const ops = (body.Operations ?? body.operations) as Array<{ op?: string; path?: string; value?: unknown }> | undefined;
   if (!Array.isArray(ops)) throw new ScimError("Operations required", 400, "invalidSyntax");
 
-  const mappingIds = new Set<string>();
-  for (const op of ops) {
+  return db.transaction(async (tx) => {
+    const database = transactionDb(tx);
+    const mappingIds = new Set<string>();
+    for (const op of ops) {
+    if ((op.op !== undefined && typeof op.op !== "string") || (op.path !== undefined && typeof op.path !== "string")) {
+      throw new ScimError("Invalid group operation", 400, "invalidSyntax");
+    }
     const operation = (op.op ?? "replace").toLowerCase();
     const path = (op.path ?? "").toLowerCase();
     const values = Array.isArray(op.value)
@@ -619,7 +624,7 @@ export async function scimPatchGroup(
     if (path !== "members" && !pathValue) continue;
 
     if (operation === "replace" && role === "admin") {
-      const mappedUsers = await db
+      const mappedUsers = await database
         .select({ userId: scimUserMappings.userId, mappingId: scimUserMappings.id })
         .from(scimUserMappings)
         .where(eq(scimUserMappings.tenantId, tenantId));
@@ -628,7 +633,7 @@ export async function scimPatchGroup(
         .filter((mapping) => !retained.has(mapping.mappingId))
         .map((mapping) => mapping.userId);
       for (const userId of demoteUserIds) {
-        await db
+        await database
           .update(tenantMemberships)
           .set({ role: "member", updatedAt: new Date() })
           .where(
@@ -644,14 +649,14 @@ export async function scimPatchGroup(
     if (operation === "remove") {
       if (role === "admin") {
         for (const mappingId of values) {
-          const mapping = await db.query.scimUserMappings.findFirst({
+          const mapping = await database.query.scimUserMappings.findFirst({
             where: and(
               eq(scimUserMappings.tenantId, tenantId),
               eq(scimUserMappings.id, mappingId),
             ),
           });
           if (mapping) {
-            await db
+            await database
               .update(tenantMemberships)
               .set({ role: "member", updatedAt: new Date() })
               .where(
@@ -667,24 +672,25 @@ export async function scimPatchGroup(
       continue;
     }
     values.forEach((value) => mappingIds.add(value));
-  }
+    }
 
-  for (const mappingId of mappingIds) {
-    const mapping = await db.query.scimUserMappings.findFirst({
-      where: and(eq(scimUserMappings.tenantId, tenantId), eq(scimUserMappings.id, mappingId)),
-    });
-    if (!mapping) continue;
-    await db
-      .update(tenantMemberships)
-      .set({ role, updatedAt: new Date() })
-      .where(
-        and(
-          eq(tenantMemberships.tenantId, tenantId),
-          eq(tenantMemberships.userId, mapping.userId),
-          // Directory group sync never changes the protected owner role.
-          sql`${tenantMemberships.role} <> 'owner'`,
-        ),
-      );
-  }
-  return { schemas: [GROUP_SCHEMA], id, displayName: entry[0], meta: { resourceType: "Group" } };
+    for (const mappingId of mappingIds) {
+      const mapping = await database.query.scimUserMappings.findFirst({
+        where: and(eq(scimUserMappings.tenantId, tenantId), eq(scimUserMappings.id, mappingId)),
+      });
+      if (!mapping) continue;
+      await database
+        .update(tenantMemberships)
+        .set({ role, updatedAt: new Date() })
+        .where(
+          and(
+            eq(tenantMemberships.tenantId, tenantId),
+            eq(tenantMemberships.userId, mapping.userId),
+            // Directory group sync never changes the protected owner role.
+            sql`${tenantMemberships.role} <> 'owner'`,
+          ),
+        );
+    }
+    return { schemas: [GROUP_SCHEMA], id, displayName: entry[0], meta: { resourceType: "Group" } };
+  });
 }

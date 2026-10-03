@@ -1227,6 +1227,37 @@ export const platformServiceUsage = pgTable(
   ],
 );
 
+/**
+ * Durable tenant content cleanup/outbox.
+ *
+ * Intentionally has no tenant FK: delete tombstones must remain visible to
+ * other API replicas after the owning tenant row has been removed.
+ */
+export const tenantContentCleanupJobs = pgTable(
+  "tenant_content_cleanup_jobs",
+  {
+    id: text("id").primaryKey().$defaultFn(newId),
+    idempotencyKey: text("idempotency_key").notNull(),
+    tenantId: text("tenant_id").notNull(),
+    action: text("action").notNull(),
+    payloadJson: text("payload_json").notNull().default("{}"),
+    status: text("status").notNull().default("pending"),
+    attempts: integer("attempts").notNull().default(0),
+    maxAttempts: integer("max_attempts").notNull().default(8),
+    availableAt: timestamp("available_at", { withTimezone: true }).notNull().defaultNow(),
+    lockedAt: timestamp("locked_at", { withTimezone: true }),
+    lockedBy: text("locked_by"),
+    lastError: text("last_error"),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+    ...timestamps,
+  },
+  (t) => [
+    uniqueIndex("tenant_content_cleanup_jobs_idempotency").on(t.idempotencyKey),
+    index("tenant_content_cleanup_jobs_ready").on(t.status, t.availableAt),
+    index("tenant_content_cleanup_jobs_tenant").on(t.tenantId, t.createdAt),
+  ],
+);
+
 export const mcpPolicies = pgTable("mcp_policies", {
   id: text("id").primaryKey().$defaultFn(newId),
   tenantId: text("tenant_id")
@@ -2036,6 +2067,7 @@ export const schema = {
   platformServices,
   platformServiceQuotas,
   platformServiceUsage,
+  tenantContentCleanupJobs,
   mcpPolicies,
   memories,
   memoryEdges,
@@ -2104,6 +2136,7 @@ export type Setting = typeof settings.$inferSelect;
 export type PlatformService = typeof platformServices.$inferSelect;
 export type PlatformServiceQuota = typeof platformServiceQuotas.$inferSelect;
 export type PlatformServiceUsageRow = typeof platformServiceUsage.$inferSelect;
+export type TenantContentCleanupJob = typeof tenantContentCleanupJobs.$inferSelect;
 export type McpPolicy = typeof mcpPolicies.$inferSelect;
 export type Memory = typeof memories.$inferSelect;
 export type MemoryEdge = typeof memoryEdges.$inferSelect;

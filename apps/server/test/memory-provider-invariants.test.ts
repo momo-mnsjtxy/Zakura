@@ -50,7 +50,7 @@ describe("memory provider persistence invariants", () => {
     const journal = JSON.parse(readFileSync(new URL("../drizzle/meta/_journal.json", import.meta.url), "utf8")) as {
       entries: Array<{ idx: number; tag: string }>;
     };
-    assert.deepEqual(journal.entries.at(-1), {
+    assert.deepEqual(journal.entries.find((entry) => entry.idx === 67), {
       idx: 67, version: "7", when: 1790380800000,
       tag: "0067_memory_invariants", breakpoints: true,
     });
@@ -114,6 +114,58 @@ describe("memory provider persistence invariants", () => {
     assert.equal(rows.length, 1);
   });
 
+  it("purges tenant-owned external mem0 records before tenant deletion", async () => {
+    const { MemoryProvidersService } = await import("../src/services/memory-providers.js");
+    const { agents, newId, tenants } = await import("../src/db/schema.js");
+    const cleanupTenant = newId();
+    const cleanupAgent = newId();
+    const now = new Date();
+    await db.insert(tenants).values({
+      id: cleanupTenant, slug: `memory-cleanup-${cleanupTenant}`, name: "Cleanup",
+      isDefault: false, createdAt: now, updatedAt: now,
+    });
+    const spaceId = await ensureTestSpace(db, cleanupTenant, { enableComputer: false });
+    await db.insert(agents).values({
+      id: cleanupAgent, tenantId: cleanupTenant, spaceId, name: "Cleanup Agent",
+      slug: `cleanup-${cleanupAgent}`, description: "", status: "ready",
+      enableFs: true, enableComputer: false, enableMemory: true,
+      runtimeNodeId: null, workspaceStatus: "ready", configJson: "{}",
+      createdAt: now, updatedAt: now,
+    });
+    const providers = new MemoryProvidersService(db, secret);
+    const provider = await providers.create(cleanupTenant, {
+      name: "External", kind: "mem0", isDefault: true,
+      config: { baseUrl: "https://mem0.cleanup.test", apiKey: "secret", defaultUserId: "u" },
+    });
+    await db.update(agents).set({ memoryProviderId: provider.id }).where(eq(agents.id, cleanupAgent));
+
+    const originalFetch = globalThis.fetch;
+    const deleted: string[] = [];
+    let listed = 0;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (String(init?.method ?? "GET").toUpperCase() === "DELETE") {
+        deleted.push(url);
+        return new Response(null, { status: 204 });
+      }
+      listed += 1;
+      return Response.json({
+        results: listed === 1
+          ? [{ id: "memory-a", memory: "a" }, { id: "memory-b", memory: "b" }]
+          : [],
+      });
+    }) as typeof fetch;
+    try {
+      await providers.cleanupTenantExternalData(cleanupTenant);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    assert.deepEqual(deleted, [
+      `https://mem0.cleanup.test/v1/memories/?agent_id=${cleanupAgent}`,
+    ]);
+    assert.equal(listed, 0, "bulk agent purge should cover non-default user namespaces");
+  });
+
   it("repairs duplicate legacy defaults when 0067 is replayed", async () => {
     const { memoryProviders } = await import("../src/db/schema.js");
     await db.execute(sql.raw('DROP INDEX IF EXISTS "memory_providers_one_default"'));
@@ -123,7 +175,7 @@ describe("memory provider persistence invariants", () => {
     ));
     assert.ok(before.length > 1);
     await db.execute(sql.raw(
-      'DELETE FROM drizzle.__drizzle_migrations WHERE id = (SELECT max(id) FROM drizzle.__drizzle_migrations)',
+      'DELETE FROM drizzle.__drizzle_migrations WHERE id >= (SELECT id FROM drizzle.__drizzle_migrations ORDER BY id DESC OFFSET 1 LIMIT 1)',
     ));
     await close();
     const { runMigrations } = await import("../src/db/migrate.js");

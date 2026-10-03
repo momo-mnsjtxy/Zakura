@@ -93,6 +93,10 @@ export class AgentService {
   private readonly agentCache = new TtlCache<Agent>(AGENT_CACHE_TTL_MS);
   /** 绑定变更时清 Agent 工具缓存（由 McpGateway 注入） */
   private toolsCacheInvalidator: ((agentId: string) => void) | null = null;
+  /** Cloud sessions must quiesce before their owning Agent/Space is cascaded. */
+  private sessionDrainer:
+    | ((tenantId: string, agentIds: string[]) => Promise<(deleted?: boolean) => Promise<void> | void>)
+    | null = null;
 
   constructor(
     private readonly db: Db,
@@ -102,8 +106,33 @@ export class AgentService {
   ) {
     this.workspace = new AgentWorkspaceService(db, runtime, config, nodes);
     this.spaces = new SpaceService(db, config, {
-      beforeDelete: (space) => this.workspace.removeSpaceWorkspace(space),
+      beforeDelete: async (space) => {
+        const members = await this.db
+          .select({ id: agents.id })
+          .from(agents)
+          .where(and(eq(agents.tenantId, space.tenantId), eq(agents.spaceId, space.id)));
+        const release = await this.sessionDrainer?.(
+          space.tenantId,
+          members.map((member) => member.id),
+        );
+        try {
+          await this.workspace.removeSpaceWorkspace(space);
+        } catch (error) {
+          await release?.(false);
+          throw error;
+        }
+        return release;
+      },
     });
+  }
+
+  /** Installed by the API composition root once the process-wide cloud store exists. */
+  setSessionDrainer(
+    drainer: (
+      (tenantId: string, agentIds: string[]) => Promise<(deleted?: boolean) => Promise<void> | void>
+    ) | null,
+  ): void {
+    this.sessionDrainer = drainer;
   }
 
   /** 解析 Agent 的所属空间；不存在时报错。 */
@@ -583,8 +612,15 @@ export class AgentService {
     // The computer belongs to the Space and may be serving sibling agents.
     // Agent deletion only removes the agent aggregate; Space deletion owns
     // workspace teardown.
-    await this.db.delete(agents).where(and(eq(agents.id, agent.id), eq(agents.tenantId, tenantId)));
-    this.forgetAgent(agent);
+    const release = await this.sessionDrainer?.(tenantId, [agent.id]);
+    let deleted = false;
+    try {
+      await this.db.delete(agents).where(and(eq(agents.id, agent.id), eq(agents.tenantId, tenantId)));
+      this.forgetAgent(agent);
+      deleted = true;
+    } finally {
+      await release?.(deleted);
+    }
 
     if (opts?.purgeData) {
       try {

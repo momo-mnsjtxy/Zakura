@@ -4,12 +4,18 @@ import { authTokens, newId } from "../../db/schema.js";
 import { hashToken, newSecretToken, parseJsonObject } from "./util.js";
 import { CredentialLifecycleService } from "./credential-lifecycle.js";
 
-export type AuthTokenKind = "email_verify" | "password_reset" | "mfa_login" | "sso_exchange";
+export type AuthTokenKind =
+  | "email_verify"
+  | "password_reset"
+  | "mfa_login"
+  | "mfa_enrollment"
+  | "sso_exchange";
 
 const TTL_MS: Record<AuthTokenKind, number> = {
   email_verify: 48 * 60 * 60 * 1000,
   password_reset: 60 * 60 * 1000,
   mfa_login: 5 * 60 * 1000,
+  mfa_enrollment: 10 * 60 * 1000,
   sso_exchange: 5 * 60 * 1000,
 };
 

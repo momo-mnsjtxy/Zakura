@@ -75,6 +75,11 @@ let appConfigRef: AppConfig | null = null;
 let dbRef: any = null;
 const refreshes = new Map<string, Promise<Record<string, unknown>>>();
 
+function refreshKey(handle: InstanceHandle): string {
+  const agentId = typeof handle.config.agentId === "string" ? handle.config.agentId : "";
+  return `${handle.tenantId}:${agentId}:${handle.id}`;
+}
+
 export function injectGoogleWorkspaceRuntime(config: AppConfig, db: unknown): void {
   appConfigRef = config;
   dbRef = db;
@@ -146,7 +151,8 @@ async function maybeRefreshOauth(
   if (!appConfigRef) return config;
 
   try {
-    const existing = refreshes.get(handle.id);
+    const key = refreshKey(handle);
+    const existing = refreshes.get(key);
     if (existing) return await existing;
     let operation!: Promise<Record<string, unknown>>;
     operation = (async () => {
@@ -181,9 +187,9 @@ async function maybeRefreshOauth(
       handle.config = next;
       return next;
     })().finally(() => {
-      if (refreshes.get(handle.id) === operation) refreshes.delete(handle.id);
+      if (refreshes.get(key) === operation) refreshes.delete(key);
     });
-    refreshes.set(handle.id, operation);
+    refreshes.set(key, operation);
     config = await operation;
   } catch (err) {
     ctx?.logger.warn("oauth refresh failed", {

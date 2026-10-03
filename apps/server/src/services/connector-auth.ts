@@ -23,10 +23,12 @@ import { and, eq, inArray } from "drizzle-orm";
 import type { AppConfig } from "../config.js";
 import type { Db } from "../db/client.js";
 import {
+  agentChannelBindings,
   agentConnectorInstallations,
   agents,
   connectorAuthProfiles,
   connectorSettings,
+  emailConnectorInstances,
   newId,
 } from "../db/schema.js";
 
@@ -677,6 +679,31 @@ export class ConnectorAuthService {
         if (updated.length) return;
       }
       throw new Error("连接器授权并发更新过多，请重试");
+    });
+  }
+
+  /**
+   * Remove every tenant/workspace-owned connector secret before tenant rows
+   * disappear. Platform profiles are intentionally untouched.
+   */
+  async cleanupTenantSecrets(tenantId: string): Promise<void> {
+    await this.db.transaction(async (tx) => {
+      const database = tx as unknown as Db;
+      await database
+        .delete(agentChannelBindings)
+        .where(eq(agentChannelBindings.tenantId, tenantId));
+      await database
+        .delete(agentConnectorInstallations)
+        .where(eq(agentConnectorInstallations.tenantId, tenantId));
+      await database
+        .delete(emailConnectorInstances)
+        .where(eq(emailConnectorInstances.tenantId, tenantId));
+      await database
+        .delete(connectorAuthProfiles)
+        .where(eq(connectorAuthProfiles.scopeKey, tenantId));
+      await database
+        .delete(connectorSettings)
+        .where(eq(connectorSettings.scopeKey, tenantId));
     });
   }
 }

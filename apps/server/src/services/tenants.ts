@@ -623,7 +623,12 @@ export class TenantService {
           throw new TenantAccessError("Password required (min 8 chars) to create account", 400);
         }
         passwordHash = await bcrypt.hash(input.password, 10);
-      } else if (input.password) {
+      } else {
+        // The invite is authorization to join this tenant, not proof that the
+        // caller owns an existing global account (which may reach other tenants).
+        if (!input.password) {
+          throw new TenantAccessError("Sign in before accepting this invite", 401);
+        }
         if (!user.passwordHash || !(await bcrypt.compare(input.password, user.passwordHash))) {
           throw new TenantAccessError("Invalid credentials", 401);
         }

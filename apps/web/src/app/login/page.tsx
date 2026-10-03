@@ -9,6 +9,7 @@ import { api, setSession, type PlatformInfo, ApiError } from "@/lib/api";
 import { AuthField, AuthFooter, AuthScreen } from "@/components/auth-screen";
 import { OauthProviderIcon } from "@/components/oauth-provider-icon";
 import { Button } from "@/components/ui/button";
+import { AuthMfaEnrollment } from "@/components/auth-mfa-enrollment";
 import { Input } from "@/components/ui/input";
 import {
   createActionLock,
@@ -16,6 +17,7 @@ import {
   readLoginIntent,
   resolveEmailDiscovery,
 } from "@/lib/auth-flow";
+import { authCallbackResult } from "@/lib/auth-callback-state";
 
 type OauthProvider = { id: string; name: string; enabled: boolean };
 type Mode = "signin" | "register";
@@ -43,6 +45,7 @@ export default function LoginPage() {
   const [tenantName, setTenantName] = useState("");
   const [code, setCode] = useState("");
   const [mfaTicket, setMfaTicket] = useState<string | null>(null);
+  const [enrollmentTicket, setEnrollmentTicket] = useState<string | null>(null);
   const [mfaMethods, setMfaMethods] = useState<string[]>([]);
   const [mfaMode, setMfaMode] = useState<MfaMode>("totp");
   const [ssoHint, setSsoHint] = useState<SsoHint | null>(null);
@@ -159,10 +162,17 @@ export default function LoginPage() {
     if (!credentialAction.current.acquire()) return;
     setLoading(true);
     try {
-      const res = await api<{ session?: string; mfaRequired?: boolean; mfaTicket?: string; methods?: string[] }>(
+      const res = await api<{ session?: string; mfaRequired?: boolean; mfaTicket?: string; methods?: string[]; mfaEnrollmentRequired?: boolean; mfaEnrollmentTicket?: string }>(
         "/api/auth/login",
         { method: "POST", json: { email, password } },
       );
+      const outcome = authCallbackResult(res);
+      if (outcome.kind === "enrollment") {
+        setEnrollmentTicket(outcome.ticket);
+        setLoading(false);
+        credentialAction.current.release();
+        return;
+      }
       if (res.mfaRequired && res.mfaTicket) {
         const methods = res.methods ?? [];
         setMfaTicket(res.mfaTicket);
@@ -192,7 +202,7 @@ export default function LoginPage() {
     if (!credentialAction.current.acquire()) return;
     setLoading(true);
     try {
-      const res = await api<{ session: string; next?: string }>("/api/auth/register", {
+      const res = await api<{ session?: string; next?: string; tenant?: { onboardingCompleted?: boolean }; mfaEnrollmentRequired?: boolean; mfaEnrollmentTicket?: string; methods?: string[] }>("/api/auth/register", {
         method: "POST",
         json: {
           email,
@@ -201,7 +211,15 @@ export default function LoginPage() {
           tenantName: tenantName || undefined,
         },
       });
-      setSession(res.session);
+      const outcome = authCallbackResult(res);
+      if (outcome.kind === "enrollment") {
+        setEnrollmentTicket(outcome.ticket);
+        setLoading(false);
+        credentialAction.current.release();
+        return;
+      }
+      if (outcome.kind !== "session") throw new Error(outcome.message);
+      setSession(outcome.session);
       toast.success("注册成功");
       router.push(res.next || "/onboarding");
     } catch (err) {
@@ -308,6 +326,15 @@ export default function LoginPage() {
       </AuthScreen>
     );
   }
+
+  if (enrollmentTicket) return (
+    <AuthScreen showBrand={false} title="保护你的账号" description="团队要求启用身份验证器。">
+      <AuthMfaEnrollment ticket={enrollmentTicket} onSession={async (result) => {
+        setSession(result.session);
+        router.push(result.tenant?.onboardingCompleted === false ? "/onboarding" : "/dashboard/agents");
+      }} />
+    </AuthScreen>
+  );
 
   const footer =
     mode === "register" ? (

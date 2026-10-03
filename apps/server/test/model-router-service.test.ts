@@ -235,4 +235,71 @@ describe("ModelRouterService route lifecycle", () => {
       ["first.invalid"],
     );
   });
+
+  it("does not force-refresh and replay a 401 after a visible delta", async () => {
+    let requests = 0;
+    globalThis.fetch = (async () => {
+      requests += 1;
+      if (requests > 1) return successfulStream("duplicated");
+      return fragmentedResponse([
+        { choices: [{ delta: { content: "partial" } }] },
+        {
+          error: {
+            status: 401,
+            code: "invalid_token",
+            type: "authentication_error",
+            message: "expired mid-stream",
+          },
+        },
+      ]);
+    }) as typeof fetch;
+
+    let visible = "";
+    await assert.rejects(
+      serviceFor([fakeRoute("auth-stream")]).chatStream(
+        "tenant",
+        [{ role: "user", content: "hello" }],
+        { capability: "chat" },
+        undefined,
+        { onDelta: (delta) => (visible += delta) },
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof ChatStreamPartialError);
+        assert.equal(error.retryable, false);
+        return true;
+      },
+    );
+    assert.equal(visible, "partial");
+    assert.equal(requests, 1);
+  });
+
+  it("still retries a 401 once when the stream emitted nothing", async () => {
+    let requests = 0;
+    globalThis.fetch = (async () => {
+      requests += 1;
+      if (requests === 1) {
+        return fragmentedResponse([
+          {
+            error: {
+              status: 401,
+              code: "invalid_token",
+              type: "authentication_error",
+              message: "expired before output",
+            },
+          },
+        ]);
+      }
+      return successfulStream("refreshed");
+    }) as typeof fetch;
+
+    const result = await serviceFor([fakeRoute("auth-before-output")]).chatStream(
+      "tenant",
+      [{ role: "user", content: "hello" }],
+      { capability: "chat" },
+      undefined,
+      {},
+    );
+    assert.equal(result.content, "refreshed");
+    assert.equal(requests, 2);
+  });
 });

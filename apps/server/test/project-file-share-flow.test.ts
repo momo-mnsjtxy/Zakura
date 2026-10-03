@@ -7,7 +7,7 @@ import { Hono } from "hono";
 import { LocalWorkspaceFs } from "@zakura/core";
 import type { AppConfig } from "../src/config.js";
 import type { Db } from "../src/db/client.js";
-import { newId, tenants } from "../src/db/schema.js";
+import { agentSchedules, newId, tenants } from "../src/db/schema.js";
 import { registerAgentFsRoutes } from "../src/api/agent-fs-routes.js";
 import { AgentService } from "../src/services/agents.js";
 import { CloudAgentSessionStore } from "../src/services/cloud-agent-session.js";
@@ -28,6 +28,7 @@ describe("Space project and file-share collaboration routes", () => {
   let fs: LocalWorkspaceFs;
   let shares: FileShareService;
   let sessions: CloudAgentSessionStore;
+  let agentService: AgentService;
 
   before(async () => {
     process.env.REDIS_URL = "off";
@@ -47,12 +48,12 @@ describe("Space project and file-share collaboration routes", () => {
       publicBaseUrl: "http://localhost",
       internalBaseUrl: "http://localhost",
     } as AppConfig;
-    const agents = new AgentService(db, {} as never, config);
-    const space = await agents.spaces.create(tenantId, { name: "Shared" });
+    agentService = new AgentService(db, {} as never, config);
+    const space = await agentService.spaces.create(tenantId, { name: "Shared" });
     spaceId = space.id;
-    await agents.spaces.update(tenantId, space.id, { enableComputer: true });
-    agentA = (await agents.create(tenantId, { name: "A", spaceId, createApiKey: false })).agent.id;
-    agentB = (await agents.create(tenantId, { name: "B", spaceId, createApiKey: false })).agent.id;
+    await agentService.spaces.update(tenantId, space.id, { enableComputer: true });
+    agentA = (await agentService.create(tenantId, { name: "A", spaceId, createApiKey: false })).agent.id;
+    agentB = (await agentService.create(tenantId, { name: "B", spaceId, createApiKey: false })).agent.id;
 
     const workspaceRoot = join(root, "shared-workspace");
     fs = new LocalWorkspaceFs(workspaceRoot);
@@ -81,7 +82,7 @@ describe("Space project and file-share collaboration routes", () => {
       await next();
     });
     const fsProvider = { forAgentBinding: async () => fs };
-    registerAgentFsRoutes(app, agents, fsProvider as never, db, shares);
+    registerAgentFsRoutes(app, agentService, fsProvider as never, db, shares);
   });
 
   after(async () => {
@@ -122,5 +123,82 @@ describe("Space project and file-share collaboration routes", () => {
       assert.equal(rows[0]?.project, null);
       assert.equal((await shares.listForAgent(tenantId, agentId))[0]?.status, "revoked");
     }
+  });
+
+  it("rolls the workspace back when rename/delete metadata transactions fail", async () => {
+    await fs.mkdir("projects/rollback");
+    await fs.write("projects/rollback/output.txt", "keep me");
+    await upsertSpaceProject(db, {
+      tenantId,
+      spaceId,
+      slug: "rollback",
+      name: "Rollback",
+      hasWorkspace: true,
+    });
+    const share = await shares.create(tenantId, agentA, fs, {
+      path: "/projects/rollback/output.txt",
+    });
+    const session = await sessions.createSession({
+      tenantId,
+      agentId: agentA,
+      title: "Rollback",
+      project: "rollback",
+    });
+    const scheduleId = newId();
+    await db.insert(agentSchedules).values({
+      id: scheduleId,
+      tenantId,
+      agentId: agentA,
+      name: "Rollback",
+      pattern: "@daily",
+      prompt: "keep project",
+      project: "rollback",
+    });
+
+    const failingDb = new Proxy(db as Db, {
+      get(target, property, receiver) {
+        if (property === "transaction") {
+          return async () => { throw new Error("injected metadata failure"); };
+        }
+        const value = Reflect.get(target as object, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const failing = new Hono<any>();
+    failing.onError((error, c) => c.json({ error: error.message }, 500));
+    failing.use("*", async (c, next) => {
+      c.set("session", { userId: "user", tenantId, email: "user@example.test", role: "owner" });
+      await next();
+    });
+    registerAgentFsRoutes(
+      failing,
+      agentService,
+      { forAgentBinding: async () => fs } as never,
+      failingDb,
+      shares,
+    );
+
+    const rename = await failing.request(`/api/agents/${agentA}/projects/rollback`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ slug: "broken" }),
+    });
+    assert.equal(rename.status, 500);
+    assert.equal(await fs.exists("projects/rollback"), true);
+    assert.equal(await fs.exists("projects/broken"), false);
+    assert.ok(await getSpaceProject(db, spaceId, "rollback"));
+    assert.equal(await getSpaceProject(db, spaceId, "broken"), null);
+
+    const remove = await failing.request(`/api/agents/${agentA}/projects/rollback`, {
+      method: "DELETE",
+    });
+    assert.equal(remove.status, 500);
+    assert.equal(await fs.exists("projects/rollback/output.txt"), true);
+    assert.ok(await getSpaceProject(db, spaceId, "rollback"));
+    assert.equal((await sessions.getSession(tenantId, agentA, session.id))?.project, "rollback");
+    assert.equal((await db.query.agentSchedules.findFirst({
+      where: (row, { eq }) => eq(row.id, scheduleId),
+    }))?.project, "rollback");
+    assert.equal((await shares.listForAgent(tenantId, agentA)).find((item) => item.id === share.id)?.status, "active");
   });
 });

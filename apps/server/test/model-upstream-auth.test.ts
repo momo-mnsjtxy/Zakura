@@ -536,6 +536,10 @@ describe("未登录调用", () => {
     assert.equal(refreshCalls, 1);
     assert.equal(first.upstream.config.apiKey, "fresh-access");
     assert.equal(second.upstream.config.apiKey, "fresh-access");
+    assert.equal(
+      decryptTokens("test-secret", String(first.upstream.config.oauthEnc)).refresh_token,
+      "fresh-refresh",
+    );
     const persisted = decryptTokens("test-secret", String(read().oauthEnc));
     assert.equal(persisted.access_token, "fresh-access");
     assert.equal(persisted.refresh_token, "fresh-refresh");

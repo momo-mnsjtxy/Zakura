@@ -1,6 +1,7 @@
 import { eq } from "drizzle-orm";
 import type { Db } from "../db/client.js";
 import { tenants, users } from "../db/schema.js";
+import { isRedisEnabled } from "./redis.js";
 
 /**
  * 平台封号（suspend）判定。
@@ -47,7 +48,10 @@ export function invalidateAllSuspensions(): void {
 }
 
 async function readUser(db: Db, userId: string): Promise<UserEntry> {
-  const cached = userCache.get(userId);
+  // In distributed mode a replica-local positive may outlive a suspension
+  // performed elsewhere. Prefer the authoritative DB to bound revocation at
+  // the request that follows the commit.
+  const cached = isRedisEnabled() ? undefined : userCache.get(userId);
   if (cached && cached.expiresAt > Date.now()) return cached;
   const row = await db.query.users.findFirst({ where: eq(users.id, userId) });
   const entry: UserEntry = {
@@ -55,12 +59,12 @@ async function readUser(db: Db, userId: string): Promise<UserEntry> {
     reason: row?.suspendedReason ?? null,
     expiresAt: Date.now() + TTL_MS,
   };
-  userCache.set(userId, entry);
+  if (!isRedisEnabled()) userCache.set(userId, entry);
   return entry;
 }
 
 async function readTenant(db: Db, tenantId: string): Promise<TenantEntry> {
-  const cached = tenantCache.get(tenantId);
+  const cached = isRedisEnabled() ? undefined : tenantCache.get(tenantId);
   if (cached && cached.expiresAt > Date.now()) return cached;
   const row = await db.query.tenants.findFirst({ where: eq(tenants.id, tenantId) });
   const entry: TenantEntry = {
@@ -69,7 +73,7 @@ async function readTenant(db: Db, tenantId: string): Promise<TenantEntry> {
     reason: row?.suspendedReason ?? null,
     expiresAt: Date.now() + TTL_MS,
   };
-  tenantCache.set(tenantId, entry);
+  if (!isRedisEnabled()) tenantCache.set(tenantId, entry);
   return entry;
 }
 

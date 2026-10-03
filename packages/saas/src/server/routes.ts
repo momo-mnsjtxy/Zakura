@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import type { SaasApp, SaasHostDeps, SaasSession, SaasTenantRole } from "./types.js";
 import { RegisterError, registerSaasUser } from "./register-user.js";
 import { registerAdminResourceRoutes } from "./admin-routes.js";
@@ -45,6 +45,7 @@ export function registerSaasRoutes(
     tenants: tenantService,
     signSession,
     sessionFromLogin,
+    mfaForLogin,
     issueSession,
     switchTenantSession,
     isSessionAdmin,
@@ -82,6 +83,17 @@ export function registerSaasRoutes(
     onTenantCreated,
   });
 
+  const evaluateMfa = (
+    result: { user: { id: string }; tenant: { id: string }; membership: { role: string } },
+    authenticatedSession: boolean,
+  ) =>
+    mfaForLogin?.({
+      userId: result.user.id,
+      tenantId: result.tenant.id,
+      role: result.membership.role,
+      authenticatedSession,
+    });
+
   // ── Public self-registration ──────────────────────────────────────────
   app.post("/api/auth/register", async (c) => {
     try {
@@ -113,12 +125,30 @@ export function registerSaasRoutes(
         password: body.password,
         name: body.name,
         tenantName: body.tenantName,
-        joinTenant: join?.action === "auto_join" ? { tenantId: join.tenantId, role: join.role } : undefined,
       });
-      if (join?.action !== "auto_join") {
-        await onTenantCreated?.(result.tenant.id).catch(() => undefined);
-      }
+      // A matching verified corporate domain is not itself proof the registrant
+      // controls the supplied mailbox. Email verification performs auto-join.
+      await onTenantCreated?.(result.tenant.id).catch(() => undefined);
       await requestEmailVerification?.({ id: result.user.id, email: result.user.email }).catch(() => undefined);
+      const mfa = await evaluateMfa(result, false);
+      if (mfa?.action === "enroll") {
+        return c.json({
+          mfaEnrollmentRequired: true,
+          mfaEnrollmentTicket: mfa.ticket,
+          methods: ["totp"],
+          code: "mfa_enrollment_required",
+        });
+      }
+      if (mfa?.action === "challenge") {
+        return c.json({
+          mfaRequired: true,
+          mfaTicket: mfa.ticket,
+          methods: mfa.methods,
+          user: { id: result.user.id, email: result.user.email, name: result.user.name },
+          tenant: result.tenant,
+          next: "/onboarding",
+        }, 200);
+      }
       const token = await sessionFromLogin(config.secret, result);
       return c.json(
         {
@@ -190,6 +220,25 @@ export function registerSaasRoutes(
         code: body.code ?? "",
         state: body.state ?? "",
       });
+      const mfa = await evaluateMfa(result, false);
+      if (mfa?.action === "enroll") {
+        return c.json({
+          mfaEnrollmentRequired: true,
+          mfaEnrollmentTicket: mfa.ticket,
+          methods: ["totp"],
+          code: "mfa_enrollment_required",
+        });
+      }
+      if (mfa?.action === "challenge") {
+        return c.json({
+          mfaRequired: true,
+          mfaTicket: mfa.ticket,
+          methods: mfa.methods,
+          user: result.user,
+          tenant: result.tenant,
+          next: result.tenant.onboardingCompleted ? "/dashboard/agents" : "/onboarding",
+        });
+      }
       const token = await sessionFromLogin(config.secret, result);
       return c.json({
         session: token,
@@ -272,6 +321,32 @@ export function registerSaasRoutes(
     }
     const body = await c.req.json<{ tenantId?: string }>();
     if (!body.tenantId) return c.json({ error: "tenantId required" }, 400);
+    const tenantsTable = schema.tenants as { id: unknown };
+    const tenant = await db.query.tenants.findFirst({
+      where: eq(tenantsTable.id as never, body.tenantId),
+    });
+    const membership = await (dbUnknown as any).query.tenantMemberships.findFirst({
+      where: and(
+        eq((schema.tenantMemberships as any).tenantId, body.tenantId),
+        eq((schema.tenantMemberships as any).userId, session.userId),
+      ),
+    });
+    const mfa = membership?.status === "active"
+      ? await mfaForLogin?.({
+          userId: session.userId,
+          tenantId: body.tenantId,
+          role: membership.role,
+          authenticatedSession: true,
+        })
+      : null;
+    if (mfa?.action === "enroll") {
+      return c.json({
+        mfaEnrollmentRequired: true,
+        mfaEnrollmentTicket: mfa.ticket,
+        methods: ["totp"],
+        code: "mfa_enrollment_required",
+      });
+    }
     const token = await switchTenantSession(
       db,
       config.secret,
@@ -279,10 +354,6 @@ export function registerSaasRoutes(
       body.tenantId,
     );
     if (!token) return c.json({ error: "Not a member of this tenant" }, 403);
-    const tenantsTable = schema.tenants as { id: unknown };
-    const tenant = await db.query.tenants.findFirst({
-      where: eq(tenantsTable.id as never, body.tenantId),
-    });
     return c.json({
       session: token,
       tenant: tenant
@@ -467,6 +538,27 @@ export function registerSaasRoutes(
         password: body.password,
         name: body.name,
       });
+      const mfa = await evaluateMfa(
+        result,
+        Boolean(session?.userId && session.userId !== "api-key"),
+      );
+      if (mfa?.action === "enroll") {
+        return c.json({
+          mfaEnrollmentRequired: true,
+          mfaEnrollmentTicket: mfa.ticket,
+          methods: ["totp"],
+          code: "mfa_enrollment_required",
+        });
+      }
+      if (mfa?.action === "challenge") {
+        return c.json({
+          mfaRequired: true,
+          mfaTicket: mfa.ticket,
+          methods: mfa.methods,
+          user: result.user,
+          tenant: result.tenant,
+        });
+      }
       const token = await sessionFromLogin(config.secret, result);
       await appendAudit?.(result.tenant.id, "member.invite_accept", {
         actorId: result.user.id,

@@ -195,12 +195,58 @@ export class Mem0Client {
       headers: headers(this.cfg),
       signal: AbortSignal.timeout(15000),
     });
-    if (!res.ok) {
+    if (!res.ok && res.status !== 404) {
       const data = await readJson(res);
       throw new Error(
         `mem0 delete failed HTTP ${res.status}: ${JSON.stringify(data).slice(0, 400)}`,
       );
     }
+  }
+
+  /** Idempotently remove every external record owned by one Zakura agent. */
+  async purgeAgent(opts: { agentId: string; userId?: string }): Promise<number> {
+    // mem0 supports deleting by agent filter. Deliberately omit user_id here:
+    // tools may have written memories for caller-supplied users, and tenant
+    // deletion must remove all of them rather than only defaultUserId.
+    const base = root(this.cfg);
+    const bulk = await fetch(
+      `${base}/v1/memories/?${new URLSearchParams({ agent_id: opts.agentId })}`,
+      {
+        method: "DELETE",
+        headers: headers(this.cfg),
+        signal: AbortSignal.timeout(30_000),
+      },
+    );
+    if (bulk.ok) return 0;
+    if (bulk.status !== 404 && bulk.status !== 405) {
+      const data = await readJson(bulk);
+      throw new Error(
+        `mem0 agent purge failed HTTP ${bulk.status}: ${JSON.stringify(data).slice(0, 400)}`,
+      );
+    }
+
+    // Older deployments may not implement filter deletion. Fall back to the
+    // configured user namespace so cleanup remains useful and retryable.
+    let removed = 0;
+    for (let pass = 0; pass < 100; pass += 1) {
+      const { memories } = await this.list({
+        agentId: opts.agentId,
+        userId: opts.userId,
+        limit: 500,
+      });
+      const ids = [...new Set(
+        memories
+          .map((memory) => (typeof memory.id === "string" ? memory.id.trim() : ""))
+          .filter(Boolean),
+      )];
+      if (!ids.length) return removed;
+      for (const id of ids) {
+        await this.delete(id);
+        removed += 1;
+      }
+      if (memories.length < 500) return removed;
+    }
+    throw new Error(`mem0 purge did not converge for agent ${opts.agentId}`);
   }
 }
 

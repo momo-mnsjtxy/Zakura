@@ -1,5 +1,10 @@
 import type { Hono } from "hono";
-import { PathJailError, scrubHostPathsInMessage, type WorkspaceFs } from "@zakura/core";
+import {
+  PathJailError,
+  recordPlatformFault,
+  scrubHostPathsInMessage,
+  type WorkspaceFs,
+} from "@zakura/core";
 import {
   AGENT_PROJECTS_DIR,
   isSafeGitRemoteUrl,
@@ -10,6 +15,7 @@ import {
   projectWorkspacePath,
 } from "@zakura/shared";
 import type { Db } from "../db/client.js";
+import { newId } from "../db/schema.js";
 import {
   deleteSpaceProjectRow,
   getSpaceProject,
@@ -515,6 +521,12 @@ export function registerAgentFsRoutes(
     if (!isValidProjectSlug(nextSlug)) return c.json({ error: "无效的项目名" }, 400);
     const displayName =
       (typeof body.name === "string" ? body.name : existing.name).trim() || nextSlug;
+    if (nextSlug !== from && await getSpaceProject(db, agent.spaceId, nextSlug)) {
+      return c.json({ error: "目标项目已存在" }, 409);
+    }
+
+    let movedFs: WorkspaceFs | null = null;
+    let createdFs: WorkspaceFs | null = null;
 
     if (existing.hasWorkspace && nextSlug !== from) {
       const resolved = await resolveAgentFs(
@@ -527,16 +539,7 @@ export function registerAgentFsRoutes(
       if (resolved.denied) return c.json({ error: "Filesystem not enabled for this agent" }, 403);
       try {
         await renameProject(resolved.fs, from, nextSlug);
-        platformEvents.publish(resolved.agent.tenantId, {
-          type: "agent_fs_changed",
-          agentId: resolved.agent.id,
-          path: `/${projectRelativePath(from)}`,
-        });
-        platformEvents.publish(resolved.agent.tenantId, {
-          type: "agent_fs_changed",
-          agentId: resolved.agent.id,
-          path: `/${projectRelativePath(nextSlug)}`,
-        });
+        movedFs = resolved.fs;
       } catch (err) {
         if (err instanceof ProjectFsError) return c.json({ error: err.message }, err.status);
         const e = fsError(err, resolved.fs);
@@ -561,11 +564,7 @@ export function registerAgentFsRoutes(
         }
         if (!(await resolved.fs.exists(rel))) {
           await resolved.fs.mkdir(rel);
-          platformEvents.publish(resolved.agent.tenantId, {
-            type: "agent_fs_changed",
-            agentId: resolved.agent.id,
-            path: `/${rel}`,
-          });
+          createdFs = resolved.fs;
         }
       } catch (err) {
         const e = fsError(err, resolved.fs);
@@ -573,37 +572,74 @@ export function registerAgentFsRoutes(
       }
     }
 
-    let row = existing;
-    if (nextSlug !== from) {
-      const renamed = await renameSpaceProjectRow(db, agent.spaceId, from, nextSlug);
-      if (!renamed) return c.json({ error: "无法重命名项目" }, 409);
-      await rebindSpaceProjectRefs(db, {
-        tenantId: agent.tenantId,
-        spaceId: agent.spaceId,
-        from,
-        to: nextSlug,
+    const memberAgentIds = nextSlug !== from && fileShares
+      ? (await agentService.list(agent.tenantId, { spaceId: agent.spaceId })).map((member) => member.id)
+      : [];
+    let row: Awaited<ReturnType<typeof upsertSpaceProject>>;
+    try {
+      row = await db.transaction(async (transaction) => {
+        const tx = transaction as unknown as Db;
+        let current = existing;
+        if (nextSlug !== from) {
+          const renamed = await renameSpaceProjectRow(tx, agent.spaceId, from, nextSlug);
+          if (!renamed) throw new Error("无法重命名项目");
+          await rebindSpaceProjectRefs(tx, {
+            tenantId: agent.tenantId,
+            spaceId: agent.spaceId,
+            from,
+            to: nextSlug,
+          });
+          if (fileShares) {
+            await fileShares.rebaseActivePaths(
+              agent.tenantId,
+              memberAgentIds,
+              projectRelativePath(from),
+              projectRelativePath(nextSlug),
+              tx,
+            );
+          }
+          current = renamed;
+        }
+        return upsertSpaceProject(tx, {
+          tenantId: agent.tenantId,
+          spaceId: agent.spaceId,
+          slug: nextSlug,
+          name: displayName,
+          description: body.description ?? current.description,
+          instructions: body.instructions ?? current.instructions,
+          hasWorkspace: body.withWorkspace ? true : current.hasWorkspace,
+        });
       });
-      if (fileShares) {
-        const agentIds = (await agentService.list(agent.tenantId, { spaceId: agent.spaceId }))
-          .map((member) => member.id);
-        await fileShares.rebaseActivePaths(
-          agent.tenantId,
-          agentIds,
-          projectRelativePath(from),
-          projectRelativePath(nextSlug),
+    } catch (error) {
+      try {
+        if (movedFs) await renameProject(movedFs, nextSlug, from);
+        else if (createdFs) await deleteProject(createdFs, nextSlug);
+      } catch (rollbackError) {
+        recordPlatformFault("agent_project.rename_rollback", rollbackError, {
+          subsystem: "agent_project",
+        });
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)}; ` +
+          `工作区回滚失败: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
         );
       }
-      row = renamed;
+      throw error;
     }
-    row = await upsertSpaceProject(db, {
-      tenantId: agent.tenantId,
-      spaceId: agent.spaceId,
-      slug: nextSlug,
-      name: displayName,
-      description: body.description ?? row.description,
-      instructions: body.instructions ?? row.instructions,
-      hasWorkspace: body.withWorkspace ? true : row.hasWorkspace,
-    });
+    if (movedFs) {
+      for (const path of [projectRelativePath(from), projectRelativePath(nextSlug)]) {
+        platformEvents.publish(agent.tenantId, {
+          type: "agent_fs_changed",
+          agentId: agent.id,
+          path: `/${path}`,
+        });
+      }
+    } else if (createdFs) {
+      platformEvents.publish(agent.tenantId, {
+        type: "agent_fs_changed",
+        agentId: agent.id,
+        path: `/${projectRelativePath(nextSlug)}`,
+      });
+    }
     return c.json({ project: toProjectDto(row) });
   });
 
@@ -615,7 +651,12 @@ export function registerAgentFsRoutes(
     if (!agent) return c.json({ error: "Not found" }, 404);
     const existing = await getSpaceProject(db, agent.spaceId, slug);
     if (!existing) return c.json({ error: "项目不存在" }, 404);
+    const memberAgentIds = fileShares
+      ? (await agentService.list(agent.tenantId, { spaceId: agent.spaceId })).map((member) => member.id)
+      : [];
     let deletedDir = false;
+    let stagedFs: WorkspaceFs | null = null;
+    let stagedSlug: string | null = null;
     if (existing.hasWorkspace) {
       const resolved = await resolveAgentFs(
         agentService,
@@ -628,13 +669,10 @@ export function registerAgentFsRoutes(
         return c.json({ error: "Filesystem not enabled for this agent" }, 403);
       }
       try {
-        deletedDir = await deleteProject(resolved.fs, slug);
-        if (deletedDir) {
-          platformEvents.publish(resolved.agent.tenantId, {
-            type: "agent_fs_changed",
-            agentId: resolved.agent.id,
-            path: `/${projectRelativePath(slug)}`,
-          });
+        if (await resolved.fs.exists(projectRelativePath(slug))) {
+          stagedSlug = `deleted-${newId().replace(/[^a-z0-9]/gi, "").slice(0, 16)}`;
+          await renameProject(resolved.fs, slug, stagedSlug);
+          stagedFs = resolved.fs;
         }
       } catch (err) {
         if (err instanceof ProjectFsError) return c.json({ error: err.message }, err.status);
@@ -642,21 +680,56 @@ export function registerAgentFsRoutes(
         return c.json(e.body, e.status);
       }
     }
-    await deleteSpaceProjectRow(db, agent.spaceId, slug);
-    await rebindSpaceProjectRefs(db, {
-      tenantId: agent.tenantId,
-      spaceId: agent.spaceId,
-      from: slug,
-      to: null,
-    });
-    if (fileShares) {
-      const agentIds = (await agentService.list(agent.tenantId, { spaceId: agent.spaceId }))
-        .map((member) => member.id);
-      await fileShares.revokeActivePaths(
-        agent.tenantId,
-        agentIds,
-        projectRelativePath(slug),
-      );
+    try {
+      await db.transaction(async (transaction) => {
+        const tx = transaction as unknown as Db;
+        if (!await deleteSpaceProjectRow(tx, agent.spaceId, slug)) {
+          throw new Error("项目不存在");
+        }
+        await rebindSpaceProjectRefs(tx, {
+          tenantId: agent.tenantId,
+          spaceId: agent.spaceId,
+          from: slug,
+          to: null,
+        });
+        if (fileShares) {
+          await fileShares.revokeActivePaths(
+            agent.tenantId,
+            memberAgentIds,
+            projectRelativePath(slug),
+            tx,
+          );
+        }
+      });
+    } catch (error) {
+      if (stagedFs && stagedSlug) {
+        try {
+          await renameProject(stagedFs, stagedSlug, slug);
+        } catch (rollbackError) {
+          recordPlatformFault("agent_project.delete_rollback", rollbackError, {
+            subsystem: "agent_project",
+          });
+          throw new Error(
+            `${error instanceof Error ? error.message : String(error)}; ` +
+            `工作区回滚失败: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+          );
+        }
+      }
+      throw error;
+    }
+    if (stagedFs && stagedSlug) {
+      try {
+        deletedDir = await deleteProject(stagedFs, stagedSlug);
+      } catch (error) {
+        recordPlatformFault("agent_project.delete_staged", error, {
+          subsystem: "agent_project",
+        });
+      }
+      platformEvents.publish(agent.tenantId, {
+        type: "agent_fs_changed",
+        agentId: agent.id,
+        path: `/${projectRelativePath(slug)}`,
+      });
     }
     return c.json({ ok: true, deleted: true, deletedDir });
   });

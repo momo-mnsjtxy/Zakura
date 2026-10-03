@@ -16,7 +16,7 @@ import {
   type User,
 } from "../db/schema.js";
 import { REDIS_KEYS } from "./redis.js";
-import { redisDel, redisGetJson, redisSetJson, REDIS_TTL } from "./redis-store.js";
+import { redisDel } from "./redis-store.js";
 import { recordUserUsage } from "./user-usage.js";
 
 export interface SessionPayload {
@@ -250,26 +250,8 @@ export async function authenticateApiKey(
 ): Promise<{ apiKey: ApiKey; tenant: Tenant } | null> {
   const keyHash = hashApiKey(rawKey);
 
-  // Redis 短缓存（跨实例）；进程内再挡一层
-  const mem = apiKeyAuthCache.get(keyHash);
-  if (mem && mem.expiresAt > Date.now()) {
-    touchApiKeyLastUsed(db, mem.apiKey.id);
-    return { apiKey: mem.apiKey, tenant: mem.tenant };
-  }
-
-  const fromRedis = await redisGetJson<{ apiKey: ApiKey; tenant: Tenant }>(
-    REDIS_KEYS.auth(keyHash),
-  );
-  if (fromRedis?.apiKey?.id && fromRedis?.tenant?.id) {
-    apiKeyAuthCache.set(keyHash, {
-      apiKey: fromRedis.apiKey,
-      tenant: fromRedis.tenant,
-      expiresAt: Date.now() + API_KEY_AUTH_TTL_MS,
-    });
-    touchApiKeyLastUsed(db, fromRedis.apiKey.id);
-    return { apiKey: fromRedis.apiKey, tenant: fromRedis.tenant };
-  }
-
+  // Credential revocation is security-critical. An authoritative lookup avoids
+  // a delete-vs-cache-fill race and guarantees every replica observes the commit.
   const apiKey = await db.query.apiKeys.findFirst({
     where: eq(apiKeys.keyHash, keyHash),
   });
@@ -281,28 +263,16 @@ export async function authenticateApiKey(
   });
   if (!tenant) return null;
 
-  apiKeyAuthCache.set(keyHash, {
-    apiKey,
-    tenant,
-    expiresAt: Date.now() + API_KEY_AUTH_TTL_MS,
-  });
-  void redisSetJson(REDIS_KEYS.auth(keyHash), { apiKey, tenant }, REDIS_TTL.auth);
   touchApiKeyLastUsed(db, apiKey.id);
   return { apiKey, tenant };
 }
 
-const API_KEY_AUTH_TTL_MS = 30_000;
-const apiKeyAuthCache = new Map<
-  string,
-  { apiKey: ApiKey; tenant: Tenant; expiresAt: number }
->();
 const lastUsedThrottle = new Map<string, number>();
 
 /** Remove durable API-key auth cache entries after key or tenant deletion. */
 export async function invalidateApiKeyAuthHashes(keyHashes: readonly string[]): Promise<void> {
   const unique = [...new Set(keyHashes.filter(Boolean))];
   if (!unique.length) return;
-  for (const keyHash of unique) apiKeyAuthCache.delete(keyHash);
   await redisDel(...unique.map((keyHash) => REDIS_KEYS.auth(keyHash)));
 }
 
