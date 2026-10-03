@@ -34,7 +34,7 @@ The exact HTTP inventory is in `ROUTE_ACCEPTANCE.md`; the capability-level matri
 - Deterministic local fake upstreams/control planes for model providers, connectors, IdPs/JWKS, MCP, email, DNS, Headscale/Tailscale/Cloudflare, Google provisioning, runner/Docker boundaries and external memory
 - Hosted Playwright flows for login, authenticated dashboard, MFA enrollment retry, generic OAuth MFA, tenant-switch enrollment, desktop operational pages and mobile access-governance recovery
 
-Final immutable head and workflow URL are recorded after the terminal run below.
+The latest implementation head, terminal validation run and hosted artifact digest are recorded below.
 
 ## Visual artifacts
 
@@ -80,6 +80,8 @@ These are credential/infrastructure gates, not unimplemented product branches.
 
 ## Final result
 
-- Final head: pending
-- GitHub Actions: pending
+- Validated implementation head: `732bcf661145ae51b8a2906f326895c0bd525572`
+- GitHub Actions: https://github.com/momo-mnsjtxy/Zakura/actions/runs/37131260036
+- Terminal jobs: `node`, `go-agent` and `browser-e2e` completed successfully
+- Browser artifact: `browser-e2e-screenshots`, 545 KB, SHA-256 `2460b107a495ada04487bbfef2d1d4520f6a9bdc4eb3e0a5ac8adf6d455a32e0`
 - Branch publication only; no merge/deploy
