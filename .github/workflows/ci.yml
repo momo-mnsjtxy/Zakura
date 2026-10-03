@@ -59,7 +59,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @zakura/shared build
       - run: pnpm --filter @zakura/web build
-      - run: pnpm dlx playwright@1.58.2 install --with-deps chromium
+      - run: pnpm dlx @playwright/test@1.58.2 install --with-deps chromium
       - name: Start local fixture and web app
         run: |
           node integration-tests/fake-api.mjs > /tmp/zakura-fake-api.log 2>&1 &
@@ -70,4 +70,4 @@ jobs:
           done
           cat /tmp/zakura-fake-api.log /tmp/zakura-web.log
           exit 1
-      - run: pnpm dlx playwright@1.58.2 test integration-tests/browser.spec.mjs --workers=1 --reporter=line
+      - run: pnpm dlx @playwright/test@1.58.2 test integration-tests/browser.spec.mjs --workers=1 --reporter=line

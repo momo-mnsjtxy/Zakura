@@ -49,3 +49,39 @@ export function prependUniqueHistory(older, current) {
   const seen = new Set(current.map((event) => event.seq));
   return [...older.filter((event) => !seen.has(event.seq)), ...current];
 }
+
+/** Tracks one in-flight action and guarantees release after failures/cancellation. */
+export function createActionController() {
+  let pending = false;
+  return {
+    begin() {
+      if (pending) return false;
+      pending = true;
+      return true;
+    },
+    finish() {
+      pending = false;
+    },
+    get pending() {
+      return pending;
+    },
+  };
+}
+
+export function nextHistoryState({ current, incoming, serverHasMore, beforeSeq }) {
+  const events = prependUniqueHistory(incoming, current);
+  const changed = events.length !== current.length;
+  return {
+    events: changed ? events : current,
+    hasMore: changed && Boolean(serverHasMore),
+    oldestSeq: events[0]?.seq ?? beforeSeq,
+  };
+}
+
+export function realtimeTransition(state, event) {
+  if (event === "ready" || event === "event") return { status: "online", error: null };
+  if (event && typeof event === "object" && event.type === "error") {
+    return { status: "offline", error: event.message };
+  }
+  return state;
+}

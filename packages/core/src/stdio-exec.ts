@@ -3,6 +3,7 @@
  * stdout/stderr 走 Docker multiplex；stdin 可写。
  */
 import { DockerMuxBinaryParser } from "./docker-mux.js";
+import { ProcessLifecycle } from "./process-lifecycle.js";
 
 export type StdioInspect = () => Promise<{ ExitCode?: number | null; Running?: boolean; Pid?: number }>;
 
@@ -32,6 +33,7 @@ export class StdioExec {
   private readonly exitWaiters: Array<(code: number | null) => void> = [];
   private readonly stderrListeners = new Set<(chunk: string) => void>();
   private wroteFirst = false;
+  private readonly lifecycle: ProcessLifecycle;
 
   constructor(
     readonly stream: NodeJS.ReadWriteStream,
@@ -39,6 +41,14 @@ export class StdioExec {
     id?: string,
   ) {
     this.id = id ?? `stdio_${Math.random().toString(36).slice(2, 12)}`;
+    this.lifecycle = new ProcessLifecycle(async () => {
+      try {
+        const info = await this.opts.inspect();
+        if (info.Pid && this.opts.killPid) await this.opts.killPid(info.Pid);
+      } catch { /* process already gone */ }
+      try { this.stream.end(); } catch { /* stream already closed */ }
+      await this.markExit();
+    });
     stream.on("data", (buf: Buffer) => {
       const { stdout, stderr } = this.mux.push(Buffer.from(buf));
       for (const chunk of stdout) this.pushStdout(chunk);
@@ -68,19 +78,8 @@ export class StdioExec {
     this.stream.write(buf);
   }
 
-  async kill(): Promise<void> {
-    try {
-      const info = await this.opts.inspect();
-      if (info.Pid && this.opts.killPid) await this.opts.killPid(info.Pid);
-    } catch {
-      /* gone */
-    }
-    try {
-      this.stream.end();
-    } catch {
-      /* ignore */
-    }
-    await this.markExit();
+  kill(): Promise<void> {
+    return this.lifecycle.close("kill");
   }
 
   wait(): Promise<number | null> {
@@ -98,6 +97,8 @@ export class StdioExec {
         write(chunk) {
           exec.write(chunk);
         },
+        close() { return exec.kill(); },
+        abort() { return exec.kill(); },
       }),
       readable: new ReadableStream<Uint8Array>({
         pull(controller) {
@@ -134,6 +135,7 @@ export class StdioExec {
   private async markExit() {
     if (this.exited) return;
     this.exited = true;
+    this.lifecycle.finish();
     try {
       const info = await this.opts.inspect();
       this.exitCode = info.ExitCode ?? 0;

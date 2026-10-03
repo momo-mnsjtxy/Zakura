@@ -89,3 +89,47 @@ describe("StdioExec non-TTY demux", () => {
     stream.end();
   });
 });
+
+describe("StdioExec lifecycle", () => {
+  it("coalesces concurrent kills and invokes process cleanup once", async () => {
+    const stream = new PassThrough();
+    let inspections = 0;
+    let kills = 0;
+    const exec = new StdioExec(stream as unknown as NodeJS.ReadWriteStream, {
+      inspect: async () => { inspections++; return { ExitCode: null, Running: true, Pid: 42 }; },
+      killPid: async (pid) => { assert.equal(pid, 42); kills++; },
+    });
+    const one = exec.kill();
+    const two = exec.kill();
+    assert.equal(one, two);
+    await Promise.all([one, two]);
+    assert.equal(kills, 1);
+    // One inspection chooses the PID; markExit performs one final status read.
+    assert.equal(inspections, 2);
+  });
+
+  it("writable abort propagates process cleanup", async () => {
+    const stream = new PassThrough();
+    let kills = 0;
+    const exec = new StdioExec(stream as unknown as NodeJS.ReadWriteStream, {
+      inspect: async () => ({ ExitCode: null, Running: true, Pid: 7 }),
+      killPid: async () => { kills++; },
+    });
+    await exec.toWebStreams().writable.abort(new Error("cancelled"));
+    assert.equal(kills, 1);
+    assert.equal(await exec.wait(), 0);
+  });
+
+  it("natural exit makes later kill a no-op", async () => {
+    const stream = new PassThrough();
+    let kills = 0;
+    const exec = new StdioExec(stream as unknown as NodeJS.ReadWriteStream, {
+      inspect: async () => ({ ExitCode: 0, Running: false, Pid: 8 }),
+      killPid: async () => { kills++; },
+    });
+    stream.end();
+    assert.equal(await exec.wait(), 0);
+    await exec.kill();
+    assert.equal(kills, 0);
+  });
+});

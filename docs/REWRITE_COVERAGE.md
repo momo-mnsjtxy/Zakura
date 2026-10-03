@@ -34,7 +34,7 @@ Generated build output is excluded. These counts prevent a carried-over compatib
 | `apps/server` | 515 | 8 | 13 | 0 |
 | `packages/saas` | 13 | 0 | 3 | 0 |
 | `apps/web` | 283 | 15 | 25 | 0 |
-| `packages/core` | 39 | 4 | 8 | 0 |
+| `packages/core` | 38 | 5 | 10 | 0 |
 | `go` | 43 | 3 | 3 | 0 |
 | `apps/oauth-bridge` | 1 | 3 | 8 | 0 |
 | `mcps` | 128 | 0 | 0 | 0 |

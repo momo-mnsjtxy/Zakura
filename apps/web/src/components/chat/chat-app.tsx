@@ -133,8 +133,10 @@ import { useTenantPresence } from "@/lib/sync/presence";
 import { useSessionDoc } from "@/lib/sync/session-doc";
 import {
   createLatestRequestGate,
+  createActionController,
   mergeOrderedEvent,
-  prependUniqueHistory,
+  nextHistoryState,
+  realtimeTransition,
 } from "@/lib/chat-state";
 import { buildProjectCreateInput, removeProjectFromChatState } from "@/lib/chat-project-state";
 import { buildChatSettingsPatch } from "@/lib/chat-settings-state";
@@ -289,6 +291,8 @@ export function ChatApp() {
   >(null);
   /** 实时事件流断开（正在自动重连）；收到任何事件即恢复 */
   const [realtimeOffline, setRealtimeOffline] = useState(false);
+  const realtimeStateRef = useRef({ status: "online", error: null as string | null });
+  const cancelControllerRef = useRef(createActionController());
   const defaultRuntimeRef = useRef(ZAKURA_RUNTIME_ID);
   const [acpRuntime, setAcpRuntime] = useState<{
     state?: AcpRuntimeState;
@@ -656,6 +660,7 @@ export function ChatApp() {
 
   const mergeEvent = useCallback(
     (ev: CloudAgentEvent) => {
+      realtimeStateRef.current = realtimeTransition(realtimeStateRef.current, "event");
       setRealtimeOffline(false);
       setEvents((prev) => mergeOrderedEvent(prev, ev) as CloudAgentEvent[]);
       if (ev.seq > seqRef.current) seqRef.current = ev.seq;
@@ -947,14 +952,16 @@ export function ChatApp() {
       setHasMoreHistory(hasMore);
       if (res.events.length === 0) return;
       setEvents((prev) => {
-        const merged = prependUniqueHistory(res.events, prev) as CloudAgentEvent[];
-        if (merged.length === prev.length) {
-          hasMoreHistoryRef.current = false;
-          setHasMoreHistory(false);
-          return prev;
-        }
-        oldestSeqRef.current = merged[0]?.seq ?? beforeSeq;
-        return merged;
+        const next = nextHistoryState({
+          current: prev,
+          incoming: res.events,
+          serverHasMore: res.hasMore,
+          beforeSeq,
+        });
+        hasMoreHistoryRef.current = next.hasMore;
+        setHasMoreHistory(next.hasMore);
+        oldestSeqRef.current = next.oldestSeq;
+        return next.events as CloudAgentEvent[];
       });
       requestAnimationFrame(() => {
         if (!scrollEl) return;
@@ -1221,8 +1228,13 @@ export function ChatApp() {
     if (!sessionId || !agentId) return;
     return subscribeCloudEvents(agentId, sessionId, seqRef.current, {
       onEvent: mergeEvent,
+      onReady: () => {
+        realtimeStateRef.current = realtimeTransition(realtimeStateRef.current, "ready");
+        setRealtimeOffline(false);
+      },
       onError: (msg) => {
         console.warn("[chat realtime]", msg);
+        realtimeStateRef.current = realtimeTransition(realtimeStateRef.current, { type: "error", message: msg });
         setRealtimeOffline(true);
       },
     });
@@ -2182,11 +2194,13 @@ export function ChatApp() {
   }
 
   async function handleCancel() {
-    if (!agentId || !sessionId) return;
+    if (!agentId || !sessionId || !cancelControllerRef.current.begin()) return;
     try {
       await cancelCloudRun(agentId, sessionId);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
+    } finally {
+      cancelControllerRef.current.finish();
     }
   }
 

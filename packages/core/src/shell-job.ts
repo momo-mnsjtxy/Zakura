@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { PtyFolder } from "@zakura/shared";
 import { DockerMuxParser } from "./docker-mux.js";
+import { ProcessLifecycle } from "./process-lifecycle.js";
 
 const OUTPUT_CAP = 256_000;
 const TRUNC_MARK = "\n…(truncated)\n";
@@ -47,10 +48,16 @@ export class ShellJob {
   private finished = false;
   private terminalOutput = "";
   private terminalOffset = 0;
+  private readonly lifecycle: ProcessLifecycle;
 
   constructor(opts: { id?: string; agentId: string }) {
     this.id = opts.id ?? newShellJobId();
     this.agentId = opts.agentId;
+    this.lifecycle = new ProcessLifecycle(async (reason) => {
+      if (reason === "timeout") this.markTimedOut();
+      try { await this.killFn?.(); } catch { /* process may already be gone */ }
+      if (this.running) this.finish(reason === "timeout" ? 124 : 130, reason === "timeout");
+    });
   }
 
   snapshot(): ShellJobSnapshot {
@@ -87,6 +94,7 @@ export class ShellJob {
     if (this.finished) return;
     this.finished = true;
     this.running = false;
+    this.lifecycle.finish();
     this.exitCode = exitCode;
     if (timedOut) this.timedOut = true;
     if (this.emitTimer) {
@@ -123,14 +131,16 @@ export class ShellJob {
     this.writeFn?.(data);
   }
 
-  async kill(): Promise<void> {
-    this.markTimedOut();
-    try {
-      await this.killFn?.();
-    } catch {
-      /* stream may already be gone */
-    }
-    if (this.running) this.finish(124, true);
+  kill(): Promise<void> {
+    return this.lifecycle.close("timeout");
+  }
+
+  cancel(signal: AbortSignal): () => void {
+    return this.lifecycle.bindAbort(signal);
+  }
+
+  armTimeout(timeoutMs: number): () => void {
+    return this.lifecycle.armTimeout(timeoutMs);
   }
 
   /**

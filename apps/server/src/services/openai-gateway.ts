@@ -845,7 +845,7 @@ export class OpenAiGatewayService {
     // be intentionally absent during bootstrap or in hermetic API tests.
     return Promise.race([
       read(agentId, key).catch(() => null),
-      new Promise<null>((resolve) => setTimeout(resolve, 250)),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 250)),
     ]);
   }
 
