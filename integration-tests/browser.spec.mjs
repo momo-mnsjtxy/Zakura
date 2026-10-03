@@ -46,3 +46,36 @@ test("fixture user authenticates and reaches the agent dashboard", async ({ page
   await expect(page.getByText("还没有 Agent")).toBeVisible();
   await page.screenshot({ path: "artifacts/e2e/agent-dashboard.png", fullPage: true });
 });
+
+test("restricted MFA enrollment retries setup and stores session only after recovery acknowledgement", async ({ page }) => {
+  const pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error));
+  await page.route(/\/api\/(?:agents|spaces)(?:\?.*)?$/, (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: "[]" }),
+  );
+
+  await page.goto("http://127.0.0.1:3001/login");
+  await page.getByLabel("邮箱").fill("enroll@example.test");
+  await page.getByRole("button", { name: "使用邮箱继续" }).click();
+  await page.locator("input#password").fill("fixture-password");
+  await page.getByRole("button", { name: "登录", exact: true }).click();
+
+  await expect(page.getByRole("heading", { name: "保护你的账号" })).toBeVisible();
+  await expect(page.getByText("Authenticator setup temporarily unavailable")).toBeVisible();
+  await expect.poll(() => page.evaluate(() => localStorage.getItem("zakura_session"))).toBeNull();
+  await page.getByRole("button", { name: "重试" }).click();
+  await expect(page.getByRole("img", { name: "MFA 二维码" })).toBeVisible();
+  await expect(page.getByText("JBSWY3DPEHPK3PXP")).toBeVisible();
+  await page.getByLabel("验证码").fill("123456");
+  await page.getByRole("button", { name: "启用并继续" }).click();
+
+  await expect(page.getByText("RECOVERY-ONE")).toBeVisible();
+  await expect(page.getByText("RECOVERY-TWO")).toBeVisible();
+  await expect.poll(() => page.evaluate(() => localStorage.getItem("zakura_session"))).toBeNull();
+  await page.getByRole("button", { name: "我已保存，继续" }).click();
+  await expect(page).toHaveURL(/\/dashboard\/agents/);
+  await expect.poll(() => page.evaluate(() => localStorage.getItem("zakura_session"))).toBe("fixture-enrollment-session");
+  await expect(page.getByText("页面出错了")).toHaveCount(0);
+  expect(pageErrors, pageErrors.map((error) => error.stack ?? error.message).join("\n")).toEqual([]);
+  await page.screenshot({ path: "artifacts/e2e/mfa-enrollment-dashboard.png", fullPage: true });
+});
