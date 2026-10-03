@@ -1,8 +1,8 @@
 import type { Hono } from "hono";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import type { AppConfig } from "../config.js";
 import type { Db } from "../db/client.js";
-import { tenants, users } from "../db/schema.js";
+import { tenantMemberships, tenants, users } from "../db/schema.js";
 import {
   createUserSession,
   isSessionAdmin,
@@ -276,9 +276,25 @@ export function registerIdentityRoutes(
         webauthn?: Parameters<typeof finishWebauthnLogin>[4];
       }>()
       .catch(() => ({}) as never);
+    const pending = body.ticket ? await peekAuthToken(db, "mfa_login", body.ticket) : null;
+    if (!pending?.userId) return c.json({ error: "登录已过期，请重新登录" }, 400);
+    const userId = pending.userId;
+    const tenantId = String(pending.meta.tenantId ?? "");
+    const role = String(pending.meta.role ?? "member");
+    const user = await db.query.users.findFirst({ where: eq(users.id, userId) });
+    const tenant = await db.query.tenants.findFirst({ where: eq(tenants.id, tenantId) });
+    if (!user || !tenant) return c.json({ error: "账号不存在" }, 400);
+    if (user.suspendedAt) return c.json({ error: "账号已被封禁", code: "account_suspended" }, 403);
+    if (tenant.suspendedAt) return c.json({ error: "所在团队已被封禁", code: "account_suspended" }, 403);
+    const membership = await db.query.tenantMemberships.findFirst({
+      where: and(eq(tenantMemberships.userId, user.id), eq(tenantMemberships.tenantId, tenant.id)),
+    });
+    if (!membership || membership.status !== "active") return c.json({ error: "账号不存在" }, 400);
+
+    // Claim the login ticket only after principal checks. Concurrent completions race
+    // on the conditional UPDATE in CredentialLifecycleService; exactly one proceeds.
     const consumed = body.ticket ? await consumeAuthToken(db, "mfa_login", body.ticket) : null;
     if (!consumed?.userId) return c.json({ error: "登录已过期，请重新登录" }, 400);
-    const userId = consumed.userId;
     let ok = false;
     if (body.totp) ok = await verifyUserTotp(db, config.secret, userId, body.totp);
     else if (body.recoveryCode) ok = await consumeRecoveryCode(db, userId, body.recoveryCode);
@@ -286,11 +302,6 @@ export function registerIdentityRoutes(
       ok = await finishWebauthnLogin(db, config.webPublicUrl, userId, `login:${body.ticket}`, body.webauthn);
     }
     if (!ok) return c.json({ error: "第二因素验证失败" }, 401);
-    const tenantId = String(consumed.meta.tenantId ?? "");
-    const role = String(consumed.meta.role ?? "member");
-    const user = await db.query.users.findFirst({ where: eq(users.id, userId) });
-    const tenant = await db.query.tenants.findFirst({ where: eq(tenants.id, tenantId) });
-    if (!user || !tenant) return c.json({ error: "账号不存在" }, 400);
     await touchLastLogin(db, user.id);
     const ip = clientIpFromHeaders((name) => c.req.header(name));
     const session = await createUserSession(

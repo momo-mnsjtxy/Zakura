@@ -15,6 +15,16 @@ test("decodes JSON API responses", async () => {
   assert.deepEqual(result, { ok: true });
 });
 
+test("preserves top-level array contracts used by dashboard lists", async () => {
+  const result = await decodeApiResponse(
+    new Response(JSON.stringify([{ id: "agent-1" }]), {
+      headers: { "content-type": "application/json" },
+    }),
+  );
+  assert.deepEqual(result, [{ id: "agent-1" }]);
+  assert.equal(result.find((item) => item.id === "agent-1")?.id, "agent-1");
+});
+
 test("accepts successful empty responses", async () => {
   assert.deepEqual(await decodeApiResponse(new Response(null, { status: 204 })), {});
 });

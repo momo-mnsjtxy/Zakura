@@ -55,6 +55,7 @@ export default function LoginPage() {
   const [platformReady, setPlatformReady] = useState(false);
   const passkeyTried = useRef(false);
   const emailAction = useRef(createActionLock());
+  const credentialAction = useRef(createActionLock());
 
   useEffect(() => {
     const intent = readLoginIntent(window.location.search);
@@ -155,6 +156,7 @@ export default function LoginPage() {
   }
 
   async function submitPassword() {
+    if (!credentialAction.current.acquire()) return;
     setLoading(true);
     try {
       const res = await api<{ session?: string; mfaRequired?: boolean; mfaTicket?: string; methods?: string[] }>(
@@ -170,6 +172,7 @@ export default function LoginPage() {
         passkeyTried.current = false;
         go("mfa");
         setLoading(false);
+        credentialAction.current.release();
         return;
       }
       if (!res.session) throw new Error("登录失败");
@@ -181,10 +184,12 @@ export default function LoginPage() {
           : err instanceof Error ? err.message : String(err);
       toast.error(message);
       setLoading(false);
+      credentialAction.current.release();
     }
   }
 
   async function submitRegister() {
+    if (!credentialAction.current.acquire()) return;
     setLoading(true);
     try {
       const res = await api<{ session: string; next?: string }>("/api/auth/register", {
@@ -202,10 +207,12 @@ export default function LoginPage() {
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
       setLoading(false);
+      credentialAction.current.release();
     }
   }
 
   async function completeMfa(extra: Record<string, unknown>) {
+    if (!credentialAction.current.acquire()) return;
     setLoading(true);
     try {
       const res = await api<{ session: string }>("/api/auth/mfa/complete", {
@@ -216,6 +223,7 @@ export default function LoginPage() {
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
       setLoading(false);
+      credentialAction.current.release();
     }
   }
 

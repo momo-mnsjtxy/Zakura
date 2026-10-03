@@ -72,3 +72,16 @@ export function loginReturnHref(email) {
   const normalized = email.trim();
   return normalized ? `/login?email=${encodeURIComponent(normalized)}` : "/login";
 }
+
+export function inviteState(info, meEmail, now = Date.now()) {
+  if (!info) return { status: "loading", canAccept: false };
+  if (new Date(info.expiresAt).getTime() <= now) return { status: "expired", canAccept: false };
+  if (meEmail && meEmail.toLowerCase() !== info.email.toLowerCase()) {
+    return { status: "mismatch", canAccept: false };
+  }
+  return { status: "ready", canAccept: true };
+}
+
+export function tokenState(token) {
+  return token?.trim() ? { valid: true, token: token.trim() } : { valid: false, token: "" };
+}

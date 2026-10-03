@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { Loader2 } from "lucide-react";
@@ -9,6 +9,8 @@ import { ThemeToggle } from "@/components/theme-toggle";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { createActionLock, inviteState } from "@/lib/auth-flow";
+import { createLatestRequestGate } from "@/lib/chat-state";
 
 type InviteInfo = {
   email: string;
@@ -27,24 +29,30 @@ export default function InviteAcceptPage() {
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
   const [meEmail, setMeEmail] = useState<string | null>(null);
+  const loadGate = useRef(createLatestRequestGate());
+  const acceptAction = useRef(createActionLock());
+  const state = useMemo(() => inviteState(info, meEmail), [info, meEmail]);
 
   useEffect(() => {
     void (async () => {
+      const requestId = loadGate.current.begin();
       try {
-        setInfo(await api<InviteInfo>(`/api/invites/${token}`));
+        const next = await api<InviteInfo>(`/api/invites/${token}`);
+        if (loadGate.current.isCurrent(requestId)) setInfo(next);
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
+        if (loadGate.current.isCurrent(requestId)) setError(err instanceof Error ? err.message : String(err));
       }
       try {
         const me = await api<{ user: { email: string } }>("/api/me");
-        setMeEmail(me.user.email);
+        if (loadGate.current.isCurrent(requestId)) setMeEmail(me.user.email);
       } catch {
-        setMeEmail(null);
+        if (loadGate.current.isCurrent(requestId)) setMeEmail(null);
       }
     })();
   }, [token]);
 
   async function accept() {
+    if (!state.canAccept || !acceptAction.current.acquire()) return;
     setBusy(true);
     try {
       const res = await api<{
@@ -65,6 +73,7 @@ export default function InviteAcceptPage() {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
+      acceptAction.current.release();
     }
   }
 
@@ -134,7 +143,7 @@ export default function InviteAcceptPage() {
 
             <Button
               className="w-full"
-              disabled={busy || (!!meEmail && meEmail.toLowerCase() !== info.email.toLowerCase())}
+              disabled={busy || !state.canAccept}
               onClick={() => void accept()}
             >
               {busy ? <Loader2 className="animate-spin" /> : null}

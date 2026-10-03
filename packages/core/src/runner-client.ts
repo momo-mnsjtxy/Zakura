@@ -19,6 +19,7 @@ import { openRunnerDuplex } from "./runner-stream.js";
 import { createRunnerWorkspaceFs } from "./runner-workspace-fs.js";
 import { archiveRunnerPaths, extractRunnerArchive, importRunnerArchive } from "./runner-archive.js";
 import { finalizeMigrationArchive, inspectMigrationArchive } from "./migration-archive.js";
+import { RunnerRequestLifecycle } from "./runner-request.js";
 
 export type HubRpc = {
   rpc<T = unknown>(method: string, params?: unknown, timeoutMs?: number): Promise<T>;
@@ -47,6 +48,7 @@ type DockerInfo = {
 export class RunnerClient {
   readonly baseUrl = "";
   private readonly hub: HubRpc;
+  private readonly requests: RunnerRequestLifecycle;
   readonly workspaceKind: "host" | "container";
 
   constructor(opts: RunnerClientOptions) {
@@ -54,11 +56,17 @@ export class RunnerClient {
       throw new Error("RunnerClient 需要 Hub 会话；旧 HTTP Runner 已移除，请重装 zakura-agent");
     }
     this.hub = opts.hub;
+    this.requests = new RunnerRequestLifecycle(opts.hub);
     this.workspaceKind = opts.workspaceKind === "host" ? "host" : "container";
   }
 
-  private rpc<T>(method: string, params?: unknown, timeoutMs?: number): Promise<T> {
-    return this.hub.rpc<T>(method, params, timeoutMs);
+  private rpc<T>(method: string, params?: unknown, timeoutMs?: number, signal?: AbortSignal): Promise<T> {
+    return this.requests.request<T>(method, params, { timeoutMs, signal });
+  }
+
+  /** Cancel pending unary calls and reject future calls. Safe to call repeatedly. */
+  close(): void {
+    this.requests.close();
   }
 
   async ping(): Promise<{

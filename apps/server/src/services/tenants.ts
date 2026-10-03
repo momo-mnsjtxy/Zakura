@@ -2,6 +2,7 @@ import { and, asc, eq, isNull } from "drizzle-orm";
 import bcrypt from "bcryptjs";
 import { createHash, randomBytes } from "node:crypto";
 import type { Db } from "../db/client.js";
+import { CredentialLifecycleService } from "./identity/credential-lifecycle.js";
 import {
   newId,
   tenantInvites,
@@ -424,12 +425,13 @@ export class TenantService {
 
     if (user.suspendedAt) throw new TenantAccessError("账号已被封禁", 403);
 
+    // Claim only after identity and suspension checks; the conditional update is the
+    // concurrency boundary, so exactly one redemption can create/activate membership.
+    if (!(await new CredentialLifecycleService(this.db).claimInvite(invite.id))) {
+      throw new TenantAccessError("Invite already used", 400);
+    }
     const existing = await this.getMembership(tenant.id, user.id);
     if (existing) {
-      await this.db
-        .update(tenantInvites)
-        .set({ acceptedAt: new Date() })
-        .where(eq(tenantInvites.id, invite.id));
       return { user, tenant, membership: existing };
     }
 
@@ -446,11 +448,6 @@ export class TenantService {
         updatedAt: now,
       })
       .returning();
-
-    await this.db
-      .update(tenantInvites)
-      .set({ acceptedAt: now })
-      .where(eq(tenantInvites.id, invite.id));
 
     return { user, tenant, membership };
   }

@@ -67,16 +67,19 @@ export async function requestEmailVerification(
   db: Db,
   webPublicUrl: string,
   user: { id: string; email: string; emailVerifiedAt: Date | null },
+  send: (to: string, url: string) => Promise<boolean> = sendVerifyEmail,
 ): Promise<boolean> {
   if (user.emailVerifiedAt) return true;
   const token = await issueAuthToken(db, { kind: "email_verify", userId: user.id });
   const verifyUrl = `${webPublicUrl}/verify-email?token=${encodeURIComponent(token)}`;
-  return sendVerifyEmail(user.email, verifyUrl);
+  return send(user.email, verifyUrl);
 }
 
 export async function confirmEmailVerification(db: Db, token: string): Promise<boolean> {
   const consumed = await consumeAuthToken(db, "email_verify", token);
   if (!consumed?.userId) return false;
+  const user = await db.query.users.findFirst({ where: eq(users.id, consumed.userId) });
+  if (!user || user.suspendedAt) return false;
   await db
     .update(users)
     .set({ emailVerifiedAt: new Date(), updatedAt: new Date() })
@@ -84,20 +87,25 @@ export async function confirmEmailVerification(db: Db, token: string): Promise<b
   return true;
 }
 
-export async function requestPasswordReset(db: Db, webPublicUrl: string, email: string): Promise<void> {
+export async function requestPasswordReset(
+  db: Db, webPublicUrl: string, email: string,
+  send: (to: string, url: string) => Promise<boolean> = sendResetPasswordEmail,
+): Promise<void> {
   const user = await db.query.users.findFirst({
     where: eq(users.email, email.trim().toLowerCase()),
   });
   if (!user?.passwordHash) return;
   const token = await issueAuthToken(db, { kind: "password_reset", userId: user.id });
   const resetUrl = `${webPublicUrl}/reset-password?token=${encodeURIComponent(token)}`;
-  await sendResetPasswordEmail(user.email, resetUrl).catch(() => false);
+  await send(user.email, resetUrl).catch(() => false);
 }
 
 export async function completePasswordReset(db: Db, token: string, password: string): Promise<boolean> {
   if (!password || password.length < 8) throw new Error("密码至少 8 位");
   const consumed = await consumeAuthToken(db, "password_reset", token);
   if (!consumed?.userId) return false;
+  const user = await db.query.users.findFirst({ where: eq(users.id, consumed.userId) });
+  if (!user || user.suspendedAt) return false;
   const passwordHash = await bcrypt.hash(password, 12);
   const now = new Date();
   await db

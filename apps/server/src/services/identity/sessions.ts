@@ -62,12 +62,12 @@ export class IdentitySessionService {
   async revokeOthers(userId: string, exceptSid?: string): Promise<number> {
     const filters = [eq(userSessions.userId, userId), isNull(userSessions.revokedAt)];
     if (exceptSid) filters.push(ne(userSessions.id, exceptSid));
-    const rows = await this.db.update(userSessions).set({ revokedAt: new Date() }).where(and(...filters)).returning({ id: userSessions.id });
+    const rows = await this.db.update(userSessions).set({ revokedAt: new Date() }).where(and(...filters)).returning();
     return rows.length;
   }
 
   async purgeExpired(now = new Date()): Promise<number> {
-    const rows = await this.db.delete(userSessions).where(lt(userSessions.expiresAt, now)).returning({ id: userSessions.id });
+    const rows = await this.db.delete(userSessions).where(lt(userSessions.expiresAt, now)).returning();
     return rows.length;
   }
 }

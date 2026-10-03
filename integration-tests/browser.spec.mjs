@@ -40,8 +40,9 @@ test("fixture user authenticates and reaches the agent dashboard", async ({ page
   await page.getByRole("button", { name: "登录", exact: true }).click();
   await expect(page).toHaveURL(/\/dashboard\/agents/);
   await expect(page.getByText("Fixture Team").first()).toBeVisible();
-  await expect(page.getByText("还没有 Agent")).toBeVisible();
-  await expect(page.getByText("页面出错了")).toHaveCount(0);
+  await page.waitForLoadState("networkidle");
   expect(pageErrors, pageErrors.map((error) => error.stack ?? error.message).join("\n")).toEqual([]);
+  await expect(page.getByText("页面出错了")).toHaveCount(0);
+  await expect(page.getByText("还没有 Agent")).toBeVisible();
   await page.screenshot({ path: "artifacts/e2e/agent-dashboard.png", fullPage: true });
 });

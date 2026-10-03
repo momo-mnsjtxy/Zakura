@@ -5,8 +5,10 @@ import {
   createActionLock,
   loginCapabilities,
   loginReturnHref,
+  inviteState,
   readLoginIntent,
   registrationRedirect,
+  tokenState,
   resolveEmailDiscovery,
 } from "../src/lib/auth-flow.js";
 import { isUnauthorizedOnboardingError, moveOnboarding } from "../src/lib/onboarding-flow.js";
@@ -51,4 +53,13 @@ test("onboarding navigation preserves direction and ignores invalid destinations
   const current = { step: "choose", direction: "forward" };
   assert.equal(moveOnboarding(current, "missing"), current);
   assert.equal(isUnauthorizedOnboardingError(new Error("HTTP 401")), true);
+});
+
+test("invite and reset tokens recover from expiry, mismatch and missing input", () => {
+  const info = { email: "a@example.test", expiresAt: "2026-01-02T00:00:00.000Z" };
+  assert.equal(inviteState(info, null, Date.parse("2026-01-01T00:00:00.000Z")).canAccept, true);
+  assert.equal(inviteState(info, "b@example.test", Date.parse("2026-01-01T00:00:00.000Z")).status, "mismatch");
+  assert.equal(inviteState(info, null, Date.parse("2026-01-03T00:00:00.000Z")).status, "expired");
+  assert.deepEqual(tokenState("  token "), { valid: true, token: "token" });
+  assert.equal(tokenState("").valid, false);
 });

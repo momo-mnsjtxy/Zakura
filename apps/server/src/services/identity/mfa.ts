@@ -19,6 +19,7 @@ import {
 } from "../../db/schema.js";
 import { encryptJson, decryptJson } from "@zakura/core";
 import { hashToken, rpFromWebUrl } from "./util.js";
+import { CredentialLifecycleService } from "./credential-lifecycle.js";
 
 const pendingChallenge = new Map<string, { challenge: string; expiresAt: number }>();
 
@@ -191,15 +192,7 @@ async function issueRecoveryCodes(db: Db, userId: string): Promise<string[]> {
 }
 
 export async function consumeRecoveryCode(db: Db, userId: string, code: string): Promise<boolean> {
-  const hash = hashToken(normalizeRecoveryCode(code));
-  if (!hash || normalizeRecoveryCode(code).length < 8) return false;
-  const rows = await db.query.userRecoveryCodes.findMany({
-    where: eq(userRecoveryCodes.userId, userId),
-  });
-  const match = rows.find((row) => !row.usedAt && row.codeHash === hash);
-  if (!match) return false;
-  await db.update(userRecoveryCodes).set({ usedAt: new Date() }).where(eq(userRecoveryCodes.id, match.id));
-  return true;
+  return new CredentialLifecycleService(db).consumeRecovery(userId, code);
 }
 
 export async function beginWebauthnRegistration(

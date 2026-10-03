@@ -1,7 +1,8 @@
-import { and, eq, isNull, lt } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "../../db/client.js";
 import { authTokens, newId } from "../../db/schema.js";
 import { hashToken, newSecretToken, parseJsonObject } from "./util.js";
+import { CredentialLifecycleService } from "./credential-lifecycle.js";
 
 export type AuthTokenKind = "email_verify" | "password_reset" | "mfa_login" | "sso_exchange";
 
@@ -40,18 +41,7 @@ export async function consumeAuthToken(
   kind: AuthTokenKind,
   raw: string,
 ): Promise<{ userId: string | null; meta: Record<string, unknown> } | null> {
-  const tokenHash = hashToken(raw);
-  const row = await db.query.authTokens.findFirst({
-    where: and(eq(authTokens.tokenHash, tokenHash), eq(authTokens.kind, kind)),
-  });
-  if (!row) return null;
-  if (row.consumedAt) return null;
-  if (row.expiresAt.getTime() < Date.now()) return null;
-  await db
-    .update(authTokens)
-    .set({ consumedAt: new Date() })
-    .where(eq(authTokens.id, row.id));
-  return { userId: row.userId, meta: parseJsonObject(row.metaJson) };
+  return new CredentialLifecycleService(db).consumeAuth(kind, raw);
 }
 
 export async function peekAuthToken(
@@ -68,5 +58,5 @@ export async function peekAuthToken(
 }
 
 export async function purgeExpiredAuthTokens(db: Db): Promise<void> {
-  await db.delete(authTokens).where(lt(authTokens.expiresAt, new Date()));
+  await new CredentialLifecycleService(db).purgeExpired();
 }

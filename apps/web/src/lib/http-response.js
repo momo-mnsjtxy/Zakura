@@ -5,7 +5,7 @@
  * a JSON parse failure.
  *
  * @param {Response} response
- * @returns {Promise<Record<string, unknown>>}
+ * @returns {Promise<any>}
  */
 export async function decodeApiResponse(response) {
   if (response.status === 204 || response.status === 205) return {};
@@ -17,10 +17,10 @@ export async function decodeApiResponse(response) {
   if (contentType.includes("json") || /^[\s]*[\[{]/.test(body)) {
     try {
       const parsed = JSON.parse(body);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        return parsed;
-      }
-      return { data: parsed };
+      // Preserve the endpoint's JSON shape. Several first-class APIs (agents,
+      // spaces, API keys) return top-level arrays; wrapping them breaks callers
+      // that correctly use array methods such as find/map.
+      return parsed;
     } catch {
       // Fall through so a malformed gateway response is still visible.
     }
