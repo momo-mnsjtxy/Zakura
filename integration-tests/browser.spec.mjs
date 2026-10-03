@@ -5,7 +5,7 @@ test("login advances through the real UI against the local API fixture", async (
   await expect(page.getByLabel("邮箱")).toBeVisible();
   await page.getByLabel("邮箱").fill("agent@example.test");
   await page.getByRole("button", { name: "使用邮箱继续" }).click();
-  await expect(page.getByLabel("密码")).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "密码", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "更换方式" }).click();
   await expect(page.getByDisplayValue("agent@example.test")).toBeVisible();
 });
