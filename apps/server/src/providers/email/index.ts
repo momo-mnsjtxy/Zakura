@@ -2,6 +2,7 @@ import { textResult } from "@zakura/core";
 import type { InstanceHandle, ProviderPlugin } from "@zakura/core";
 import type { McpToolDef, ProviderConfigSchema } from "@zakura/shared";
 import nodemailer from "nodemailer";
+import { connectorJson } from "../connector-http.js";
 
 export type EmailProduct = "smtp" | "mailgun" | "resendapi" | "amail" | "bettermail";
 
@@ -130,18 +131,6 @@ function mailArgs(handle: InstanceHandle, args: Record<string, unknown>) {
   };
 }
 
-function jsonHeaders(token: string): Headers {
-  const headers = new Headers({ "Content-Type": "application/json" });
-  if (token) headers.set("Authorization", `Bearer ${token}`);
-  return headers;
-}
-
-async function readJson<T>(response: Response): Promise<T> {
-  const text = await response.text();
-  if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 500)}`);
-  return text ? (JSON.parse(text) as T) : ({} as T);
-}
-
 async function sendSmtp(handle: InstanceHandle, args: Record<string, unknown>): Promise<unknown> {
   const host = stringValue(handle.config, "smtpHost");
   const user = stringValue(handle.config, "smtpUser");
@@ -184,23 +173,22 @@ async function sendMailgun(handle: InstanceHandle, args: Record<string, unknown>
   if (mail.bcc.length) body.set("bcc", mail.bcc.join(","));
   if (mail.replyTo) body.set("h:Reply-To", mail.replyTo);
   const auth = Buffer.from(`api:${token}`).toString("base64");
-  const response = await fetch(`https://${region}.mailgun.net/v3/${encodeURIComponent(domain)}/messages`, {
+  return connectorJson(`https://${region}.mailgun.net/v3/${encodeURIComponent(domain)}/messages`, "", {
     method: "POST",
     headers: { Authorization: `Basic ${auth}`, "Content-Type": "application/x-www-form-urlencoded" },
     body,
-    signal: AbortSignal.timeout(60_000),
+    authScheme: "none",
+    timeoutMs: 60_000,
   });
-  return readJson(response);
 }
 
 async function sendResend(handle: InstanceHandle, args: Record<string, unknown>): Promise<unknown> {
   const token = stringValue(handle.config, "apiToken");
   if (!token) throw new Error("Resend API 缺少 apiToken");
   const mail = mailArgs(handle, args);
-  const response = await fetch(stringValue(handle.config, "baseUrl") || "https://api.resend.com/emails", {
+  return connectorJson(stringValue(handle.config, "baseUrl") || "https://api.resend.com/emails", token, {
     method: "POST",
-    headers: { ...Object.fromEntries(jsonHeaders("").entries()), "Authorization": `Bearer ${token}` },
-    body: JSON.stringify({
+    json: {
       from: mail.from,
       to: mail.to,
       subject: mail.subject,
@@ -209,10 +197,9 @@ async function sendResend(handle: InstanceHandle, args: Record<string, unknown>)
       ...(mail.cc.length ? { cc: mail.cc } : {}),
       ...(mail.bcc.length ? { bcc: mail.bcc } : {}),
       ...(mail.replyTo ? { reply_to: mail.replyTo } : {}),
-    }),
-    signal: AbortSignal.timeout(60_000),
+    },
+    timeoutMs: 60_000,
   });
-  return readJson(response);
 }
 
 async function sendAmail(handle: InstanceHandle, args: Record<string, unknown>): Promise<unknown> {
@@ -263,13 +250,12 @@ async function receiveBettermail(handle: InstanceHandle, args: Record<string, un
     headers.set("Authorization", `Bearer ${token}`);
     headers.set("X-API-Key", token);
   }
-  const response = await fetch(`${baseUrl.replace(/\/$/, "")}/mails`, {
+  return connectorJson(`${baseUrl.replace(/\/$/, "")}/mails`, token, {
     method: "POST",
-    headers: { ...Object.fromEntries(headers.entries()), "Content-Type": "application/json" },
-    body: JSON.stringify({ to: mailbox, limit }),
-    signal: AbortSignal.timeout(60_000),
+    headers,
+    json: { to: mailbox, limit },
+    timeoutMs: 60_000,
   });
-  return readJson(response);
 }
 
 function toolsFor(product: EmailProduct): McpToolDef[] {

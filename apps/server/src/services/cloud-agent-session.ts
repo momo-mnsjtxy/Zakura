@@ -1711,9 +1711,9 @@ export class CloudAgentSessionStore {
     await this.db
       .update(cloudAgentRuns)
       .set({ status: "running", startedAt: new Date() })
-      .where(eq(cloudAgentRuns.id, runId));
+      .where(and(eq(cloudAgentRuns.id, runId), eq(cloudAgentRuns.status, "queued")));
     const run = await this.getRun(runId);
-    if (run) {
+    if (run?.status === "running") {
       void writeRunSnapshot({
         runId,
         sessionId: run.sessionId,
@@ -1735,10 +1735,18 @@ export class CloudAgentSessionStore {
     if (run.status === "completed" || run.status === "cancelled" || run.status === "failed") {
       return false;
     }
-    await this.db
+    const updated = await this.db
       .update(cloudAgentRuns)
       .set({ cancelRequested: true })
-      .where(eq(cloudAgentRuns.id, targetId));
+      .where(
+        and(
+          eq(cloudAgentRuns.id, targetId),
+          eq(cloudAgentRuns.sessionId, sessionId),
+          inArray(cloudAgentRuns.status, ["queued", "running"]),
+        ),
+      )
+      .returning();
+    if (updated.length === 0) return false;
     // 即时传导：本进程直接触发监听器；跨实例经全局频道广播（DB 标记只作兜底轮询）
     this.fireRunCancel(targetId);
     if (isRedisEnabled()) {
@@ -1811,14 +1819,41 @@ export class CloudAgentSessionStore {
    * 返回恢复的 Run 数量。
    */
   async recoverInterruptedRuns(): Promise<number> {
+    const abandonedRecoveryBefore = new Date(Date.now() - 30_000);
     const stale = await this.db
       .select()
       .from(cloudAgentRuns)
-      .where(inArray(cloudAgentRuns.status, ["queued", "running"]));
+      .where(
+        or(
+          inArray(cloudAgentRuns.status, ["queued", "running"]),
+          and(
+            eq(cloudAgentRuns.status, "recovering"),
+            or(
+              isNull(cloudAgentRuns.completedAt),
+              lt(cloudAgentRuns.completedAt, abandonedRecoveryBefore),
+            ),
+          ),
+        ),
+      );
     if (stale.length === 0) return 0;
 
     const message = "服务重启，该运行已中断";
+    let recovered = 0;
     for (const run of stale) {
+      const claimState = run.status === "recovering"
+        ? and(
+            eq(cloudAgentRuns.status, "recovering"),
+            run.completedAt
+              ? eq(cloudAgentRuns.completedAt, run.completedAt)
+              : isNull(cloudAgentRuns.completedAt),
+          )
+        : inArray(cloudAgentRuns.status, ["queued", "running"]);
+      const claimed = await this.db
+        .update(cloudAgentRuns)
+        .set({ status: "recovering", error: message, completedAt: new Date() })
+        .where(and(eq(cloudAgentRuns.id, run.id), claimState))
+        .returning();
+      if (claimed.length === 0) continue;
       try {
         // 事件先落库：SSE 重连的客户端据此结束「进行中」状态
         await this.appendEvent({
@@ -1838,6 +1873,7 @@ export class CloudAgentSessionStore {
         recordPlatformFault("cloud_agent.recover_run", err, { subsystem: "cloud_agent" });
       }
       await this.finishRun(run.sessionId, run.id, "failed", message);
+      recovered += 1;
     }
 
     // 兜底：清理指向已不存在 Run 的 activeRunId（历史数据/异常删除）
@@ -1850,11 +1886,11 @@ export class CloudAgentSessionStore {
           sql`NOT EXISTS (
             SELECT 1 FROM ${cloudAgentRuns}
             WHERE ${cloudAgentRuns.id} = ${cloudAgentSessions.activeRunId}
-              AND ${cloudAgentRuns.status} IN ('queued', 'running')
+              AND ${cloudAgentRuns.status} IN ('queued', 'running', 'recovering')
           )`,
         ),
       );
-    return stale.length;
+    return recovered;
   }
 
 
@@ -1865,14 +1901,21 @@ export class CloudAgentSessionStore {
     error?: string,
   ): Promise<void> {
     const now = new Date();
-    await this.db
+    const transitioned = await this.db
       .update(cloudAgentRuns)
       .set({
         status,
         error: error ?? null,
         completedAt: now,
       })
-      .where(eq(cloudAgentRuns.id, runId));
+      .where(
+        and(
+          eq(cloudAgentRuns.id, runId),
+          eq(cloudAgentRuns.sessionId, sessionId),
+          inArray(cloudAgentRuns.status, ["queued", "running", "recovering"]),
+        ),
+      )
+      .returning();
     await this.db
       .update(cloudAgentSessions)
       .set({
@@ -1882,6 +1925,7 @@ export class CloudAgentSessionStore {
       .where(and(eq(cloudAgentSessions.id, sessionId), eq(cloudAgentSessions.activeRunId, runId)));
     // 会话队列跨 Run 存续（服务端权威）；只清理该 Run 的取消状态
     this.cancellations.clear(runId);
+    if (transitioned.length === 0) return;
     try {
       const session = await this.db.query.cloudAgentSessions.findFirst({
         where: eq(cloudAgentSessions.id, sessionId),

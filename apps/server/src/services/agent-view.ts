@@ -41,6 +41,9 @@ export function hydrateAgent(agent: Agent, space: Space): AgentWithSpace {
   const computer = Boolean(space.enableComputer);
   return {
     ...agent,
+    // Workspace failures belong to the shared Space. Keep the compatibility
+    // field on the hydrated Agent view so existing API clients still see it.
+    lastError: space.lastError ?? agent.lastError,
     space,
     spaceName: space.name,
     status: space.workspaceStatus,

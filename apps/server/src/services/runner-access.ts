@@ -114,11 +114,14 @@ export async function assertNodeBindAllowed(
     tenantId: string;
     /** null / local → Local Runner */
     nodeId: string | null;
-    /** 启动/重启时排除当前 agent 已有工作区，避免误占配额 */
+    /** 启动/重启时排除当前 Space 已有工作区，避免误占配额 */
+    excludeAllocationId?: string;
+    /** @deprecated workspace allocation moved from Agent to Space */
     excludeAgentId?: string;
   },
 ): Promise<void> {
-  const { userId, tenantId, nodeId, excludeAgentId } = opts;
+  const { userId, tenantId, nodeId } = opts;
+  const excludeAllocationId = opts.excludeAllocationId ?? opts.excludeAgentId;
 
   if (!nodeId || nodeId === "local") {
     const ok = await userCanUseLocalRunner(db, config, userId);
@@ -149,25 +152,32 @@ export async function assertNodeBindAllowed(
   await assertSharedRunnerQuota(db, {
     nodeId: node.id,
     tenantId,
-    excludeAgentId,
+    excludeAllocationId,
   });
 }
 
 export async function assertSharedRunnerQuota(
   db: Db,
-  opts: { nodeId: string; tenantId: string; excludeAgentId?: string },
+  opts: {
+    nodeId: string;
+    tenantId: string;
+    excludeAllocationId?: string;
+    /** @deprecated use excludeAllocationId */
+    excludeAgentId?: string;
+  },
 ): Promise<void> {
-  const { nodeId, tenantId, excludeAgentId } = opts;
+  const { nodeId, tenantId } = opts;
+  const excludeAllocationId = opts.excludeAllocationId ?? opts.excludeAgentId;
 
   const tenantConds = [
     eq(managedContainers.tenantId, tenantId),
     eq(managedContainers.runtimeNodeId, nodeId),
     sql`${managedContainers.status} in ('running','starting','created')`,
   ];
-  if (excludeAgentId) {
-    // allocatedTo / agentId 任一指向当前 agent 则不计（重启工作区）
+  if (excludeAllocationId) {
+    // New rows are Space-owned; coalesce keeps old Agent-owned rows readable.
     tenantConds.push(
-      sql`coalesce(${managedContainers.allocatedTo}, ${managedContainers.agentId}, '') <> ${excludeAgentId}`,
+      sql`coalesce(${managedContainers.allocatedTo}, ${managedContainers.spaceId}, ${managedContainers.agentId}, '') <> ${excludeAllocationId}`,
     );
   }
 
@@ -186,9 +196,9 @@ export async function assertSharedRunnerQuota(
     eq(managedContainers.runtimeNodeId, nodeId),
     sql`${managedContainers.status} in ('running','starting','created')`,
   ];
-  if (excludeAgentId) {
+  if (excludeAllocationId) {
     totalConds.push(
-      sql`coalesce(${managedContainers.allocatedTo}, ${managedContainers.agentId}, '') <> ${excludeAgentId}`,
+      sql`coalesce(${managedContainers.allocatedTo}, ${managedContainers.spaceId}, ${managedContainers.agentId}, '') <> ${excludeAllocationId}`,
     );
   }
 

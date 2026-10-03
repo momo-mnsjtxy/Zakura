@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, ne } from "drizzle-orm";
 import { join } from "node:path";
 import {
   RunnerClient,
@@ -30,6 +30,7 @@ import {
   spaces,
   tenants,
   type RuntimeNode,
+  type Space,
 } from "../db/schema.js";
 import type { DockerPullEvent, DockerRuntime, TcpTunnel } from "../runtime/docker.js";
 import {
@@ -109,6 +110,10 @@ function rewriteLoopbackUrl(
   } catch {
     return url;
   }
+}
+
+function timestampMs(value: unknown): number {
+  return value instanceof Date ? value.getTime() : 0;
 }
 
 export function agentDataDir(config: AppConfig, agentId: string): string {
@@ -250,12 +255,20 @@ export class AgentWorkspaceService {
   }
 
   async isWorkspaceRunning(agent: AgentWithSpace): Promise<boolean> {
-    try {
-      await this.resolveDockerId(agent);
-      return true;
-    } catch {
-      return false;
+    if (!this.hasRuntimeNode(agent)) return false;
+    const { client } = await this.requireRunnerClient(agent);
+    const remote = await client.getWorkspace(agent.spaceId);
+    if (!remote || remote.status !== "running") return false;
+    if (typeof (this.db as unknown as { update?: unknown }).update === "function") {
+      try {
+        await this.syncWorkspaceRecord(agent, remote);
+      } catch (error) {
+        // Runner truth is authoritative. Bookkeeping repair is best-effort here
+        // and will be retried by later status reads/starts.
+        recordPlatformFault("agent_ws.reconcile_record", error, { subsystem: "agent_ws" });
+      }
     }
+    return true;
   }
 
   /**
@@ -277,10 +290,18 @@ export class AgentWorkspaceService {
       throw new Error("本机工作区提供文件和终端；虚拟桌面与浏览器需要容器工作区（Docker）。");
     }
     return this.withStartLock(agent.spaceId, async () => {
-      if (await this.isWorkspaceRunning(agent)) {
+      const running = await this.isWorkspaceRunning(agent);
+      if (running) {
         if (require === "display") {
           const { client } = await this.requireRunnerClient(agent);
           await this.waitUntilReady(agent, client, require);
+        }
+        if (typeof (this.db as unknown as { update?: unknown }).update === "function") {
+          try {
+            await this.setWorkspaceError(agent, null);
+          } catch (error) {
+            recordPlatformFault("agent_ws.clear_recovered_error", error, { subsystem: "agent_ws" });
+          }
         }
         return agent;
       }
@@ -341,7 +362,104 @@ export class AgentWorkspaceService {
           eq(managedContainers.purpose, "workspace"),
         ),
       );
-    return rows.find((r) => r.status !== "removed") ?? rows[0] ?? null;
+    const newest = [...rows].sort(
+      (a, b) => timestampMs(b.createdAt) - timestampMs(a.createdAt),
+    );
+    return newest.find((r) => r.status !== "removed") ?? newest[0] ?? null;
+  }
+
+  /** Reconcile runner truth into the local lifecycle row without creating duplicates. */
+  private async syncWorkspaceRecord(
+    agent: WorkspaceScope,
+    state: {
+      dockerId?: string | null;
+      name?: string;
+      image?: string;
+      status?: string;
+      labels?: Record<string, string>;
+      ports?: Array<{ containerPort: number; hostPort?: number }>;
+    },
+  ): Promise<void> {
+    const now = new Date();
+    const rows = await this.db
+      .select()
+      .from(managedContainers)
+      .where(
+        and(
+          eq(managedContainers.spaceId, agent.spaceId),
+          eq(managedContainers.purpose, "workspace"),
+        ),
+      );
+    const current = [...rows]
+      .sort((a, b) => timestampMs(b.createdAt) - timestampMs(a.createdAt))
+      .find((row) => row.status !== "removed") ?? null;
+    const status = state.status ?? "running";
+    if (current) {
+      await this.db
+        .update(managedContainers)
+        .set({
+          dockerId: state.dockerId ?? current.dockerId,
+          name: state.name ?? current.name,
+          image: state.image ?? current.image,
+          status,
+          labelsJson: state.labels ? JSON.stringify(state.labels) : current.labelsJson,
+          portsJson: state.ports ? JSON.stringify(state.ports) : current.portsJson,
+          runtimeNodeId: agent.runtimeNodeId ?? null,
+          updatedAt: now,
+        })
+        .where(eq(managedContainers.id, current.id));
+    } else {
+      await this.db.insert(managedContainers).values({
+        id: newId(),
+        tenantId: agent.tenantId,
+        spaceId: agent.spaceId,
+        dockerId: state.dockerId ?? null,
+        name: state.name ?? `zakura-workspace-${agent.spaceId}`.slice(0, 120),
+        image: state.image ?? resolveImageForMode(resolveStackMode(agent), agent.workspaceImage),
+        purpose: "workspace",
+        status,
+        labelsJson: JSON.stringify(state.labels ?? {}),
+        portsJson: JSON.stringify(state.ports ?? []),
+        allocatedTo: agent.spaceId,
+        runtimeNodeId: agent.runtimeNodeId ?? null,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+    const activeRows = await this.db
+      .select({ id: managedContainers.id, updatedAt: managedContainers.updatedAt })
+      .from(managedContainers)
+      .where(
+        and(
+          eq(managedContainers.spaceId, agent.spaceId),
+          eq(managedContainers.purpose, "workspace"),
+          ne(managedContainers.status, "removed"),
+        ),
+      );
+    const active = [...activeRows].sort(
+      (a, b) => timestampMs(b.updatedAt) - timestampMs(a.updatedAt),
+    );
+    const keepId = active[0]?.id;
+    if (keepId && active.length > 1) {
+      await this.db
+        .update(managedContainers)
+        .set({ status: "removed", dockerId: null, updatedAt: now })
+        .where(
+          and(
+            eq(managedContainers.spaceId, agent.spaceId),
+            eq(managedContainers.purpose, "workspace"),
+            ne(managedContainers.id, keepId),
+            ne(managedContainers.status, "removed"),
+          ),
+        );
+    }
+  }
+
+  private async setWorkspaceError(agent: WorkspaceScope, message: string | null): Promise<void> {
+    await this.db
+      .update(spaces)
+      .set({ lastError: message, updatedAt: new Date() })
+      .where(and(eq(spaces.id, agent.spaceId), eq(spaces.tenantId, agent.tenantId)));
   }
 
   parsePorts(portsJson: string): Array<{ containerPort: number; hostPort?: number }> {
@@ -582,11 +700,8 @@ export class AgentWorkspaceService {
       return updated ? { ...agent, lastError: updated.lastError, updatedAt: updated.updatedAt } : agent;
     }
 
-    // 仅清理上次错误；不把 Agent 标成 starting/running（状态在 managedContainers）
-    await this.db
-      .update(agents)
-      .set({ lastError: null, updatedAt: new Date() })
-      .where(eq(agents.id, agent.id));
+    // Runtime state and failures belong to the shared Space.
+    await this.setWorkspaceError(agent, null);
 
     log("runner", "正在连接运行节点…", 6, "docker");
     const { client: remoteClient } = await this.requireRunnerClient(agent);
@@ -615,15 +730,6 @@ export class AgentWorkspaceService {
       });
       if (!tenant) throw new Error("Tenant not found");
 
-      // Clear local container bookkeeping if any leftover
-      const existing = await this.getWorkspaceContainer(agent.spaceId);
-      if (existing) {
-        await this.db
-          .update(managedContainers)
-          .set({ status: "removed", dockerId: null, updatedAt: new Date() })
-          .where(eq(managedContainers.id, existing.id));
-      }
-
       const mode = resolveStackMode(agent);
       // The lite image is built/pushed by CI, so remote runners can pull it the
       // same way they pull the full image.
@@ -650,23 +756,7 @@ export class AgentWorkspaceService {
         },
       });
 
-      const now = new Date();
-      await this.db.insert(managedContainers).values({
-        id: newId(),
-        tenantId: agent.tenantId,
-        spaceId: agent.spaceId,
-        dockerId: ws.dockerId,
-        name: ws.name,
-        image: ws.image,
-        purpose: "workspace",
-        status: ws.status,
-        labelsJson: JSON.stringify(ws.labels ?? {}),
-        portsJson: JSON.stringify(ws.ports ?? []),
-        allocatedTo: agent.spaceId,
-        runtimeNodeId: agent.runtimeNodeId,
-        createdAt: now,
-        updatedAt: now,
-      });
+      await this.syncWorkspaceRecord(agent, ws);
 
       log("container", `工作区已启动 ${ws.name.slice(0, 24)}…`, 70);
       if (ws.endpoints?.novncUrl) {
@@ -685,24 +775,16 @@ export class AgentWorkspaceService {
       await this.waitUntilReady(agent, client, readiness);
       log("ready", "工作区就绪", 100, "ready");
 
-      const [updated] = await this.db
-        .update(agents)
-        .set({ lastError: null, updatedAt: new Date() })
-        .where(eq(agents.id, agent.id))
-        .returning();
+      await this.setWorkspaceError(agent, null);
       finishAgentProgress(agent.id, { ok: true, message: "工作区运行中" });
-      return updated ? { ...agent, lastError: updated.lastError, updatedAt: updated.updatedAt } : agent;
+      return { ...agent, lastError: null, space: { ...agent.space, lastError: null } };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logAgentProgress(agent.id, "failed", message, { level: "error", phase: "error" });
       finishAgentProgress(agent.id, { ok: false, error: message });
-      const [updated] = await this.db
-        .update(agents)
-        .set({ lastError: message, updatedAt: new Date() })
-        .where(eq(agents.id, agent.id))
-        .returning();
+      await this.setWorkspaceError(agent, message);
       throw Object.assign(err instanceof Error ? err : new Error(message), {
-        agent: updated,
+        agent: { ...agent, lastError: message, space: { ...agent.space, lastError: message } },
       });
     }
   }
@@ -722,10 +804,20 @@ export class AgentWorkspaceService {
           agent.runtimeNodeId!,
           { allowOffline: true },
         );
-        await client.stopWorkspace(agent.spaceId, opts?.removeContainer !== false);
+        const remote = await client.getWorkspace(agent.spaceId);
+        if (remote) {
+          await client.stopWorkspace(agent.spaceId, opts?.removeContainer !== false);
+        }
       } catch (err) {
         remoteErr = err;
         recordPlatformFault("agent_ws.remote_stop", err, { subsystem: "agent_ws" });
+      }
+      if (remoteErr) {
+        const msg = remoteErr instanceof Error ? remoteErr.message : String(remoteErr);
+        await this.setWorkspaceError(agent, msg);
+        throw Object.assign(remoteErr instanceof Error ? remoteErr : new Error(msg), {
+          agent: { ...agent, lastError: msg, space: { ...agent.space, lastError: msg } },
+        });
       }
       const row = await this.getWorkspaceContainer(agent.spaceId);
       if (row) {
@@ -738,30 +830,38 @@ export class AgentWorkspaceService {
           })
           .where(eq(managedContainers.id, row.id));
       }
-      if (remoteErr) {
-        const msg = remoteErr instanceof Error ? remoteErr.message : String(remoteErr);
-        if (/离线|offline|不可用|endpoint|token|不存在/i.test(msg)) {
-          const [updated] = await this.db
-            .update(agents)
-            .set({ lastError: msg, updatedAt: new Date() })
-            .where(eq(agents.id, agent.id))
-            .returning();
-          throw Object.assign(
-            remoteErr instanceof Error ? remoteErr : new Error(msg),
-            { agent: updated },
-          );
-        }
-      }
     } else {
       throw new Error("请先绑定一台电脑或服务器");
     }
 
-    const [updated] = await this.db
-      .update(agents)
-      .set({ lastError: null, updatedAt: new Date() })
-      .where(eq(agents.id, agent.id))
-      .returning();
-    return updated ? { ...agent, lastError: updated.lastError, updatedAt: updated.updatedAt } : agent;
+    await this.setWorkspaceError(agent, null);
+    return { ...agent, lastError: null, space: { ...agent.space, lastError: null } };
+  }
+
+  /** Space deletion owns runner teardown; fail closed so cleanup can be retried. */
+  async removeSpaceWorkspace(space: Space): Promise<void> {
+    this.closeTunnelsForAgent(space.id);
+    await this.shellJobs.killAgent(space.id);
+    if (space.runtimeNodeId) {
+      if (!this.nodes) throw new Error("运行节点服务不可用，请稍后重试");
+      const { client } = await this.nodes.requireRunnerClient(
+        space.tenantId,
+        space.runtimeNodeId,
+        { allowOffline: true },
+      );
+      const remote = await client.getWorkspace(space.id);
+      if (remote) await client.stopWorkspace(space.id, true);
+    }
+    await this.db
+      .update(managedContainers)
+      .set({ status: "removed", dockerId: null, updatedAt: new Date() })
+      .where(
+        and(
+          eq(managedContainers.spaceId, space.id),
+          eq(managedContainers.purpose, "workspace"),
+          ne(managedContainers.status, "removed"),
+        ),
+      );
   }
 
   async resolveDockerId(agent: AgentWithSpace): Promise<string> {

@@ -306,8 +306,8 @@ export function registerSaasRoutes(
   app.patch("/api/tenant/members/:id", async (c) => {
     const session = c.get("session")!;
     const body = await c.req.json<{ role?: SaasTenantRole }>();
-    if (!body.role || !["admin", "member"].includes(body.role)) {
-      return c.json({ error: "role must be admin or member" }, 400);
+    if (!body.role || !["owner", "admin", "member"].includes(body.role)) {
+      return c.json({ error: "role must be owner, admin or member" }, 400);
     }
     try {
       const row = await tenantService.updateMemberRole(
@@ -522,15 +522,22 @@ export function registerSaasRoutes(
   });
 
   app.get("/api/admin/agent-defaults", async (c) => {
-    return c.json(await deps.agentDefaults?.get());
+    if (!deps.agentDefaults) return c.json({ error: "Agent defaults unavailable" }, 503);
+    return c.json(await deps.agentDefaults.get());
   });
 
   app.put("/api/admin/agent-defaults", async (c) => {
+    const session = c.get("session")!;
     if (!deps.agentDefaults) return c.json({ error: "Agent defaults unavailable" }, 503);
     const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
     try {
       const saved = await deps.agentDefaults.save(body);
       await deps.agentDefaults.syncManaged();
+      await appendAudit?.(session.tenantId, "admin.agent_defaults", {
+        actorId: session.userId,
+        targetType: "platform",
+        targetId: "agent-defaults",
+      });
       return c.json(saved);
     } catch (err) {
       return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
@@ -560,11 +567,18 @@ export function registerSaasRoutes(
   });
 
   app.put("/api/admin/oauth/login-policy", async (c) => {
+    const session = c.get("session")!;
     const body = await c.req
       .json<{ disablePasswordLogin?: boolean; highlightedMethod?: string }>()
       .catch(() => ({} as { disablePasswordLogin?: boolean; highlightedMethod?: string }));
     try {
       const policy = await saveLoginPolicy(oauthDeps(), body);
+      await appendAudit?.(session.tenantId, "admin.login_policy", {
+        actorId: session.userId,
+        targetType: "platform",
+        targetId: "login-policy",
+        detail: { disablePasswordLogin: policy.stored.disablePasswordLogin },
+      });
       return c.json({
         disablePasswordLogin: policy.stored.disablePasswordLogin,
         passwordLoginEnabled: !policy.effective.disablePasswordLogin,
@@ -591,6 +605,7 @@ export function registerSaasRoutes(
   });
 
   app.put("/api/admin/oauth/:provider", async (c) => {
+    const session = c.get("session")!;
     const provider = c.req.param("provider");
     if (!isLoginOauthProviderId(provider)) {
       return c.json({ error: "unknown oauth provider" }, 404);
@@ -599,6 +614,12 @@ export function registerSaasRoutes(
     try {
       const pub = await saveProviderConfig(oauthDeps(), provider, body);
       const { stored } = await loadProviderConfig(oauthDeps(), provider);
+      await appendAudit?.(session.tenantId, "admin.oauth_provider", {
+        actorId: session.userId,
+        targetType: "oauth_provider",
+        targetId: provider,
+        detail: { enabled: stored.enabled, ready: pub.ready },
+      });
       return c.json({
         ...pub,
         enabled: stored.enabled,
@@ -610,9 +631,16 @@ export function registerSaasRoutes(
   });
 
   app.post("/api/admin/users/:id/agent-defaults/apply", async (c) => {
+    const session = c.get("session")!;
     if (!deps.agentDefaults) return c.json({ error: "Agent defaults unavailable" }, 503);
     try {
-      return c.json(await deps.agentDefaults.enableForUser(c.req.param("id")));
+      const result = await deps.agentDefaults.enableForUser(c.req.param("id"));
+      await appendAudit?.(session.tenantId, "admin.agent_defaults_apply", {
+        actorId: session.userId,
+        targetType: "user",
+        targetId: c.req.param("id"),
+      });
+      return c.json(result);
     } catch (err) {
       return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
     }

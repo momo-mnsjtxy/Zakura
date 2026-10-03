@@ -21,10 +21,14 @@ const toolDefs: Record<(typeof PRODUCTS)[number], McpToolDef[]> = {
 };
 
 async function linearGraphql<T>(token: string, query: string, variables?: Record<string, unknown>) {
-  return restJson<T>("https://api.linear.app/graphql", token, {
+  const result = await restJson<T & { errors?: Array<{ message?: string }> }>("https://api.linear.app/graphql", token, {
     method: "POST",
     json: { query, variables },
   });
+  if (result.errors?.length) {
+    throw new Error(`Linear GraphQL: ${result.errors.map((error) => error.message || "unknown error").join("; ")}`);
+  }
+  return result;
 }
 
 const factory = createOauthRestProvider({

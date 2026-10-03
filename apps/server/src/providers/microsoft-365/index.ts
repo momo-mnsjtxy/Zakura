@@ -6,6 +6,7 @@ import { componentInstances } from "../../db/schema.js";
 import type { AppConfig } from "../../config.js";
 import { McpUpstreamOauthService } from "../../services/mcp-upstream-oauth.js";
 import { applyOauthTokensToConfig } from "../generic-mcp.js";
+import { connectorJson } from "../connector-http.js";
 
 type MicrosoftProduct = "outlook" | "files" | "teams" | "directory";
 
@@ -30,6 +31,7 @@ const configSchema: ProviderConfigSchema = {
 let appConfigRef: AppConfig | null = null;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let dbRef: any = null;
+const refreshes = new Map<string, Promise<Record<string, unknown>>>();
 
 export function injectMicrosoft365Runtime(config: AppConfig, db: unknown): void {
   appConfigRef = config;
@@ -57,18 +59,11 @@ function parseProduct(config: Record<string, unknown>): MicrosoftProduct {
 }
 
 async function graphFetch<T>(token: string, path: string, init?: RequestInit & { json?: unknown }): Promise<T> {
-  const headers = new Headers(init?.headers);
-  headers.set("Authorization", `Bearer ${token}`);
-  if (init?.json !== undefined) headers.set("Content-Type", "application/json");
-  const response = await fetch(`https://graph.microsoft.com/v1.0${path}`, {
+  return connectorJson<T>(`https://graph.microsoft.com/v1.0${path}`, token, {
     ...init,
-    headers,
-    body: init?.json !== undefined ? JSON.stringify(init.json) : init?.body,
-    signal: init?.signal ?? AbortSignal.timeout(60_000),
+    timeoutMs: 60_000,
+    retry: { attempts: 3, baseDelayMs: 150, maxDelayMs: 2_000 },
   });
-  const text = await response.text();
-  if (!response.ok) throw new Error(`Microsoft Graph ${response.status}: ${text.slice(0, 400)}`);
-  return text ? JSON.parse(text) as T : {} as T;
 }
 
 const toolDefs: Record<MicrosoftProduct, McpToolDef[]> = {
@@ -159,22 +154,35 @@ async function accessToken(handle: InstanceHandle): Promise<string> {
   let current = { ...handle.config };
   const expiresAt = Number(current.oauthExpiresAt ?? 0);
   if ((!current.oauthAccessToken || expiresAt <= Math.floor(Date.now() / 1000) + 120) && current.oauthRefreshToken && current.oauthClientId && appConfigRef) {
-    const tokenEndpoint = String(current.oauthTokenEndpoint ?? "").trim();
-    if (!tokenEndpoint) throw new Error("Microsoft OAuth 配置缺少 token endpoint");
-    const tokens = await new McpUpstreamOauthService(appConfigRef).refresh({
-      accessToken: String(current.oauthAccessToken ?? ""),
-      refreshToken: String(current.oauthRefreshToken),
-      expiresAt,
-      clientId: String(current.oauthClientId),
-      clientSecret: typeof current.oauthClientSecret === "string" ? current.oauthClientSecret : undefined,
-      tokenEndpoint,
-    });
-    current = applyOauthTokensToConfig(current, tokens);
-    current.authRequired = false;
-    handle.config = current;
-    if (dbRef) {
-      const { encryptJson } = await import("@zakura/core");
-      await dbRef.update(componentInstances).set({ configEnc: encryptJson(appConfigRef.secret, current), updatedAt: new Date() }).where(eq(componentInstances.id, handle.id));
+    const existing = refreshes.get(handle.id);
+    const operation = existing ?? (async () => {
+      const tokenEndpoint = String(current.oauthTokenEndpoint ?? "").trim();
+      if (!tokenEndpoint) throw new Error("Microsoft OAuth 配置缺少 token endpoint");
+      const tokens = await new McpUpstreamOauthService(appConfigRef).refresh({
+        accessToken: String(current.oauthAccessToken ?? ""),
+        refreshToken: String(current.oauthRefreshToken),
+        expiresAt,
+        clientId: String(current.oauthClientId),
+        clientSecret: typeof current.oauthClientSecret === "string" ? current.oauthClientSecret : undefined,
+        tokenEndpoint,
+      });
+      const next = applyOauthTokensToConfig(current, tokens);
+      next.authRequired = false;
+      if (dbRef) {
+        const { encryptJson } = await import("@zakura/core");
+        await dbRef.update(componentInstances).set({ configEnc: encryptJson(appConfigRef.secret, next), updatedAt: new Date() }).where(eq(componentInstances.id, handle.id));
+      }
+      handle.config = next;
+      return next;
+    })();
+    if (!existing) {
+      const tracked = operation.finally(() => {
+        if (refreshes.get(handle.id) === tracked) refreshes.delete(handle.id);
+      });
+      refreshes.set(handle.id, tracked);
+      current = await tracked;
+    } else {
+      current = await existing;
     }
   }
   const token = String(current.oauthAccessToken ?? "").trim();

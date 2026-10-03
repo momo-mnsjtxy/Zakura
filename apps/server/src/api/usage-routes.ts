@@ -2,7 +2,7 @@ import type { Hono } from "hono";
 import { and, eq } from "drizzle-orm";
 import { isUserUsageCategory } from "@zakura/shared";
 import { isSessionAdmin } from "../services/auth.js";
-import { tenantMemberships } from "../db/schema.js";
+import { tenantMemberships, tenants } from "../db/schema.js";
 import type { Db } from "../db/client.js";
 import type { UserUsageStore } from "../services/user-usage.js";
 
@@ -48,6 +48,9 @@ export function registerUsageRoutes(
     if (session.userId === "api-key") return c.json({ error: "User session required" }, 403);
     const days = parseDays(c.req.query("days"));
     const category = c.req.query("category");
+    if (category && !isUserUsageCategory(category)) {
+      return c.json({ error: "Invalid usage category" }, 400);
+    }
     const [summary, events, sessions] = await Promise.all([
       usage.summarize({ userId: session.userId, tenantId: session.tenantId, days }),
       usage.listEvents({
@@ -67,7 +70,20 @@ export function registerUsageRoutes(
       return c.json({ error: "Admin only" }, 403);
     }
     const days = parseDays(c.req.query("days"));
-    const rows = await usage.listTenantUsers({ tenantId: session.tenantId, days });
+    const requestedTenantId = c.req.query("tenantId")?.trim();
+    if (requestedTenantId && !session.isPlatformAdmin) {
+      return c.json({ error: "Platform admin only" }, 403);
+    }
+    const tenantId = requestedTenantId || session.tenantId;
+    if (requestedTenantId) {
+      const tenant = await db.query.tenants.findFirst({ where: eq(tenants.id, tenantId) });
+      if (!tenant) return c.json({ error: "Tenant not found" }, 404);
+    }
+    const limit = Math.min(
+      Math.max(Number.parseInt(c.req.query("limit") ?? "100", 10) || 100, 1),
+      500,
+    );
+    const rows = await usage.listTenantUsers({ tenantId, days, limit });
     return c.json({ days, users: rows });
   });
 
@@ -79,6 +95,9 @@ export function registerUsageRoutes(
     if (!access.ok) return c.json({ error: "Forbidden" }, access.status);
     const days = parseDays(c.req.query("days"));
     const category = c.req.query("category");
+    if (category && !isUserUsageCategory(category)) {
+      return c.json({ error: "Invalid usage category" }, 400);
+    }
     const limit = Math.min(Math.max(Number.parseInt(c.req.query("limit") ?? "50", 10) || 50, 1), 200);
     const offset = Math.max(Number.parseInt(c.req.query("offset") ?? "0", 10) || 0, 0);
     const [summary, events, sessions] = await Promise.all([

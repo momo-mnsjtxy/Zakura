@@ -106,7 +106,12 @@ export class MigrationService {
     const sourceNodeId = space.runtimeNodeId;
     if (input.userId) {
       for (const nodeId of [sourceNodeId, input.targetNodeId]) {
-        await assertNodeBindAllowed(this.db, this.config, { tenantId, userId: input.userId, nodeId, excludeAgentId: agent.id });
+        await assertNodeBindAllowed(this.db, this.config, {
+          tenantId,
+          userId: input.userId,
+          nodeId,
+          excludeAllocationId: agent.spaceId,
+        });
       }
     }
     const target = await this.nodes.get(tenantId, input.targetNodeId);

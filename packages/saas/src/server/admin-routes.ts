@@ -277,6 +277,7 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
   });
 
   app.post("/api/admin/users", async (c) => {
+    const session = c.get("session") as SaasSession;
     const body = await c.req
       .json<{
         email?: string;
@@ -309,6 +310,12 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
           .where(eq(users.id, result.user.id));
       }
       await deps.onTenantCreated?.(result.tenant.id).catch(() => undefined);
+      await deps.appendAudit?.(session.tenantId, "admin.user_create", {
+        actorId: session.userId,
+        targetType: "user",
+        targetId: result.user.id,
+        detail: { tenantId: result.tenant.id, isPlatformAdmin: isAdmin },
+      });
       return c.json(
         {
           user: {
@@ -439,12 +446,15 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
         const clash = await db.query.users.findFirst({ where: eq(users.email, email) });
         if (clash) return c.json({ error: "该邮箱已被占用" }, 409);
         patch.email = email;
+        patch.emailVerifiedAt = null;
       }
     }
     if (body.name !== undefined) patch.name = body.name?.trim() || null;
     if (body.password !== undefined) {
       if (body.password.length < 8) return c.json({ error: "密码至少 8 位" }, 400);
       patch.passwordHash = await bcrypt.hash(body.password, 12);
+      // IdentitySessionService rejects every token issued before this cutoff.
+      patch.passwordUpdatedAt = new Date();
     }
 
     const nextAdmin =
@@ -464,6 +474,15 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
     if (!updated) return c.json({ error: "Update failed" }, 500);
 
     bumpUser(target.id);
+    await deps.appendAudit?.(session.tenantId, "admin.user_update", {
+      actorId: session.userId,
+      targetType: "user",
+      targetId: target.id,
+      detail: {
+        fields: Object.keys(body).filter((field) => field !== "password"),
+        passwordChanged: body.password !== undefined,
+      },
+    });
     return c.json({
       user: {
         id: updated.id,
@@ -543,10 +562,17 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
           tenantService.notifyMemberAccessRevoked?.(membership.tenantId, target.id),
         ),
     );
+    await deps.appendAudit?.(session.tenantId, "admin.user_suspend", {
+      actorId: session.userId,
+      targetType: "user",
+      targetId: target.id,
+      detail: { reason: body.reason?.trim() || null },
+    });
     return c.json({ user: { id: updated.id, ...mapSuspension(updated) } });
   });
 
   app.post("/api/admin/users/:id/unsuspend", async (c) => {
+    const session = c.get("session") as SaasSession;
     const id = c.req.param("id");
     const target = await db.query.users.findFirst({ where: eq(users.id, id) });
     if (!target) return c.json({ error: "Not found" }, 404);
@@ -563,6 +589,11 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
       .returning();
 
     bumpUser(target.id);
+    await deps.appendAudit?.(session.tenantId, "admin.user_unsuspend", {
+      actorId: session.userId,
+      targetType: "user",
+      targetId: target.id,
+    });
     return c.json({ user: { id: updated.id, ...mapSuspension(updated) } });
   });
 
@@ -631,6 +662,12 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
     for (const tid of orphanTenantIds) bumpTenant(tid);
 
     bumpUser(id);
+    await deps.appendAudit?.(session.tenantId, "admin.user_delete", {
+      actorId: session.userId,
+      targetType: "user",
+      targetId: id,
+      detail: { deletedTenants: orphanTenantIds.length },
+    });
     return c.json({ ok: true, deletedTenants: orphanTenantIds.length });
   });
 
@@ -738,6 +775,12 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
         ownerUserId,
       });
       await deps.onTenantCreated?.(created.tenant.id).catch(() => undefined);
+      await deps.appendAudit?.(created.tenant.id, "admin.tenant_create", {
+        actorId: session.userId,
+        targetType: "tenant",
+        targetId: created.tenant.id,
+        detail: { ownerUserId },
+      });
       return c.json({ tenant: created.tenant }, 201);
     } catch (err) {
       return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
@@ -811,6 +854,7 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
   });
 
   app.patch("/api/admin/tenants/:id", async (c) => {
+    const session = c.get("session") as SaasSession;
     const id = c.req.param("id");
     const body = await c.req
       .json<{ name?: string }>()
@@ -818,6 +862,12 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
     if (!body.name?.trim()) return c.json({ error: "团队名称必填" }, 400);
     try {
       const updated = await tenantService.updateTenant(id, { name: body.name.trim() });
+      await deps.appendAudit?.(id, "admin.tenant_update", {
+        actorId: session.userId,
+        targetType: "tenant",
+        targetId: id,
+        detail: { name: updated.name },
+      });
       return c.json({ tenant: { id: updated.id, name: updated.name, slug: updated.slug } });
     } catch (err) {
       return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
@@ -853,10 +903,17 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
 
     bumpTenant(id);
     await tenantService.notifyTenantSuspended?.(id);
+    await deps.appendAudit?.(id, "admin.tenant_suspend", {
+      actorId: session.userId,
+      targetType: "tenant",
+      targetId: id,
+      detail: { reason: body.reason?.trim() || null },
+    });
     return c.json({ tenant: { id: updated.id, ...mapSuspension(updated) } });
   });
 
   app.post("/api/admin/tenants/:id/unsuspend", async (c) => {
+    const session = c.get("session") as SaasSession;
     const id = c.req.param("id");
     const tenant = await db.query.tenants.findFirst({ where: eq(tenants.id, id) });
     if (!tenant) return c.json({ error: "Not found" }, 404);
@@ -873,6 +930,11 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
       .returning();
 
     bumpTenant(id);
+    await deps.appendAudit?.(id, "admin.tenant_unsuspend", {
+      actorId: session.userId,
+      targetType: "tenant",
+      targetId: id,
+    });
     return c.json({ tenant: { id: updated.id, ...mapSuspension(updated) } });
   });
 
@@ -885,6 +947,11 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
     if (tenant.id === session.tenantId) {
       return c.json({ error: "不能删除自己当前所在的团队" }, 400);
     }
+    await deps.appendAudit?.(session.tenantId, "admin.tenant_delete", {
+      actorId: session.userId,
+      targetType: "tenant",
+      targetId: id,
+    });
     await deleteTenantAggregate(id);
     bumpTenant(id);
     return c.json({ ok: true });
@@ -892,6 +959,7 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
 
   // ── 团队成员 ──────────────────────────────────────────────────────────
   app.post("/api/admin/tenants/:id/members", async (c) => {
+    const session = c.get("session") as SaasSession;
     const tenantId = c.req.param("id");
     const body = await c.req
       .json<{ userId?: string; email?: string; role?: string }>()
@@ -899,6 +967,7 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
 
     const tenant = await db.query.tenants.findFirst({ where: eq(tenants.id, tenantId) });
     if (!tenant) return c.json({ error: "Not found" }, 404);
+    if (tenant.suspendedAt) return c.json({ error: "该团队已被封禁" }, 403);
 
     let user: Record<string, any> | null | undefined;
     if (body.userId?.trim()) {
@@ -910,6 +979,9 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
     }
     if (!user) return c.json({ error: "找不到该用户" }, 404);
 
+    if (body.role !== undefined && !["owner", "admin", "member"].includes(body.role)) {
+      return c.json({ error: "role 必须是 owner / admin / member" }, 400);
+    }
     const role = body.role === "owner" || body.role === "admin" ? body.role : "member";
     const existing = await db.query.tenantMemberships.findFirst({
       where: and(
@@ -929,10 +1001,17 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
       createdAt: now,
       updatedAt: now,
     });
+    await deps.appendAudit?.(tenantId, "admin.member_add", {
+      actorId: session.userId,
+      targetType: "user",
+      targetId: user.id,
+      detail: { role },
+    });
     return c.json({ ok: true }, 201);
   });
 
   app.patch("/api/admin/tenants/:id/members/:membershipId", async (c) => {
+    const session = c.get("session") as SaasSession;
     const tenantId = c.req.param("id");
     const membershipId = c.req.param("membershipId");
     const body = await c.req
@@ -941,6 +1020,12 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
 
     try {
       const updated = await adminMemberships.update(tenantId, membershipId, body);
+      await deps.appendAudit?.(tenantId, "admin.member_update", {
+        actorId: session.userId,
+        targetType: "membership",
+        targetId: membershipId,
+        detail: { role: updated.role, status: updated.status },
+      });
       return c.json({ membership: { id: updated.id, role: updated.role, status: updated.status } });
     } catch (error) {
       if (error instanceof SaasAdminError) return c.json({ error: error.message }, error.status);
@@ -949,10 +1034,16 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
   });
 
   app.delete("/api/admin/tenants/:id/members/:membershipId", async (c) => {
+    const session = c.get("session") as SaasSession;
     const tenantId = c.req.param("id");
     const membershipId = c.req.param("membershipId");
     try {
       await adminMemberships.remove(tenantId, membershipId);
+      await deps.appendAudit?.(tenantId, "admin.member_remove", {
+        actorId: session.userId,
+        targetType: "membership",
+        targetId: membershipId,
+      });
       return c.json({ ok: true });
     } catch (error) {
       if (error instanceof SaasAdminError) return c.json({ error: error.message }, error.status);

@@ -21,7 +21,15 @@ const toolDefs: Record<(typeof PRODUCTS)[number], McpToolDef[]> = {
 };
 
 async function feishuFetch<T>(token: string, path: string, init?: RequestInit & { json?: unknown }) {
-  return restJson<T>(`https://open.feishu.cn/open-apis${path}`, token, init);
+  const result = await restJson<T & { code?: number; msg?: string }>(
+    `https://open.feishu.cn/open-apis${path}`,
+    token,
+    init,
+  );
+  if (typeof result.code === "number" && result.code !== 0) {
+    throw new Error(`Feishu API ${result.code}: ${result.msg || "request failed"}`);
+  }
+  return result;
 }
 
 const factory = createOauthRestProvider({

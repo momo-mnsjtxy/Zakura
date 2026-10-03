@@ -139,6 +139,10 @@ function snapshot(id: string, row: Pending): AuthSessionSnapshot {
 
 export class ModelUpstreamAuthService {
   private readonly pending = new Map<string, Pending>();
+  private readonly refreshInFlight = new Map<
+    string,
+    Promise<UpstreamOauthTokens>
+  >();
 
   constructor(
     private readonly db: Db,
@@ -414,8 +418,26 @@ export class ModelUpstreamAuthService {
     }
     let tokens = decryptTokens(this.secret, enc);
     if (opts?.forceRefresh || needsRefresh(tokens)) {
-      tokens = await this.refresh(protocol, tokens);
-      await this.saveTokensByUpstreamId(route.upstream.id, tokens, route.upstream.config.oauth?.loginKind ?? protocol);
+      let refreshing = this.refreshInFlight.get(route.upstream.id);
+      if (!refreshing) {
+        refreshing = (async () => {
+          const refreshed = await this.refresh(protocol, tokens);
+          await this.saveTokensByUpstreamId(
+            route.upstream.id,
+            refreshed,
+            route.upstream.config.oauth?.loginKind ?? protocol,
+          );
+          return refreshed;
+        })();
+        this.refreshInFlight.set(route.upstream.id, refreshing);
+      }
+      try {
+        tokens = await refreshing;
+      } finally {
+        if (this.refreshInFlight.get(route.upstream.id) === refreshing) {
+          this.refreshInFlight.delete(route.upstream.id);
+        }
+      }
     }
     const apiKey = bearerFromTokens(tokens);
     const extraHeaders = { ...(route.upstream.config.extraHeaders ?? {}) };

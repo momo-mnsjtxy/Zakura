@@ -11,7 +11,13 @@ import {
   type ChatStreamCallbacks,
   type ModelProtocolAdapter,
 } from "../adapter.js";
-import { apiError, httpJson, httpSse, mapConcurrent } from "../http.js";
+import {
+  apiError,
+  httpJson,
+  httpSse,
+  mapConcurrent,
+  providerStreamError,
+} from "../http.js";
 import { acceptsImageInput, expandToolImageMessages, imageOmittedText } from "../media.js";
 import {
   assertCompleteToolCalls,
@@ -37,10 +43,10 @@ export function geminiChatUrl(route: ResolvedRoute, stream: boolean): string {
   const base = route.upstream.config.baseUrl.replace(/\/$/, "");
   if (isGeminiCli(route)) {
     const verb = stream ? "streamGenerateContent" : "generateContent";
-    return `${base}/v1internal:${verb}`;
+    return `${base}/v1internal:${verb}${stream ? "?alt=sse" : ""}`;
   }
   const suffix = stream ? "streamGenerateContent" : "generateContent";
-  return `${base}/models/${encodeURIComponent(route.model)}:${suffix}?key=${encodeURIComponent(apiKey(route))}`;
+  return `${base}/models/${encodeURIComponent(route.model)}:${suffix}?key=${encodeURIComponent(apiKey(route))}${stream ? "&alt=sse" : ""}`;
 }
 
 function geminiRequestHeaders(route: ResolvedRoute): Record<string, string> {
@@ -224,6 +230,7 @@ async function chat(
     timeoutMs: timeout(route),
   });
   if (!res.ok) throw apiError("gemini chat", res.status, res.data, res.text);
+  if (res.data?.error) throw providerStreamError("gemini chat", res.data);
 
   const payload =
     res.data?.candidates
@@ -255,7 +262,7 @@ async function chat(
       : "stop";
   assertCompleteToolCalls(toolCalls, finishReason, toolCalls.length);
 
-  const usage = res.data?.usageMetadata;
+  const usage = payload?.usageMetadata;
   const openai = buildOpenAIChatCompletion({
     model: route.model,
     content: textParts.join("") || null,
@@ -308,9 +315,14 @@ export function absorbGeminiStreamChunk(
       candidatesTokenCount?: number;
       totalTokenCount?: number;
     };
-    error?: { message?: string };
+    error?: {
+      message?: string;
+      code?: string | number;
+      type?: string;
+      status?: string | number;
+    };
   };
-  if (o.error?.message) throw new Error(`gemini stream error: ${o.error.message}`);
+  if (o.error) throw providerStreamError("gemini chat(stream)", o);
   if (o.usageMetadata) {
     state.usage = {
       promptTokens: o.usageMetadata.promptTokenCount,
@@ -423,6 +435,7 @@ async function embedOne(route: ResolvedRoute, text: string): Promise<number[]> {
     timeoutMs: timeout(route),
   });
   if (!res.ok) throw apiError("gemini embedding", res.status, res.data, res.text);
+  if (res.data?.error) throw providerStreamError("gemini embedding", res.data);
   const values = res.data?.embedding?.values;
   if (!Array.isArray(values) || values.length === 0) {
     throw new Error("gemini embedding response missing vector");
@@ -462,10 +475,15 @@ async function generateImage(
     timeoutMs: timeout(route) * 2,
   });
   if (!res.ok) throw apiError("gemini image", res.status, res.data, res.text);
-  return {
-    images: (res.data?.predictions ?? []).map((p) => ({
+  if (res.data?.error) throw providerStreamError("gemini image", res.data);
+  const images = (res.data?.predictions ?? []).map((p) => ({
       b64Json: p.bytesBase64Encoded,
-    })),
+    }));
+  if (!images.some((image) => image.b64Json)) {
+    throw new Error("gemini image response missing image data");
+  }
+  return {
+    images,
     model: route.model,
   };
 }

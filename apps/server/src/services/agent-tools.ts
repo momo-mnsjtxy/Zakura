@@ -964,7 +964,7 @@ export async function callAgentNativeTool(
     };
 
     if (name === "agent_info") {
-      const container = await workspace.getWorkspaceContainer(agent.id);
+      const container = await workspace.getWorkspaceContainer(agent.spaceId);
       const desktop = await workspace.getDesktopInfo(agent);
       let memoryProvider: { id: string; name: string; kind: string } | null = null;
       if (memoryProviders && agent.enableMemory) {

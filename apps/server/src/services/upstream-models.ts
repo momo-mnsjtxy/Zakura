@@ -31,6 +31,9 @@ export function inferCapabilitiesFromModelId(modelId: string): ModelCapability[]
   const s = modelId.trim().toLowerCase();
   if (!s) return [];
   const caps: ModelCapability[] = [];
+  if (/(?:^|[-_. ])(?:jev|system[-_. ]?one)(?:$|[-_. ])/.test(s)) {
+    caps.push("evaluation");
+  }
   if (s.includes("rerank") || s.includes("ranker")) caps.push("rerank");
   if (s.includes("embed") || s.includes("embedding")) caps.push("embedding");
   if (

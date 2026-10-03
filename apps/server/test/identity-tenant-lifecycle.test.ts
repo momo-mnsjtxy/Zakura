@@ -38,7 +38,8 @@ import {
   upsertTenantSso,
 } from "../src/services/identity/sso.js";
 import { TenantAccessError, TenantService } from "../src/services/tenants.js";
-import { authenticateApiKey } from "../src/services/auth.js";
+import { authenticateApiKey, signSession, verifySession } from "../src/services/auth.js";
+import { IdentitySessionService } from "../src/services/identity/sessions.js";
 import { AdminMembershipService, SaasAdminError } from "../../../packages/saas/src/server/admin-memberships.js";
 import { RegisterError, registerSaasUser } from "../../../packages/saas/src/server/register-user.js";
 import { registerSaasRoutes } from "../../../packages/saas/src/server/routes.js";
@@ -279,6 +280,37 @@ describe("identity tenancy lifecycle on PGlite", () => {
       schema,
     } satisfies SaasHostDeps & { schema: typeof schema };
     registerSaasRoutes(app, deps);
+
+    const missingDefaults = await app.request("http://test/api/admin/agent-defaults");
+    assert.equal(missingDefaults.status, 503);
+
+    const invalidRole = await app.request(
+      `http://test/api/admin/tenants/${routeTenant.tenant.id}/members`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ userId: ownerB, role: "viewer" }),
+      },
+    );
+    assert.equal(invalidRole.status, 400, await invalidRole.clone().text());
+
+    const oldPayload = verifySession(
+      "route-secret",
+      signSession("route-secret", {
+        userId: routeMember.id,
+        tenantId: routeTenant.tenant.id,
+        email: routeMember.email,
+        role: "member",
+        iat: Math.floor(Date.now() / 1000) - 60,
+      }),
+    )!;
+    const passwordUpdate = await app.request(`http://test/api/admin/users/${routeMember.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ password: "replacement-password" }),
+    });
+    assert.equal(passwordUpdate.status, 200, await passwordUpdate.clone().text());
+    assert.equal((await new IdentitySessionService(db).lookup(oldPayload)).status, "invalid");
 
     const foreignPatch = await app.request(`http://test/api/tenant/members/${foreign!.id}`, {
       method: "PATCH",

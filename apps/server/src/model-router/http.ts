@@ -64,19 +64,29 @@ function record(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-/** Preserve structured provider failures carried inside a successful SSE response. */
+/**
+ * Preserve structured provider failures carried inside a successful transport
+ * response. Providers use the same error envelope for SSE frames and JSON
+ * bodies, and several of them encode retry policy as a symbolic status rather
+ * than an HTTP status.
+ */
 export function providerStreamError(prefix: string, payload: unknown): UpstreamHttpError {
   const envelope = record(payload) ?? {};
   const nested = record(envelope.error) ?? envelope;
   const stringField = (key: string): string | undefined => {
     const value = nested[key] ?? envelope[key];
-    return typeof value === "string" && value ? value : undefined;
+    if (typeof value === "string" && value) return value;
+    return typeof value === "number" && Number.isFinite(value)
+      ? String(value)
+      : undefined;
   };
   const numericStatus = [
     nested.status,
     nested.status_code,
+    nested.code,
     envelope.status,
     envelope.status_code,
+    envelope.code,
   ]
     .map((value) =>
       typeof value === "number"
@@ -87,16 +97,22 @@ export function providerStreamError(prefix: string, payload: unknown): UpstreamH
     )
     .find((value): value is number => value != null);
   const code = stringField("code");
-  const type = stringField("type");
+  const symbolicStatus = [nested.status, envelope.status]
+    .find((value) => typeof value === "string" && !/^\d{3}$/.test(value)) as
+      | string
+      | undefined;
+  const type = stringField("type") ?? symbolicStatus;
   const message =
     stringField("message") ??
     (typeof envelope.error === "string" ? envelope.error : undefined) ??
     "upstream stream error";
-  const classification = `${code ?? ""} ${type ?? ""} ${message}`.toLowerCase();
+  const classification = `${code ?? ""} ${type ?? ""} ${symbolicStatus ?? ""} ${message}`.toLowerCase();
   const inferredStatus =
-    /rate[_ -]?limit|too[_ -]?many|quota/.test(classification)
+    /rate[_ -]?limit|too[_ -]?many|quota|throttl|resource[_ -]?exhausted/.test(
+      classification,
+    )
       ? 429
-      : /server[_ -]?error|overload|temporar|unavailable|internal[_ -]?error/.test(
+      : /server[_ -]?error|overload|temporar|unavailable|internal[_ -]?error|deadline[_ -]?exceeded/.test(
             classification,
           )
         ? 503

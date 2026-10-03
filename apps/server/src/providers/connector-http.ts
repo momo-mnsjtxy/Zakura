@@ -7,7 +7,7 @@
  */
 import { createHash } from "node:crypto";
 
-export type ConnectorAuthScheme = "bearer" | "token" | "private-token";
+export type ConnectorAuthScheme = "bearer" | "token" | "private-token" | "none";
 
 export type ConnectorRetryOptions = {
   /** Total attempts, including the first request. */
@@ -56,6 +56,7 @@ function authHeaders(
   source?: RequestInit["headers"],
 ): Headers {
   const headers = new Headers(source);
+  if (scheme === "none") return headers;
   if (scheme === "private-token") headers.set("PRIVATE-TOKEN", token);
   else if (scheme === "token") headers.set("Authorization", `Token ${token}`);
   else headers.set("Authorization", `Bearer ${token}`);

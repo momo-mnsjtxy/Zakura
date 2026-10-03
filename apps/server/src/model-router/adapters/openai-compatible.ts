@@ -197,6 +197,7 @@ async function chat(
     timeoutMs: timeout(route),
   });
   if (!res.ok) throw apiError("chat", res.status, res.data, res.text);
+  if (res.data?.error) throw providerStreamError("chat", res.data);
 
   const choice = res.data?.choices?.[0];
   const finishReason = choice?.finish_reason ?? null;
@@ -360,6 +361,7 @@ async function embed(
     timeoutMs: timeout(route),
   });
   if (!res.ok) throw apiError("embedding", res.status, res.data, res.text);
+  if (res.data?.error) throw providerStreamError("embedding", res.data);
   const rows = [...(res.data?.data ?? [])].sort(
     (a, b) => (a.index ?? 0) - (b.index ?? 0),
   );
@@ -400,6 +402,7 @@ async function rerank(
     timeoutMs: timeout(route),
   });
   if (!res.ok) throw apiError("rerank", res.status, res.data, res.text);
+  if (res.data?.error) throw providerStreamError("rerank", res.data);
   return {
     results: (res.data?.results ?? []).map((r, i) => ({
       index: r.index ?? i,
@@ -434,11 +437,16 @@ async function generateImage(
     timeoutMs: timeout(route) * 2,
   });
   if (!res.ok) throw apiError("image", res.status, res.data, res.text);
-  return {
-    images: (res.data?.data ?? []).map((d) => ({
+  if (res.data?.error) throw providerStreamError("image", res.data);
+  const images = (res.data?.data ?? []).map((d) => ({
       url: d.url,
       b64Json: d.b64_json,
-    })),
+    }));
+  if (!images.some((image) => image.url || image.b64Json)) {
+    throw new Error("image response missing image data");
+  }
+  return {
+    images,
     model: res.data?.model ?? route.model,
   };
 }

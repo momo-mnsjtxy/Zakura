@@ -2,7 +2,7 @@
  * Space 项目记录：对话分组与说明。工作区目录可选。
  * 项目归 Space 所有，空间内成员 Agent 共享。
  */
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import {
   AGENT_PROJECTS_DIR,
   projectSlugsFromList,
@@ -10,7 +10,14 @@ import {
 } from "@zakura/shared";
 import type { WorkspaceFs } from "@zakura/core";
 import type { Db } from "../db/client.js";
-import { newId, spaceProjects, type SpaceProjectRow } from "../db/schema.js";
+import {
+  agentSchedules,
+  agents,
+  cloudAgentSessions,
+  newId,
+  spaceProjects,
+  type SpaceProjectRow,
+} from "../db/schema.js";
 import { planProjectWorkspaceReconciliation } from "./project-reconciliation.js";
 
 export type AgentProjectDto = {
@@ -128,6 +135,45 @@ export async function deleteSpaceProjectRow(db: Db, spaceId: string, slug: strin
   if (!existing) return false;
   await db.delete(spaceProjects).where(eq(spaceProjects.id, existing.id));
   return true;
+}
+
+/** Rename/clear project references for every collaborating Agent in the Space. */
+export async function rebindSpaceProjectRefs(
+  db: Db,
+  input: {
+    tenantId: string;
+    spaceId: string;
+    from: string;
+    to: string | null;
+  },
+): Promise<void> {
+  const members = await db
+    .select({ id: agents.id })
+    .from(agents)
+    .where(and(eq(agents.tenantId, input.tenantId), eq(agents.spaceId, input.spaceId)));
+  const agentIds = members.map((member) => member.id);
+  if (agentIds.length === 0) return;
+  const now = new Date();
+  await db
+    .update(cloudAgentSessions)
+    .set({ project: input.to, updatedAt: now })
+    .where(
+      and(
+        eq(cloudAgentSessions.tenantId, input.tenantId),
+        inArray(cloudAgentSessions.agentId, agentIds),
+        eq(cloudAgentSessions.project, input.from),
+      ),
+    );
+  await db
+    .update(agentSchedules)
+    .set({ project: input.to, updatedAt: now })
+    .where(
+      and(
+        eq(agentSchedules.tenantId, input.tenantId),
+        inArray(agentSchedules.agentId, agentIds),
+        eq(agentSchedules.project, input.from),
+      ),
+    );
 }
 
 /** 把工作区里已有目录补进记录，并把 hasWorkspace 与实盘对齐 */

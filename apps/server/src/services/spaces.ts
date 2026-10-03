@@ -1,4 +1,5 @@
 import { and, asc, eq, gte, inArray, isNotNull } from "drizzle-orm";
+import { rmSync } from "node:fs";
 import { join } from "node:path";
 import type { AppConfig } from "../config.js";
 import type { Db } from "../db/client.js";
@@ -28,6 +29,11 @@ export type SpaceGraph = {
 /** 回填默认空间时使用的确定性 id 前缀（与 0062 迁移一致） */
 export const DEFAULT_SPACE_SLUG = "default";
 
+export type SpaceLifecycle = {
+  /** Remove runner-owned resources before the database cascade becomes irreversible. */
+  beforeDelete?: (space: Space) => Promise<void>;
+};
+
 function slugify(input: string): string {
   return (
     input
@@ -43,7 +49,11 @@ export function spaceWorkspaceHostPath(config: AppConfig, spaceId: string): stri
 }
 
 export class SpaceService {
-  constructor(private readonly db: Db, private readonly config: AppConfig) {}
+  constructor(
+    private readonly db: Db,
+    private readonly config: AppConfig,
+    private readonly lifecycle: SpaceLifecycle = {},
+  ) {}
 
   async list(tenantId: string): Promise<Space[]> {
     return this.db
@@ -173,9 +183,17 @@ export class SpaceService {
     if (space.slug === DEFAULT_SPACE_SLUG) {
       throw new Error("默认空间不可删除");
     }
+    // A Space owns its computer. Stop/remove it before cascading the Space row;
+    // otherwise an offline/failed runner cleanup leaves an unaddressable orphan.
+    await this.lifecycle.beforeDelete?.(space);
     await this.db
       .delete(spaces)
       .where(and(eq(spaces.tenantId, tenantId), eq(spaces.id, space.id)));
+    try {
+      rmSync(spaceWorkspaceHostPath(this.config, space.id), { recursive: true, force: true });
+    } catch {
+      // Remote workspaces do not necessarily have a server-local directory.
+    }
     return true;
   }
 
@@ -297,6 +315,7 @@ export class SpaceService {
       workspaceKind: space.workspaceKind,
       workspaceStatus: space.workspaceStatus,
       workspaceRevision: space.workspaceRevision ?? null,
+      lastError: space.lastError ?? null,
       workspaceHostPath: spaceWorkspaceHostPath(this.config, space.id),
       isDefault: space.slug === DEFAULT_SPACE_SLUG,
       agentCount: extra?.agentCount ?? 0,

@@ -4,7 +4,7 @@ import type {
   ModelRerankResult,
 } from "@zakura/shared";
 import type { ModelProtocolAdapter } from "../adapter.js";
-import { apiError, httpJson } from "../http.js";
+import { apiError, httpJson, providerStreamError } from "../http.js";
 import type { ResolvedRoute } from "../types.js";
 
 export type BailianRemoteModel = {
@@ -268,7 +268,7 @@ async function embed(
     throw apiError("dashscope embedding", res.status, res.data, msg || res.text);
   }
   if (res.data?.code && res.data.code !== "Success") {
-    throw new Error(`dashscope embedding: ${res.data.message ?? res.data.code}`);
+    throw providerStreamError("dashscope embedding", res.data);
   }
 
   const rows = [...(res.data?.output?.embeddings ?? [])].sort(
@@ -338,7 +338,7 @@ async function rerank(
     throw apiError("dashscope rerank", res.status, res.data, msg || res.text);
   }
   if (res.data?.code && res.data.code !== "Success") {
-    throw new Error(`dashscope rerank: ${res.data.message ?? res.data.code}`);
+    throw providerStreamError("dashscope rerank", res.data);
   }
 
   const results = res.data?.output?.results ?? [];

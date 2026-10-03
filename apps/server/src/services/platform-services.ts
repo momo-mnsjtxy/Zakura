@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { decryptJson, encryptJson } from "@zakura/core";
 import type { PlatformServiceKey, PlatformServiceMode } from "@zakura/shared";
 import { PLATFORM_SERVICE_KEYS, PLATFORM_SERVICE_MODES } from "@zakura/shared";
@@ -111,22 +111,21 @@ export class PlatformServiceManager {
 
   async ensureRows(): Promise<void> {
     for (const key of PLATFORM_SERVICE_KEYS) {
-      const existing = await this.db.query.platformServices.findFirst({
-        where: eq(platformServices.serviceKey, key),
-      });
-      if (existing) continue;
       const now = new Date();
-      await this.db.insert(platformServices).values({
-        id: newId(),
-        serviceKey: key,
-        mode: "disabled",
-        desiredState: "stopped",
-        status: "stopped",
-        configEnc: encryptJson(this.config.secret, defaultServiceConfig()),
-        containersJson: "[]",
-        createdAt: now,
-        updatedAt: now,
-      });
+      await this.db
+        .insert(platformServices)
+        .values({
+          id: newId(),
+          serviceKey: key,
+          mode: "disabled",
+          desiredState: "stopped",
+          status: "stopped",
+          configEnc: encryptJson(this.config.secret, defaultServiceConfig()),
+          containersJson: "[]",
+          createdAt: now,
+          updatedAt: now,
+        })
+        .onConflictDoNothing({ target: platformServices.serviceKey });
     }
   }
 
@@ -135,6 +134,14 @@ export class PlatformServiceManager {
       return decryptJson<PlatformServiceConfig>(this.config.secret, row.configEnc);
     } catch {
       return defaultServiceConfig();
+    }
+  }
+
+  private readConfigForMutation(row: PlatformService): PlatformServiceConfig {
+    try {
+      return decryptJson<PlatformServiceConfig>(this.config.secret, row.configEnc);
+    } catch {
+      throw new Error("平台服务配置无法解密，已拒绝覆盖；请检查 ZAKURA_SECRET");
     }
   }
 
@@ -302,7 +309,7 @@ export class PlatformServiceManager {
     },
   ): Promise<PlatformServicePublic> {
     const row = await this.requireRow(key);
-    const cfg = this.readConfig(row);
+    const cfg = this.readConfigForMutation(row);
     if (patch.config) {
       if (typeof patch.config.image === "string") cfg.image = patch.config.image || undefined;
       if (typeof patch.config.hostPort === "number") cfg.hostPort = patch.config.hostPort;
@@ -347,7 +354,7 @@ export class PlatformServiceManager {
         .where(eq(platformServices.serviceKey, key));
     }
 
-    return this.toPublic(row);
+    return this.toPublic(await this.requireRow(key));
   }
 
   /** Enable managed mode + start deploy (async). */
@@ -370,7 +377,7 @@ export class PlatformServiceManager {
     externalUrl?: string,
   ): Promise<PlatformServicePublic> {
     const row = await this.requireRow(key);
-    const cfg = this.readConfig(row);
+    const cfg = this.readConfigForMutation(row);
     if (externalUrl?.trim()) cfg.externalUrl = externalUrl.trim();
     if (!cfg.externalUrl?.trim()) {
       throw new Error("请填写外接服务 URL");
@@ -421,14 +428,17 @@ export class PlatformServiceManager {
       }
     });
 
-    return this.toPublic(row);
+    return this.toPublic(await this.requireRow(key));
   }
 
   /**
    * Start managed service. Returns immediately; deploy continues in background.
    * Subscribe to platform_service_progress SSE for steps.
    */
-  async startAsync(key: PlatformServiceKey): Promise<PlatformServicePublic> {
+  async startAsync(
+    key: PlatformServiceKey,
+    opts: { recoverStarting?: boolean } = {},
+  ): Promise<PlatformServicePublic> {
     const row = await this.requireRow(key);
     this.liveHealth.delete(key);
     const mode = parseMode(row.mode);
@@ -436,7 +446,15 @@ export class PlatformServiceManager {
       return this.connectExternal(key);
     }
 
-    await this.db
+    if (
+      !opts.recoverStarting &&
+      row.desiredState === "running" &&
+      (row.status === "starting" || row.status === "running")
+    ) {
+      return this.toPublic(row);
+    }
+
+    const claimed = await this.db
       .update(platformServices)
       .set({
         status: "starting",
@@ -445,7 +463,10 @@ export class PlatformServiceManager {
         lastError: null,
         updatedAt: new Date(),
       })
-      .where(eq(platformServices.serviceKey, key));
+      .where(and(eq(platformServices.id, row.id), eq(platformServices.updatedAt, row.updatedAt)))
+      .returning();
+
+    if (!claimed.length) return this.toPublic(await this.requireRow(key));
 
     this.queueJob(key, async () => {
       await this.startManaged(key);
@@ -520,7 +541,7 @@ export class PlatformServiceManager {
         signal: AbortSignal.timeout(8000),
         headers: cfg.apiKey ? { Authorization: `Bearer ${cfg.apiKey}` } : undefined,
       });
-      const ok = res.status < 500;
+      const ok = res.ok;
       this.liveHealth.set(key, {
         status: ok ? "healthy" : "unhealthy",
         error: ok ? null : `HTTP ${res.status}`,
@@ -578,7 +599,7 @@ export class PlatformServiceManager {
       }
       if (mode === "managed" && row.desiredState === "running") {
         try {
-          await this.startAsync(row.serviceKey as PlatformServiceKey);
+          await this.startAsync(row.serviceKey as PlatformServiceKey, { recoverStarting: true });
           started += 1;
         } catch (err) {
           failed += 1;
@@ -665,7 +686,7 @@ export class PlatformServiceManager {
   private async startManaged(key: PlatformServiceKey): Promise<void> {
     const row = await this.requireRow(key);
     const def = PLATFORM_SERVICE_CATALOG[key];
-    let cfg = this.readConfig(row);
+    let cfg = this.readConfigForMutation(row);
 
     beginPlatformServiceProgress(key, "checking", "");
     setPlatformServicePhase(key, "checking", 5);
@@ -713,6 +734,16 @@ export class PlatformServiceManager {
       const total = specs.length;
 
       for (let i = 0; i < specs.length; i++) {
+        const desired = await this.requireRow(key);
+        if (desired.desiredState !== "running" || parseMode(desired.mode) !== "managed") {
+          await this.removeServiceContainers(key);
+          await this.db
+            .update(platformServices)
+            .set({ status: "stopped", containersJson: "[]", endpointUrl: null, updatedAt: new Date() })
+            .where(eq(platformServices.serviceKey, key));
+          finishPlatformServiceProgress(key, { message: "start cancelled" });
+          return;
+        }
         const spec = specs[i]!;
         const role = spec.labels?.["zakura.service_role"] ?? "main";
         const basePct = 15 + Math.floor((i / Math.max(total, 1)) * 65);
@@ -767,6 +798,12 @@ export class PlatformServiceManager {
           { step: "create", phase: "creating", percent: basePct + 35, level: "ok" },
         );
         refs.push({ name: running.name, dockerId: running.id, role });
+        // Persist incrementally so a later container/start failure remains
+        // reconcilable after process restart.
+        await this.db
+          .update(platformServices)
+          .set({ containersJson: JSON.stringify(refs), updatedAt: new Date() })
+          .where(eq(platformServices.serviceKey, key));
 
         // Real container stdout/stderr right after start
         try {
@@ -822,6 +859,17 @@ export class PlatformServiceManager {
         }
       }
 
+      const desired = await this.requireRow(key);
+      if (desired.desiredState !== "running" || parseMode(desired.mode) !== "managed") {
+        await this.removeServiceContainers(key);
+        await this.db
+          .update(platformServices)
+          .set({ status: "stopped", containersJson: "[]", endpointUrl: null, updatedAt: new Date() })
+          .where(eq(platformServices.serviceKey, key));
+        finishPlatformServiceProgress(key, { message: "start cancelled" });
+        return;
+      }
+
       await this.db
         .update(platformServices)
         .set({
@@ -873,10 +921,22 @@ export class PlatformServiceManager {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       appendPlatformServiceLog(key, message, { step: "error", level: "error" });
+      let cleanupOk = true;
+      try {
+        await this.removeServiceContainers(key);
+      } catch (cleanupError) {
+        cleanupOk = false;
+        appendPlatformServiceLog(
+          key,
+          `cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+          { step: "cleanup", level: "error" },
+        );
+      }
       await this.db
         .update(platformServices)
         .set({
           status: "error",
+          ...(cleanupOk ? { containersJson: "[]" } : {}),
           lastError: message,
           updatedAt: new Date(),
         })
@@ -911,6 +971,7 @@ export class PlatformServiceManager {
   private async removeServiceContainers(key: PlatformServiceKey): Promise<void> {
     const row = await this.requireRow(key);
     const refs = parseContainers(row.containersJson);
+    const failures: string[] = [];
     for (const ref of refs) {
       if (!ref.dockerId) continue;
       try {
@@ -918,6 +979,7 @@ export class PlatformServiceManager {
         await this.runtime.remove(ref.dockerId, true);
       } catch (err) {
         console.warn(`[platform-services] remove ${ref.name}:`, err);
+        failures.push(`${ref.name}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
     try {
@@ -927,8 +989,8 @@ export class PlatformServiceManager {
           await this.runtime.remove(c.id, true);
         }
       }
-    } catch {
-      /* ignore */
+    } catch (err) {
+      failures.push(`label cleanup: ${err instanceof Error ? err.message : String(err)}`);
     }
     const def = PLATFORM_SERVICE_CATALOG[key];
     for (const role of def.containers) {
@@ -938,10 +1000,29 @@ export class PlatformServiceManager {
         for (const c of listed) {
           if (c.name === name) await this.runtime.remove(c.id, true);
         }
-      } catch {
-        /* ignore */
+      } catch (err) {
+        failures.push(`${name}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
+
+    let verifiedClean = false;
+    try {
+      const remaining = (await this.runtime.list({ purpose: "platform-service" })).filter(
+        (container) =>
+          container.labels?.["zakura.service"] === key ||
+          def.containers.some((role) => container.name === containerNameFor(key, role.role)),
+      );
+      if (remaining.length) {
+        failures.push(`containers remain: ${remaining.map((container) => container.name).join(", ")}`);
+      } else {
+        verifiedClean = true;
+      }
+    } catch (err) {
+      if (failures.length) {
+        failures.push(`verification: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (failures.length && !verifiedClean) throw new Error(failures.join("; "));
   }
 }
 

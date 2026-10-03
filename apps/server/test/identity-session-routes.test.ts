@@ -78,4 +78,33 @@ describe("identity session lifecycle routes", () => {
     const schema=await import("../src/db/schema.js");const invitedId=schema.newId();await db.insert(schema.users).values({id:invitedId,email:"invited@example.test",passwordHash:null});const {TenantService}=await import("../src/services/tenants.js");const service=new TenantService(db);const expired=await service.createInvite({tenantId,email:"expired@example.test",role:"member",invitedByUserId:passwordUserId,ttlHours:-1});await assert.rejects(()=>service.acceptInvite({token:expired.token,email:"expired@example.test",password:"password-123"}),/expired/i);const made=await service.createInvite({tenantId,email:"invited@example.test",role:"member",invitedByUserId:passwordUserId});const redeem=()=>service.acceptInvite({token:made.token,userId:invitedId});const outcomes=await Promise.allSettled([redeem(),redeem()]);assert.equal(outcomes.filter(x=>x.status==="fulfilled").length,1);assert.equal(outcomes.filter(x=>x.status==="rejected").length,1);const memberships=await db.query.tenantMemberships.findMany({where:eq(schema.tenantMemberships.userId,invitedId)});assert.equal(memberships.length,1);
   });
 
+  it("enforces optional, admins and all tenant MFA policies on the real login route",async()=>{
+    const schema=await import("../src/db/schema.js");
+    const {setTenantMfaPolicy}=await import("../src/services/identity/mfa.js");
+    const password="mfa-policy-password";const passwordHash=await bcrypt.hash(password,4);
+    const rows=[
+      {id:schema.newId(),email:"mfa-owner@example.test",role:"owner"},
+      {id:schema.newId(),email:"mfa-admin@example.test",role:"admin"},
+      {id:schema.newId(),email:"mfa-member@example.test",role:"member"},
+      {id:schema.newId(),email:"mfa-enrolled@example.test",role:"admin"},
+    ] as const;
+    await db.insert(schema.users).values(rows.map((row)=>({id:row.id,email:row.email,passwordHash})));
+    await db.insert(schema.tenantMemberships).values(rows.map((row)=>({id:schema.newId(),tenantId,userId:row.id,role:row.role,status:"active"})));
+    await db.insert(schema.userWebauthnCredentials).values({
+      id:schema.newId(),userId:rows[3].id,credentialId:`cred-${schema.newId()}`,
+      publicKey:"AA",counter:0,name:"Policy passkey",transportsJson:"[]",createdAt:new Date(),
+    });
+    const login=(email:string)=>app.request("http://local/api/auth/login",{
+      method:"POST",headers:{"content-type":"application/json"},
+      body:JSON.stringify({email,password,tenantSlug:"identity"}),
+    });
+    await setTenantMfaPolicy(db,tenantId,"optional");assert.equal((await login(rows[0].email)).status,200);
+    await setTenantMfaPolicy(db,tenantId,"admins");
+    for(const row of rows.slice(0,2)){const response=await login(row.email);assert.equal(response.status,403);assert.equal(((await response.json()) as {code?:string}).code,"mfa_enrollment_required")}
+    assert.equal((await login(rows[2].email)).status,200);
+    const enrolled=await login(rows[3].email);assert.equal(enrolled.status,200);const enrolledBody=await enrolled.json() as {mfaRequired?:boolean;methods?:string[]};assert.equal(enrolledBody.mfaRequired,true);assert.deepEqual(enrolledBody.methods,["webauthn"]);
+    await setTenantMfaPolicy(db,tenantId,"all");const allDenied=await login(rows[2].email);assert.equal(allDenied.status,403);assert.equal(((await allDenied.json()) as {code?:string}).code,"mfa_enrollment_required");
+    await setTenantMfaPolicy(db,tenantId,"optional");
+  });
+
 });

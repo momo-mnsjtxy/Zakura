@@ -98,4 +98,50 @@ describe("remote channel binding lifecycle", () => {
     assert.equal(shutdowns, 1, "repeat lifecycle notifications remain idempotent");
     await assert.rejects(runtime.startBinding(binding.tenantId, binding.id), /团队不可用/);
   });
+
+  it("retries Telegram webhook refresh and persists one generated secret", async () => {
+    const binding = {
+      id: "binding-telegram", tenantId: "tenant-telegram", agentId: "agent-telegram",
+      platform: "telegram", profileKey: "remote-telegram", enabled: true,
+    };
+    let persisted: Record<string, unknown> | null = null;
+    const ingress = {
+      getBinding: async () => binding,
+      getBindingCredentials: () => ({
+        enabled: true, values: { botToken: "fake-bot-token", mode: "webhook" },
+        configuredFields: ["botToken"],
+      }),
+      mergeBindingCredentials: async (_tenantId: string, _bindingId: string, patch: Record<string, unknown>) => {
+        persisted = patch;
+      },
+      isTenantAvailable: async () => true,
+      listBindings: async () => [binding],
+    };
+    const runtime = new RemoteChannelRuntime(
+      { databaseUrl: "pglite:test", publicBaseUrl: "https://zakura.example.test" } as never,
+      {} as never, ingress as never, {} as never,
+    );
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    let lastBody = "";
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      calls++;
+      lastBody = String(init?.body ?? "");
+      if (calls < 3) return Response.json({ ok: false, description: "temporary" }, { status: 503 });
+      return Response.json({ ok: true });
+    }) as typeof fetch;
+    try {
+      await (runtime as unknown as {
+        tryRegisterTelegramWebhook: (tenantId: string, row: typeof binding) => Promise<void>;
+      }).tryRegisterTelegramWebhook(binding.tenantId, binding);
+      assert.equal(calls, 3);
+      assert.equal(typeof persisted?.secretToken, "string");
+      const body = JSON.parse(lastBody) as { url: string; secret_token: string };
+      assert.equal(body.secret_token, persisted?.secretToken);
+      assert.equal(body.url, `https://zakura.example.test/api/remote-channels/${binding.tenantId}/${binding.id}/webhook`);
+    } finally {
+      globalThis.fetch = originalFetch;
+      await runtime.stop();
+    }
+  });
 });

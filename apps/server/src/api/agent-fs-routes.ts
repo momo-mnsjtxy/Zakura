@@ -1,5 +1,4 @@
 import type { Hono } from "hono";
-import { and, eq } from "drizzle-orm";
 import { PathJailError, scrubHostPathsInMessage, type WorkspaceFs } from "@zakura/core";
 import {
   AGENT_PROJECTS_DIR,
@@ -11,18 +10,19 @@ import {
   projectWorkspacePath,
 } from "@zakura/shared";
 import type { Db } from "../db/client.js";
-import { agentSchedules, cloudAgentSessions } from "../db/schema.js";
 import {
   deleteSpaceProjectRow,
   getSpaceProject,
   listSpaceProjectRows,
   listWorkspaceSlugs,
+  rebindSpaceProjectRefs,
   renameSpaceProjectRow,
   syncProjectsFromWorkspace,
   toProjectDto,
   upsertSpaceProject,
 } from "../services/agent-projects.js";
 import type { AgentService } from "../services/agents.js";
+import type { FileShareService } from "../services/file-shares.js";
 import type { ServerWorkspaceFsProvider } from "../services/workspace-fs-provider.js";
 import { platformEvents } from "../services/platform-events.js";
 import {
@@ -107,6 +107,7 @@ export function registerAgentFsRoutes(
   agentService: AgentService,
   fsProvider: ServerWorkspaceFsProvider,
   db: Db,
+  fileShares?: FileShareService | null,
 ) {
   app.get("/api/agents/:id/fs", async (c) => {
     const session = c.get("session")!;
@@ -576,7 +577,22 @@ export function registerAgentFsRoutes(
     if (nextSlug !== from) {
       const renamed = await renameSpaceProjectRow(db, agent.spaceId, from, nextSlug);
       if (!renamed) return c.json({ error: "无法重命名项目" }, 409);
-      await rebindProjectRefs(db, agent.tenantId, agent.id, from, nextSlug);
+      await rebindSpaceProjectRefs(db, {
+        tenantId: agent.tenantId,
+        spaceId: agent.spaceId,
+        from,
+        to: nextSlug,
+      });
+      if (fileShares) {
+        const agentIds = (await agentService.list(agent.tenantId, { spaceId: agent.spaceId }))
+          .map((member) => member.id);
+        await fileShares.rebaseActivePaths(
+          agent.tenantId,
+          agentIds,
+          projectRelativePath(from),
+          projectRelativePath(nextSlug),
+        );
+      }
       row = renamed;
     }
     row = await upsertSpaceProject(db, {
@@ -607,25 +623,41 @@ export function registerAgentFsRoutes(
         session.tenantId,
         agent.id,
       );
-      if (resolved && !resolved.denied) {
-        try {
-          deletedDir = await deleteProject(resolved.fs, slug);
-          if (deletedDir) {
-            platformEvents.publish(resolved.agent.tenantId, {
-              type: "agent_fs_changed",
-              agentId: resolved.agent.id,
-              path: `/${projectRelativePath(slug)}`,
-            });
-          }
-        } catch (err) {
-          if (err instanceof ProjectFsError) return c.json({ error: err.message }, err.status);
-          const e = fsError(err, resolved.fs);
-          return c.json(e.body, e.status);
+      if (!resolved) return c.json({ error: "Not found" }, 404);
+      if (resolved.denied) {
+        return c.json({ error: "Filesystem not enabled for this agent" }, 403);
+      }
+      try {
+        deletedDir = await deleteProject(resolved.fs, slug);
+        if (deletedDir) {
+          platformEvents.publish(resolved.agent.tenantId, {
+            type: "agent_fs_changed",
+            agentId: resolved.agent.id,
+            path: `/${projectRelativePath(slug)}`,
+          });
         }
+      } catch (err) {
+        if (err instanceof ProjectFsError) return c.json({ error: err.message }, err.status);
+        const e = fsError(err, resolved.fs);
+        return c.json(e.body, e.status);
       }
     }
     await deleteSpaceProjectRow(db, agent.spaceId, slug);
-    await rebindProjectRefs(db, agent.tenantId, agent.id, slug, null);
+    await rebindSpaceProjectRefs(db, {
+      tenantId: agent.tenantId,
+      spaceId: agent.spaceId,
+      from: slug,
+      to: null,
+    });
+    if (fileShares) {
+      const agentIds = (await agentService.list(agent.tenantId, { spaceId: agent.spaceId }))
+        .map((member) => member.id);
+      await fileShares.revokeActivePaths(
+        agent.tenantId,
+        agentIds,
+        projectRelativePath(slug),
+      );
+    }
     return c.json({ ok: true, deleted: true, deletedDir });
   });
 
@@ -840,35 +872,4 @@ export function registerAgentFsRoutes(
       return c.json(e.body, e.status);
     }
   });
-}
-
-/** 目录改名/删除后，会话与定时任务上的 slug 跟着改（含子代理）。 */
-async function rebindProjectRefs(
-  db: Db,
-  tenantId: string,
-  agentId: string,
-  from: string,
-  to: string | null,
-) {
-  const now = new Date();
-  await db
-    .update(cloudAgentSessions)
-    .set({ project: to, updatedAt: now })
-    .where(
-      and(
-        eq(cloudAgentSessions.tenantId, tenantId),
-        eq(cloudAgentSessions.agentId, agentId),
-        eq(cloudAgentSessions.project, from),
-      ),
-    );
-  await db
-    .update(agentSchedules)
-    .set({ project: to, updatedAt: now })
-    .where(
-      and(
-        eq(agentSchedules.tenantId, tenantId),
-        eq(agentSchedules.agentId, agentId),
-        eq(agentSchedules.project, from),
-      ),
-    );
 }

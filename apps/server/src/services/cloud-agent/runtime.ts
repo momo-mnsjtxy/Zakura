@@ -491,54 +491,67 @@ export class CloudAgentRuntime {
 
     const isFirstTurn = session.lastSeq === 0;
     const run = await this.store.createRun(input.sessionId);
-    if (session.createdByUserId) {
-      recordUserUsage({
-        tenantId: input.tenantId,
-        userId: session.createdByUserId,
-        category: "run",
-        action: "run_started",
-        agentId: input.agentId,
-        sessionId: input.sessionId,
-        resourceKind: "run",
-        resourceId: run.id,
-      });
-    }
-
-    if (!isRegenerate) {
-      // 先用首条消息截断作临时标题，运行结束后再由模型润色
-      if (!isContinue && isFirstTurn && session.title === "新对话") {
-        const title = content.length > 40 ? `${content.slice(0, 40)}…` : content;
-        await this.store.updateSession(input.tenantId, input.agentId, input.sessionId, {
-          title,
+    try {
+      if (session.createdByUserId) {
+        recordUserUsage({
+          tenantId: input.tenantId,
+          userId: session.createdByUserId,
+          category: "run",
+          action: "run_started",
+          agentId: input.agentId,
+          sessionId: input.sessionId,
+          resourceKind: "run",
+          resourceId: run.id,
         });
       }
+
+      if (!isRegenerate) {
+        // 先用首条消息截断作临时标题，运行结束后再由模型润色
+        if (!isContinue && isFirstTurn && session.title === "新对话") {
+          const title = content.length > 40 ? `${content.slice(0, 40)}…` : content;
+          await this.store.updateSession(input.tenantId, input.agentId, input.sessionId, {
+            title,
+          });
+        }
+        await this.store.appendEvent({
+          sessionId: input.sessionId,
+          type: "user_message",
+          runId: run.id,
+          payload: {
+            messageId: targetMessageId,
+            content,
+            ...(parentRunId !== undefined ? { parentRunId } : {}),
+            ...(attachments.length ? { attachments } : {}),
+            ...(isContinue ? { continue: true } : {}),
+            ...(input.userId && input.userId !== "api-key"
+              ? { userId: input.userId, ...(input.userName ? { userName: input.userName } : {}) }
+              : {}),
+          },
+        });
+      }
+
       await this.store.appendEvent({
         sessionId: input.sessionId,
-        type: "user_message",
+        type: "run_start",
         runId: run.id,
         payload: {
-          messageId: targetMessageId,
-          content,
-          ...(parentRunId !== undefined ? { parentRunId } : {}),
-          ...(attachments.length ? { attachments } : {}),
-          ...(isContinue ? { continue: true } : {}),
-          ...(input.userId && input.userId !== "api-key"
-            ? { userId: input.userId, ...(input.userName ? { userName: input.userName } : {}) }
-            : {}),
+          runId: run.id,
+          replyToMessageId: targetMessageId,
+          ...(input.options ? { options: input.options } : {}),
         },
       });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      try {
+        await failRun(this.store, input.sessionId, run.id, message);
+      } catch (recordError) {
+        recordPlatformFault("cloud_agent.allocate_run", recordError, {
+          subsystem: "cloud_agent",
+        });
+        await this.store.finishRun(input.sessionId, run.id, "failed", message).catch(() => undefined);
+      }
+      throw error;
     }
-
-    await this.store.appendEvent({
-      sessionId: input.sessionId,
-      type: "run_start",
-      runId: run.id,
-      payload: {
-        runId: run.id,
-        replyToMessageId: targetMessageId,
-        ...(input.options ? { options: input.options } : {}),
-      },
-    });
 
     // 异步执行，HTTP 立即返回；客户端通过事件流接收结果
     const actor = idsFromSession({
@@ -703,7 +716,9 @@ export class CloudAgentRuntime {
             await this.store.requeueFront(input.sessionId, taken);
             return;
           }
-          // 配置类错误（如模型路由缺失）：丢弃该项避免死循环，保留后续项
+          // Admission/preparation failures must not silently lose the user's
+          // queued message. Restore it and let an explicit retry/recovery drain it.
+          await this.store.requeueFront(input.sessionId, taken);
           recordPlatformFault("cloud_agent.queue_drain", message, {
             subsystem: "cloud_agent",
           });

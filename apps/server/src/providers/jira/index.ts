@@ -1,4 +1,5 @@
 import type { McpToolDef } from "@zakura/shared";
+import { createHash } from "node:crypto";
 import { createOauthRestProvider, int, restJson, str } from "../oauth-rest.js";
 
 const PRODUCTS = ["issues", "projects"] as const;
@@ -16,14 +17,28 @@ const toolDefs: Record<(typeof PRODUCTS)[number], McpToolDef[]> = {
   ],
 };
 
+const cloudIds = new Map<string, { expiresAt: number; value: Promise<string> }>();
+
 async function cloudId(token: string): Promise<string> {
-  const resources = await restJson<Array<{ id: string; url: string }>>(
-    "https://api.atlassian.com/oauth/token/accessible-resources",
-    token,
-  );
-  const first = resources[0];
-  if (!first?.id) throw new Error("未找到可访问的 Atlassian 站点，请确认 OAuth 授权范围");
-  return first.id;
+  const key = createHash("sha256").update(token).digest("base64url").slice(0, 16);
+  const cached = cloudIds.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  const value = (async () => {
+    const resources = await restJson<Array<{ id: string; url: string }>>(
+      "https://api.atlassian.com/oauth/token/accessible-resources",
+      token,
+    );
+    const first = resources[0];
+    if (!first?.id) throw new Error("未找到可访问的 Atlassian 站点，请确认 OAuth 授权范围");
+    return first.id;
+  })();
+  cloudIds.set(key, { expiresAt: Date.now() + 5 * 60_000, value });
+  try {
+    return await value;
+  } catch (error) {
+    if (cloudIds.get(key)?.value === value) cloudIds.delete(key);
+    throw error;
+  }
 }
 
 async function jiraFetch<T>(

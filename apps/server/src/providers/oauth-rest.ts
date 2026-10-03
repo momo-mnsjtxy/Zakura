@@ -212,7 +212,8 @@ export function str(args: Record<string, unknown>, key: string): string {
 }
 
 export function int(args: Record<string, unknown>, key: string, fallback?: number): number | undefined {
-  if (typeof args[key] === "number") return args[key] as number;
-  if (typeof args[key] === "string" && args[key]) return Number(args[key]);
+  const raw = args[key];
+  const parsed = typeof raw === "number" ? raw : typeof raw === "string" && raw ? Number(raw) : NaN;
+  if (Number.isFinite(parsed)) return Math.trunc(parsed);
   return fallback;
 }

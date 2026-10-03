@@ -49,7 +49,12 @@ import {
 } from "../services/auth.js";
 import { assertSessionAlive, touchLastLogin } from "../services/identity/sessions.js";
 import { issueAuthToken } from "../services/identity/tokens.js";
-import { mfaRequired, mfaStatus } from "../services/identity/mfa.js";
+import {
+  getTenantMfaPolicy,
+  mfaRequired,
+  mfaStatus,
+  tenantMfaPolicyRequires,
+} from "../services/identity/mfa.js";
 import { maybeAutoJoinTenant } from "../services/identity/domains.js";
 import { passwordLoginBlockedBySso } from "../services/identity/sso.js";
 import { loginThrottleClear, loginThrottleHit } from "../services/identity/throttle.js";
@@ -858,6 +863,16 @@ export async function createApiApp(deps: {
       emailVerified: Boolean(result.user.emailVerifiedAt),
     });
     const factors = await mfaStatus(db, result.user.id);
+    const tenantMfaPolicy = await getTenantMfaPolicy(db, result.tenant.id);
+    if (
+      tenantMfaPolicyRequires(tenantMfaPolicy, result.membership.role) &&
+      factors.methods.length === 0
+    ) {
+      return c.json(
+        { error: "团队策略要求先配置 MFA", code: "mfa_enrollment_required" },
+        403,
+      );
+    }
     if (mfaRequired(factors)) {
       const ticket = await issueAuthToken(db, {
         kind: "mfa_login",
@@ -2086,7 +2101,7 @@ export async function createApiApp(deps: {
         getTelemetry().mcpErrors.inc({ kind: "api_list_resource_templates" });
       }
 
-      const container = await agentService.workspace.getWorkspaceContainer(agent.id);
+      const container = await agentService.workspace.getWorkspaceContainer(agent.spaceId);
       let desktop: Awaited<ReturnType<typeof agentService.workspace.getDesktopInfo>>;
       try {
         desktop = await agentService.workspace.getDesktopInfo(agent);
@@ -2253,7 +2268,7 @@ export async function createApiApp(deps: {
           : {}),
         userId: session.userId,
       });
-      const container = await agentService.workspace.getWorkspaceContainer(agent.id);
+      const container = await agentService.workspace.getWorkspaceContainer(agent.spaceId);
       return c.json({
         ...agentService.serialize(agent, {
           workspace: container
@@ -2280,7 +2295,7 @@ export async function createApiApp(deps: {
     const agent = await agentService.get(session.tenantId, c.req.param("id"));
     if (!agent) return c.json({ error: "Not found" }, 404);
     const { getAgentProgress } = await import("../services/space-progress.js");
-    const container = await agentService.workspace.getWorkspaceContainer(agent.id);
+    const container = await agentService.workspace.getWorkspaceContainer(agent.spaceId);
     const progress = getAgentProgress(agent.id);
     const needsWs = agent.enableComputer;
     const workspaceStatus = progress.running
@@ -2307,7 +2322,7 @@ export async function createApiApp(deps: {
     const session = c.get("session")!;
     try {
       const agent = await agentService.stop(session.tenantId, c.req.param("id"));
-      const container = await agentService.workspace.getWorkspaceContainer(agent.id);
+      const container = await agentService.workspace.getWorkspaceContainer(agent.spaceId);
       return c.json(
         agentService.serialize(agent, {
           workspace: container
@@ -2466,7 +2481,7 @@ export async function createApiApp(deps: {
   // ── Per-agent memory (data isolated by agentId) ───────────────────────
   // Agent workspace filesystem — routes via WorkspaceFsProvider (local or remote)
   if (workspaceFsProvider) {
-    registerAgentFsRoutes(app, agentService, workspaceFsProvider, db);
+    registerAgentFsRoutes(app, agentService, workspaceFsProvider, db, fileShares);
     if (fileShares) {
       registerFileShareRoutes(app, fileShares, agentService, workspaceFsProvider);
     }

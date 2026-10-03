@@ -39,10 +39,14 @@ import {
   enableTotp,
   finishWebauthnLogin,
   finishWebauthnRegistration,
+  getTenantMfaPolicy,
   mfaStatus,
   regenerateRecoveryCodes,
   renameWebauthnCredential,
   startTotpSetup,
+  setTenantMfaPolicy,
+  tenantMfaPolicyRequires,
+  type TenantMfaPolicy,
   verifyUserTotp,
   consumeRecoveryCode,
 } from "../services/identity/mfa.js";
@@ -446,7 +450,15 @@ export function registerIdentityRoutes(
   app.get("/api/me/mfa", async (c) => {
     const session = c.get("session")!;
     if (session.userId === "api-key") return c.json({ totp: false, webauthn: false, methods: [], credentials: [] });
-    return c.json(await mfaStatus(db, session.userId));
+    const [status, policy] = await Promise.all([
+      mfaStatus(db, session.userId),
+      getTenantMfaPolicy(db, session.tenantId),
+    ]);
+    return c.json({
+      ...status,
+      policy,
+      required: tenantMfaPolicyRequires(policy, session.role),
+    });
   });
 
   app.post("/api/me/mfa/totp/start", async (c) => {
@@ -488,6 +500,13 @@ export function registerIdentityRoutes(
     const session = c.get("session")!;
     const body = await c.req.json<{ code?: string; recoveryCode?: string }>().catch(() => ({}) as never);
     try {
+      const [policy, status] = await Promise.all([
+        getTenantMfaPolicy(db, session.tenantId),
+        mfaStatus(db, session.userId),
+      ]);
+      if (tenantMfaPolicyRequires(policy, session.role) && status.credentials.length === 0) {
+        return c.json({ error: "团队策略要求保留至少一种 MFA 方式" }, 409);
+      }
       await disableTotp(db, session.userId, config.secret, {
         code: body.code,
         recoveryCode: body.recoveryCode,
@@ -551,8 +570,51 @@ export function registerIdentityRoutes(
 
   app.delete("/api/me/mfa/webauthn/:id", async (c) => {
     const session = c.get("session")!;
+    const [policy, status] = await Promise.all([
+      getTenantMfaPolicy(db, session.tenantId),
+      mfaStatus(db, session.userId),
+    ]);
+    const ownsCredential = status.credentials.some((item) => item.id === c.req.param("id"));
+    if (
+      ownsCredential &&
+      tenantMfaPolicyRequires(policy, session.role) &&
+      !status.totp &&
+      status.credentials.length <= 1
+    ) {
+      return c.json({ error: "团队策略要求保留至少一种 MFA 方式" }, 409);
+    }
     const ok = await deleteWebauthnCredential(db, session.userId, c.req.param("id"));
     return c.json({ ok });
+  });
+
+  app.get("/api/tenant/identity/mfa", async (c) => {
+    const session = c.get("session")!;
+    if (!isSessionAdmin(session)) return c.json({ error: "Admin only" }, 403);
+    return c.json({ policy: await getTenantMfaPolicy(db, session.tenantId) });
+  });
+
+  app.put("/api/tenant/identity/mfa", async (c) => {
+    const session = c.get("session")!;
+    if (!isSessionAdmin(session)) return c.json({ error: "Admin only" }, 403);
+    const body = await c.req
+      .json<{ policy?: TenantMfaPolicy }>()
+      .catch(() => ({}) as { policy?: TenantMfaPolicy });
+    try {
+      const policy = await setTenantMfaPolicy(
+        db,
+        session.tenantId,
+        body.policy as TenantMfaPolicy,
+      );
+      await audit.append(session.tenantId, "mfa.policy", {
+        actor: actor(session, clientIpFromHeaders((name) => c.req.header(name))),
+        targetType: "tenant",
+        targetId: session.tenantId,
+        detail: { policy },
+      });
+      return c.json({ policy });
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
   });
 
   app.get("/api/tenant/identity/domains", async (c) => {
@@ -584,7 +646,18 @@ export function registerIdentityRoutes(
     if (!isSessionAdmin(session)) return c.json({ error: "Admin only" }, 403);
     const body = await c.req.json<{ joinMode?: JoinMode }>().catch(() => ({}) as never);
     try {
-      await setDomainJoinMode(db, session.tenantId, c.req.param("id"), body.joinMode ?? "invite_only");
+      const updated = await setDomainJoinMode(
+        db,
+        session.tenantId,
+        c.req.param("id"),
+        body.joinMode ?? "invite_only",
+      );
+      await audit.append(session.tenantId, "domain.policy", {
+        actor: actor(session, clientIpFromHeaders((name) => c.req.header(name))),
+        targetType: "domain",
+        targetId: updated.id,
+        detail: { joinMode: updated.joinMode },
+      });
       return c.json({ ok: true });
     } catch (err) {
       return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
@@ -610,7 +683,8 @@ export function registerIdentityRoutes(
   app.delete("/api/tenant/identity/domains/:id", async (c) => {
     const session = c.get("session")!;
     if (!isSessionAdmin(session)) return c.json({ error: "Admin only" }, 403);
-    await removeTenantDomain(db, session.tenantId, c.req.param("id"));
+    const removed = await removeTenantDomain(db, session.tenantId, c.req.param("id"));
+    if (!removed) return c.json({ error: "域名不存在" }, 404);
     await audit.append(session.tenantId, "domain.remove", {
       actor: actor(session, clientIpFromHeaders((name) => c.req.header(name))),
       targetType: "domain",
@@ -696,6 +770,9 @@ export function registerIdentityRoutes(
       : session.tenantId;
     const since = c.req.query("since") ? new Date(c.req.query("since")!) : undefined;
     const until = c.req.query("until") ? new Date(c.req.query("until")!) : undefined;
+    if (since && !Number.isFinite(since.getTime())) return c.json({ error: "Invalid since" }, 400);
+    if (until && !Number.isFinite(until.getTime())) return c.json({ error: "Invalid until" }, 400);
+    if (since && until && since > until) return c.json({ error: "since must not exceed until" }, 400);
     const format = c.req.query("format");
     if (format === "csv") {
       const items = await audit.listAll(tenantId, { action: c.req.query("action") ?? undefined, since, until });
@@ -720,7 +797,20 @@ export function registerIdentityRoutes(
     const session = c.get("session")!;
     if (!isSessionAdmin(session)) return c.json({ error: "Admin only" }, 403);
     const body = await c.req.json<{ retentionDays?: number }>().catch(() => ({}) as never);
-    const retentionDays = await audit.setRetentionDays(session.tenantId, Number(body.retentionDays ?? 365));
-    return c.json({ retentionDays });
+    try {
+      const retentionDays = await audit.setRetentionDays(
+        session.tenantId,
+        Number(body.retentionDays ?? 365),
+      );
+      await audit.append(session.tenantId, "audit.retention", {
+        actor: actor(session, clientIpFromHeaders((name) => c.req.header(name))),
+        targetType: "tenant",
+        targetId: session.tenantId,
+        detail: { retentionDays },
+      });
+      return c.json({ retentionDays });
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
   });
 }

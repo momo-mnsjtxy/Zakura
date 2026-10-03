@@ -39,7 +39,7 @@ export class ServerWorkspaceFsProvider implements WorkspaceFsProvider {
     });
     if (!agent) throw new Error(`Agent not found: ${agentId}`);
     const space = await this.db.query.spaces.findFirst({
-      where: eq(spaces.id, agent.spaceId),
+      where: and(eq(spaces.id, agent.spaceId), eq(spaces.tenantId, tenantId)),
     });
     if (!space) throw new Error(`Space not found for agent: ${agentId}`);
     return this.forAgentBinding({
@@ -76,9 +76,9 @@ export class ServerWorkspaceFsProvider implements WorkspaceFsProvider {
   }
 
   /** Invalidate cached Runner FS (e.g. after migrate / rebind). */
-  invalidate(agentId: string): void {
+  invalidate(spaceId: string): void {
     for (const key of this.runnerFsCache.keys()) {
-      if (key === agentId || key.startsWith(`${agentId}:`)) {
+      if (key === spaceId || key.startsWith(`${spaceId}:`)) {
         this.runnerFsCache.delete(key);
       }
     }

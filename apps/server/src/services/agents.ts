@@ -101,7 +101,9 @@ export class AgentService {
     private readonly nodes?: import("./runtime-nodes.js").RuntimeNodeService,
   ) {
     this.workspace = new AgentWorkspaceService(db, runtime, config, nodes);
-    this.spaces = new SpaceService(db, config);
+    this.spaces = new SpaceService(db, config, {
+      beforeDelete: (space) => this.workspace.removeSpaceWorkspace(space),
+    });
   }
 
   /** 解析 Agent 的所属空间；不存在时报错。 */
@@ -372,12 +374,20 @@ export class AgentService {
           userId: opts.userId,
           tenantId,
           nodeId: nodeId ?? null,
-          excludeAgentId: agent.id,
+          excludeAllocationId: agent.spaceId,
         });
       }
       nodeId = await this.normalizeRuntimeNodeId(tenantId, nodeId);
       if (nodeId) {
         await this.assertNodeAvailable(tenantId, nodeId);
+      }
+      if (nodeId !== agent.runtimeNodeId) {
+        const current = await this.workspace.getWorkspaceContainer(agent.spaceId);
+        if (current?.dockerId && current.status !== "removed" && current.status !== "exited") {
+          // Stop against the old binding before changing the Space row. If the
+          // runner is unavailable, abort and keep the old binding retryable.
+          await this.workspace.stop(agent);
+        }
       }
       await this.db
         .update(spaces)
@@ -389,7 +399,7 @@ export class AgentService {
         userId: opts.userId,
         tenantId,
         nodeId: agent.runtimeNodeId,
-        excludeAgentId: agent.id,
+        excludeAllocationId: agent.spaceId,
       });
     }
 
@@ -400,9 +410,9 @@ export class AgentService {
     }
 
     if (!needsContainer(agent)) {
-      return this.workspace.start(agent);
+      return this.workspace.ensureStarted(agent, { require: "shell" });
     }
-    void this.workspace.start(agent).catch((err) => {
+    void this.workspace.ensureStarted(agent, { require: "display" }).catch((err) => {
       recordPlatformFault("agent.workspace_start", err, { subsystem: "agent" });
     });
     return agent;
@@ -466,7 +476,7 @@ export class AgentService {
         userId: input.userId,
         tenantId,
         nodeId: input.runtimeNodeId,
-        excludeAgentId: agent.id,
+        excludeAllocationId: agent.spaceId,
       });
     }
     const runtimeNodeId = await this.normalizeRuntimeNodeId(tenantId, input.runtimeNodeId);
@@ -482,6 +492,20 @@ export class AgentService {
         ),
       });
       if (!mp) throw new Error("Memory provider not found");
+    }
+
+    const bindingChanged =
+      (runtimeNodeId !== undefined && runtimeNodeId !== agent.runtimeNodeId) ||
+      (input.workspaceKind !== undefined && input.workspaceKind !== agent.workspaceKind);
+    const containerBeforeUpdate = await this.workspace.getWorkspaceContainer(agent.spaceId);
+    const hadWorkspaceAlive =
+      Boolean(containerBeforeUpdate?.dockerId) &&
+      containerBeforeUpdate?.status !== "removed" &&
+      containerBeforeUpdate?.status !== "exited";
+    if (bindingChanged && hadWorkspaceAlive) {
+      // Teardown must use the old node/kind. Updating first would strand the
+      // existing workspace on an address the Space can no longer resolve.
+      await this.workspace.stop(agent);
     }
 
     // 电脑 / 工作区字段写 Space；其余写 Agent。
@@ -531,7 +555,7 @@ export class AgentService {
     const stackChanged =
       isComputerEnvEnabled(agent) !== Boolean(result.enableComputer);
 
-    if (input.restart || (workspaceAlive && stackChanged)) {
+    if (input.restart || (hadWorkspaceAlive && stackChanged)) {
       if (workspaceAlive) {
         await this.workspace.stop(result);
         result = (await this.get(tenantId, id)) ?? result;
@@ -556,11 +580,9 @@ export class AgentService {
     const agent = await this.get(tenantId, id);
     if (!agent) throw new Error("Agent not found");
 
-    const container = await this.workspace.getWorkspaceContainer(agent.id);
-    if (container?.dockerId && container.status !== "removed") {
-      await this.workspace.stop(agent);
-    }
-
+    // The computer belongs to the Space and may be serving sibling agents.
+    // Agent deletion only removes the agent aggregate; Space deletion owns
+    // workspace teardown.
     await this.db.delete(agents).where(and(eq(agents.id, agent.id), eq(agents.tenantId, tenantId)));
     this.forgetAgent(agent);
 
@@ -575,7 +597,12 @@ export class AgentService {
   }
 
   async start(tenantId: string, id: string) {
-    return this.startAsync(tenantId, id);
+    const agent = await this.get(tenantId, id);
+    if (!agent) throw new Error("Agent not found");
+    if (agent.runtimeNodeId) await this.assertNodeAvailable(tenantId, agent.runtimeNodeId);
+    return this.workspace.ensureStarted(agent, {
+      require: agent.enableComputer ? "display" : "shell",
+    });
   }
 
   async stop(tenantId: string, id: string) {

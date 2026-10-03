@@ -3,7 +3,7 @@ import type {
   ModelEvaluationResult,
 } from "@zakura/shared";
 import type { ModelProtocolAdapter } from "../adapter.js";
-import { httpJson, UpstreamHttpError } from "../http.js";
+import { apiError, httpJson, providerStreamError } from "../http.js";
 
 /**
  * TypeSafe System One（JEV）评估适配器。
@@ -24,6 +24,7 @@ export const typesafeAdapter: ModelProtocolAdapter = {
       model?: string;
       answers?: ModelEvaluationResult["answers"];
       usage?: { input_tokens?: number; output_tokens?: number };
+      error?: { message?: string; code?: string; type?: string };
     }>(`${base}/v1/systemone`, {
       method: "POST",
       headers: {
@@ -38,12 +39,13 @@ export const typesafeAdapter: ModelProtocolAdapter = {
       timeoutMs: timeoutMs ?? 20_000,
     });
     if (!ok) {
-      throw new UpstreamHttpError(
-        `TypeSafe API ${status}: ${text.slice(0, 200)}`,
-        status,
-      );
+      throw apiError("TypeSafe API", status, data, text);
     }
-    const answers = data?.answers ?? {};
+    if (data?.error) throw providerStreamError("TypeSafe API", data);
+    if (!data?.answers || typeof data.answers !== "object") {
+      throw new Error("TypeSafe API response missing answers");
+    }
+    const answers = data.answers;
     return {
       model: data?.model ?? route.model,
       answers,

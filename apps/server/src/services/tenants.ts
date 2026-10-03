@@ -1,5 +1,5 @@
 import bcrypt from "bcryptjs";
-import { and, asc, eq, isNull, or } from "drizzle-orm";
+import { and, asc, eq, isNull, ne, or, sql } from "drizzle-orm";
 import { createHash, randomBytes } from "node:crypto";
 import type { Db } from "../db/client.js";
 import {
@@ -369,34 +369,100 @@ export class TenantService {
     actorUserId: string,
   ) {
     if (!isTenantRole(role)) throw new TenantAccessError("Invalid member role", 400);
-    if (role === "owner") throw new TenantAccessError("Cannot assign owner via role update", 400);
     await this.requireMembership(tenantId, actorUserId, "admin");
-    const target = await this.db.query.tenantMemberships.findFirst({
-      where: and(eq(tenantMemberships.id, membershipId), eq(tenantMemberships.tenantId, tenantId)),
+    return this.db.transaction(async (tx) => {
+      const database = transactionDb(tx);
+      await database.execute(
+        sql`select id from ${tenantMemberships} where tenant_id = ${tenantId} and role = 'owner' for update`,
+      );
+      const [actorMembership, target] = await Promise.all([
+        database.query.tenantMemberships.findFirst({
+          where: and(
+            eq(tenantMemberships.tenantId, tenantId),
+            eq(tenantMemberships.userId, actorUserId),
+            eq(tenantMemberships.status, "active"),
+          ),
+        }),
+        database.query.tenantMemberships.findFirst({
+          where: and(
+            eq(tenantMemberships.id, membershipId),
+            eq(tenantMemberships.tenantId, tenantId),
+          ),
+        }),
+      ]);
+      if (!actorMembership || !roleAtLeast(actorMembership.role, "admin")) {
+        throw new TenantAccessError("Admin only", 403);
+      }
+      if (!target) throw new TenantAccessError("Member not found", 404);
+      if (
+        actorMembership.role !== "owner" &&
+        (target.role === "owner" || role === "owner")
+      ) {
+        throw new TenantAccessError("Owner only", 403);
+      }
+      if (target.role === "owner" && target.status === "active" && role !== "owner") {
+        const otherOwner = await database.query.tenantMemberships.findFirst({
+          where: and(
+            eq(tenantMemberships.tenantId, tenantId),
+            eq(tenantMemberships.role, "owner"),
+            eq(tenantMemberships.status, "active"),
+            ne(tenantMemberships.id, target.id),
+          ),
+        });
+        if (!otherOwner) {
+          throw new TenantAccessError("Tenant must retain an active owner", 400);
+        }
+      }
+      const [row] = await database
+        .update(tenantMemberships)
+        .set({ role, updatedAt: new Date() })
+        .where(
+          and(eq(tenantMemberships.id, membershipId), eq(tenantMemberships.tenantId, tenantId)),
+        )
+        .returning();
+      if (!row) throw new TenantAccessError("Member not found", 404);
+      return row;
     });
-    if (!target) throw new TenantAccessError("Member not found", 404);
-    if (target.role === "owner") throw new TenantAccessError("Cannot change owner role", 400);
-    const [row] = await this.db
-      .update(tenantMemberships)
-      .set({ role, updatedAt: new Date() })
-      .where(and(eq(tenantMemberships.id, membershipId), eq(tenantMemberships.tenantId, tenantId)))
-      .returning();
-    if (!row) throw new TenantAccessError("Member not found", 404);
-    return row;
   }
 
   async removeMember(tenantId: string, membershipId: string, actorUserId: string) {
     await this.requireMembership(tenantId, actorUserId, "admin");
     const removedUserId = await this.db.transaction(async (tx) => {
       const database = transactionDb(tx);
-      const target = await database.query.tenantMemberships.findFirst({
-        where: and(
-          eq(tenantMemberships.id, membershipId),
-          eq(tenantMemberships.tenantId, tenantId),
-        ),
-      });
+      await database.execute(
+        sql`select id from ${tenantMemberships} where tenant_id = ${tenantId} and role = 'owner' for update`,
+      );
+      const [actorMembership, target] = await Promise.all([
+        database.query.tenantMemberships.findFirst({
+          where: and(
+            eq(tenantMemberships.tenantId, tenantId),
+            eq(tenantMemberships.userId, actorUserId),
+            eq(tenantMemberships.status, "active"),
+          ),
+        }),
+        database.query.tenantMemberships.findFirst({
+          where: and(
+            eq(tenantMemberships.id, membershipId),
+            eq(tenantMemberships.tenantId, tenantId),
+          ),
+        }),
+      ]);
+      if (!actorMembership || !roleAtLeast(actorMembership.role, "admin")) {
+        throw new TenantAccessError("Admin only", 403);
+      }
       if (!target) throw new TenantAccessError("Member not found", 404);
-      if (target.role === "owner") throw new TenantAccessError("Cannot remove owner", 400);
+      if (target.role === "owner") {
+        if (actorMembership.role !== "owner") throw new TenantAccessError("Owner only", 403);
+        const otherOwner = await database.query.tenantMemberships.findFirst({
+          where: and(
+            eq(tenantMemberships.tenantId, tenantId),
+            eq(tenantMemberships.role, "owner"),
+            eq(tenantMemberships.status, "active"),
+            ne(tenantMemberships.id, target.id),
+          ),
+        });
+        if (!otherOwner) throw new TenantAccessError("Tenant must retain an active owner", 400);
+      }
       if (target.userId === actorUserId) {
         throw new TenantAccessError("Cannot remove yourself; leave the tenant instead", 400);
       }
@@ -414,14 +480,40 @@ export class TenantService {
   }
 
   async leaveTenant(tenantId: string, userId: string) {
-    const membership = await this.getMembership(tenantId, userId);
-    if (!membership) throw new TenantAccessError("Not a member", 404);
-    if (membership.role === "owner") {
-      throw new TenantAccessError("Owner cannot leave; transfer ownership first", 400);
-    }
-    await this.db
-      .delete(tenantMemberships)
-      .where(and(eq(tenantMemberships.id, membership.id), eq(tenantMemberships.tenantId, tenantId)));
+    await this.db.transaction(async (tx) => {
+      const database = transactionDb(tx);
+      await database.execute(
+        sql`select id from ${tenantMemberships} where tenant_id = ${tenantId} and role = 'owner' for update`,
+      );
+      const membership = await database.query.tenantMemberships.findFirst({
+        where: and(
+          eq(tenantMemberships.tenantId, tenantId),
+          eq(tenantMemberships.userId, userId),
+          eq(tenantMemberships.status, "active"),
+        ),
+      });
+      if (!membership) throw new TenantAccessError("Not a member", 404);
+      if (membership.role === "owner") {
+        const otherOwner = await database.query.tenantMemberships.findFirst({
+          where: and(
+            eq(tenantMemberships.tenantId, tenantId),
+            eq(tenantMemberships.role, "owner"),
+            eq(tenantMemberships.status, "active"),
+            ne(tenantMemberships.id, membership.id),
+          ),
+        });
+        if (!otherOwner) {
+          throw new TenantAccessError("Owner cannot leave; transfer ownership first", 400);
+        }
+      }
+      const rows = await database
+        .delete(tenantMemberships)
+        .where(
+          and(eq(tenantMemberships.id, membership.id), eq(tenantMemberships.tenantId, tenantId)),
+        )
+        .returning();
+      if (!rows.length) throw new TenantAccessError("Not a member", 404);
+    });
     await this.notifyMemberAccessRevoked(tenantId, userId);
     return { ok: true as const };
   }
@@ -450,6 +542,9 @@ export class TenantService {
     const token = `inv_${randomBytes(24).toString("base64url")}`;
     return this.db.transaction(async (tx) => {
       const database = transactionDb(tx);
+      // Serialize invite replacement per tenant so concurrent creates leave one
+      // authoritative unconsumed token for an email instead of several valid links.
+      await database.execute(sql`select id from ${tenants} where id = ${input.tenantId} for update`);
       const now = new Date();
       await database
         .delete(tenantInvites)
@@ -566,6 +661,9 @@ export class TenantService {
       const existing = await new TenantService(database).findMembership(tenant.id, claimedUser.id, false);
       let membership: TenantMembership;
       if (existing) {
+        if (existing.status === "suspended") {
+          throw new TenantAccessError("Membership is suspended", 403);
+        }
         const [updated] = await database
           .update(tenantMemberships)
           .set({

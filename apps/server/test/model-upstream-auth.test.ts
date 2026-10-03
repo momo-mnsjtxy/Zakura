@@ -10,7 +10,12 @@ import {
   cursorPrompt,
   type JsonHttp,
 } from "../src/services/model-upstream-auth/index.js";
-import { encryptTokens, jwtChatgptAccountId } from "../src/services/model-upstream-auth/tokens.js";
+import { listAgentRemoteModels } from "../src/services/model-upstream-auth/remote-models.js";
+import {
+  decryptTokens,
+  encryptTokens,
+  jwtChatgptAccountId,
+} from "../src/services/model-upstream-auth/tokens.js";
 import { setRouteHydrator, hydrateRoute } from "../src/model-router/oauth-hook.js";
 import { buildHeaders } from "../src/model-router/http.js";
 import { responsesUrl, responsesChat } from "../src/model-router/openai-responses-api.js";
@@ -397,6 +402,60 @@ describe("Gemini CLI / Grok", () => {
   });
 });
 
+describe("订阅上游模型目录", () => {
+  afterEach(() => setCursorLoginApi(null));
+
+  it("uses authenticated Codex/Cursor remote catalogs and typed static fallbacks", async () => {
+    let codexHeaders: Headers | undefined;
+    const restore = stubFetch(async (_url, init) => {
+      codexHeaders = new Headers(init?.headers);
+      return new Response(JSON.stringify({
+        models: [{ id: "gpt-remote" }, { slug: "gpt-slug" }],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    try {
+      const codex = await listAgentRemoteModels("codex", {
+        baseUrl: "https://chatgpt.com",
+        apiKey: "codex-token",
+        extraHeaders: { "chatgpt-account-id": "account-1" },
+      });
+      assert.deepEqual(codex.models.map((model) => model.id), ["gpt-remote", "gpt-slug"]);
+      assert.equal(codexHeaders?.get("authorization"), "Bearer codex-token");
+      assert.equal(codexHeaders?.get("chatgpt-account-id"), "account-1");
+    } finally {
+      restore();
+    }
+
+    setCursorLoginApi({
+      login: async ({ onLoginUrl }) => {
+        onLoginUrl("https://cursor.invalid/login");
+        return { apiKey: "cursor-token" };
+      },
+      listModels: async (apiKey) => {
+        assert.equal(apiKey, "cursor-token");
+        return [{ id: "composer-remote", name: "Composer Remote" }];
+      },
+      prompt: async () => "unused",
+    });
+    const cursor = await listAgentRemoteModels("cursor", {
+      baseUrl: "https://cursor.com",
+      apiKey: "cursor-token",
+    });
+    assert.deepEqual(cursor.models, [{
+      id: "composer-remote",
+      name: "Composer Remote",
+      ownedBy: "cursor",
+      capability: "chat",
+    }]);
+
+    for (const protocol of ["claude-code", "gemini-cli", "grok-build"] as const) {
+      const fallback = await listAgentRemoteModels(protocol, { baseUrl: "https://fake.invalid" });
+      assert.ok(fallback.models.length > 0);
+      assert.ok(fallback.models.every((model) => model.capability === "chat"));
+    }
+  });
+});
+
 describe("未登录调用", () => {
   afterEach(() => setRouteHydrator(undefined));
 
@@ -429,5 +488,56 @@ describe("未登录调用", () => {
     );
     assert.equal(hydrated.upstream.config.apiKey, "live");
     assert.match(buildHeaders(hydrated.upstream.config, "codex").Authorization ?? "", /Bearer live/);
+  });
+
+  it("并发过期凭证只 refresh 一次并在继续调用前持久化", async () => {
+    let refreshCalls = 0;
+    const http: JsonHttp = {
+      async postJson(url, body) {
+        assert.match(url, /\/oauth\/token$/);
+        assert.equal((body as Record<string, unknown>).refresh_token, "old-refresh");
+        refreshCalls += 1;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return {
+          status: 200,
+          json: {
+            access_token: "fresh-access",
+            refresh_token: "fresh-refresh",
+            expires_in: 3600,
+          },
+        };
+      },
+      async getJson() {
+        return { status: 404, json: null };
+      },
+      async postForm() {
+        return { status: 404, json: null };
+      },
+    };
+    const oauthEnc = encryptTokens("test-secret", {
+      access_token: "expired-access",
+      refresh_token: "old-refresh",
+      expires_at: Date.now() - 1,
+    });
+    const { db, read } = memoryUpstream("codex", {
+      baseUrl: "https://chatgpt.com",
+      oauthEnc,
+    });
+    const auth = new ModelUpstreamAuthService(db, "test-secret", http);
+    const expired = route("codex", {
+      baseUrl: "https://chatgpt.com",
+      oauthEnc,
+    });
+
+    const [first, second] = await Promise.all([
+      auth.hydrateRoute(expired),
+      auth.hydrateRoute(expired),
+    ]);
+    assert.equal(refreshCalls, 1);
+    assert.equal(first.upstream.config.apiKey, "fresh-access");
+    assert.equal(second.upstream.config.apiKey, "fresh-access");
+    const persisted = decryptTokens("test-secret", String(read().oauthEnc));
+    assert.equal(persisted.access_token, "fresh-access");
+    assert.equal(persisted.refresh_token, "fresh-refresh");
   });
 });

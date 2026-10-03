@@ -1,4 +1,5 @@
 /** Google REST 调用封装 */
+import { connectorJson, ConnectorHttpError } from "../connector-http.js";
 
 export class GoogleApiError extends Error {
   readonly status: number;
@@ -17,26 +18,17 @@ export async function googleFetch<T = unknown>(
   url: string,
   init?: RequestInit & { json?: unknown },
 ): Promise<T> {
-  const headers = new Headers(init?.headers);
-  headers.set("Authorization", `Bearer ${accessToken}`);
-  if (init?.json !== undefined) {
-    headers.set("Content-Type", "application/json");
-  }
-  const res = await fetch(url, {
-    ...init,
-    headers,
-    body: init?.json !== undefined ? JSON.stringify(init.json) : init?.body,
-    signal: init?.signal ?? AbortSignal.timeout(60000),
-  });
-  const text = await res.text();
-  if (!res.ok) {
-    throw new GoogleApiError(res.status, text);
-  }
-  if (!text) return {} as T;
   try {
-    return JSON.parse(text) as T;
-  } catch {
-    return text as unknown as T;
+    return await connectorJson<T>(url, accessToken, {
+      ...init,
+      timeoutMs: 60_000,
+      retry: { attempts: 3, baseDelayMs: 150, maxDelayMs: 2_000 },
+    });
+  } catch (error) {
+    if (error instanceof ConnectorHttpError) {
+      throw new GoogleApiError(error.status, error.responseBody);
+    }
+    throw error;
   }
 }
 

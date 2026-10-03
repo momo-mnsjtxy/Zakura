@@ -12,6 +12,7 @@ import {
 import type { Db } from "../../db/client.js";
 import {
   newId,
+  settings,
   userRecoveryCodes,
   userTotp,
   userWebauthnCredentials,
@@ -22,6 +23,48 @@ import { hashToken, rpFromWebUrl } from "./util.js";
 import { CredentialLifecycleService } from "./credential-lifecycle.js";
 
 const pendingChallenge = new Map<string, { challenge: string; expiresAt: number }>();
+const MFA_POLICY_KEY = "identity.mfa";
+
+export type TenantMfaPolicy = "optional" | "admins" | "all";
+
+export function parseTenantMfaPolicy(value: unknown): TenantMfaPolicy {
+  return value === "admins" || value === "all" ? value : "optional";
+}
+
+export function tenantMfaPolicyRequires(policy: TenantMfaPolicy, role: string): boolean {
+  return policy === "all" || (policy === "admins" && (role === "owner" || role === "admin"));
+}
+
+export async function getTenantMfaPolicy(db: Db, tenantId: string): Promise<TenantMfaPolicy> {
+  const row = await db.query.settings.findFirst({
+    where: and(eq(settings.ownerKey, `tenant:${tenantId}`), eq(settings.key, MFA_POLICY_KEY)),
+  });
+  try {
+    return parseTenantMfaPolicy(JSON.parse(row?.value ?? "{}").policy);
+  } catch {
+    return "optional";
+  }
+}
+
+export async function setTenantMfaPolicy(
+  db: Db,
+  tenantId: string,
+  policy: TenantMfaPolicy,
+): Promise<TenantMfaPolicy> {
+  if (policy !== "optional" && policy !== "admins" && policy !== "all") {
+    throw new Error("无效的 MFA 策略");
+  }
+  const ownerKey = `tenant:${tenantId}`;
+  const value = JSON.stringify({ policy });
+  await db
+    .insert(settings)
+    .values({ id: newId(), ownerKey, key: MFA_POLICY_KEY, value })
+    .onConflictDoUpdate({
+      target: [settings.ownerKey, settings.key],
+      set: { value },
+    });
+  return policy;
+}
 
 function setChallenge(key: string, challenge: string) {
   pendingChallenge.set(key, { challenge, expiresAt: Date.now() + 5 * 60 * 1000 });

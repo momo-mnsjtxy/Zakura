@@ -7,6 +7,7 @@ import { emailDomain, newSecretToken, normalizeDomain } from "./util.js";
 export { normalizeDomain };
 
 export type JoinMode = "invite_only" | "auto_join" | "sso_required";
+const JOIN_MODES = ["invite_only", "auto_join", "sso_required"] as const;
 
 export type DomainPolicy = {
   tenantId: string;
@@ -22,7 +23,23 @@ export function txtHost(domain: string): string {
 }
 
 export function txtRecordsContain(records: string[][], token: string): boolean {
-  return records.some((chunks) => chunks.join("").includes(token));
+  return records.some((chunks) => chunks.join("").trim() === token);
+}
+
+function isJoinMode(value: unknown): value is JoinMode {
+  return typeof value === "string" && (JOIN_MODES as readonly string[]).includes(value);
+}
+
+function isValidDomain(value: string): boolean {
+  if (value.length > 253 || value.includes("..")) return false;
+  const labels = value.split(".");
+  if (labels.length < 2 || labels.every((label) => /^\d+$/.test(label))) return false;
+  return labels.every(
+    (label) =>
+      label.length > 0 &&
+      label.length <= 63 &&
+      /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label),
+  );
 }
 
 export async function listTenantDomains(db: Db, tenantId: string) {
@@ -43,16 +60,18 @@ export async function listTenantDomains(db: Db, tenantId: string) {
 
 export async function addTenantDomain(db: Db, tenantId: string, rawDomain: string, joinMode: JoinMode = "invite_only") {
   const domain = normalizeDomain(rawDomain);
-  if (!domain || !domain.includes(".")) throw new Error("请输入有效域名");
+  if (!isValidDomain(domain)) throw new Error("请输入有效域名");
+  if (!isJoinMode(joinMode)) throw new Error("无效的加入方式");
   const existing = await db.query.tenantDomains.findFirst({ where: eq(tenantDomains.domain, domain) });
   if (existing && existing.tenantId !== tenantId) {
     throw new Error("该域名已被其他团队占用");
   }
   if (existing) return existing;
+  const id = newId();
   const [row] = await db
     .insert(tenantDomains)
     .values({
-      id: newId(),
+      id,
       tenantId,
       domain,
       txtToken: newSecretToken("dom", 12).replace("dom_", ""),
@@ -60,13 +79,22 @@ export async function addTenantDomain(db: Db, tenantId: string, rawDomain: strin
       createdAt: new Date(),
       updatedAt: new Date(),
     })
+    .onConflictDoNothing({ target: tenantDomains.domain })
     .returning();
-  return row;
+  if (row) return row;
+  const winner = await db.query.tenantDomains.findFirst({ where: eq(tenantDomains.domain, domain) });
+  if (!winner || winner.tenantId !== tenantId) throw new Error("该域名已被其他团队占用");
+  return winner;
 }
 
 export async function setDomainJoinMode(db: Db, tenantId: string, domainId: string, joinMode: JoinMode) {
-  if (!["invite_only", "auto_join", "sso_required"].includes(joinMode)) {
-    throw new Error("无效的加入方式");
+  if (!isJoinMode(joinMode)) throw new Error("无效的加入方式");
+  const existing = await db.query.tenantDomains.findFirst({
+    where: and(eq(tenantDomains.id, domainId), eq(tenantDomains.tenantId, tenantId)),
+  });
+  if (!existing) throw new Error("域名不存在");
+  if (joinMode !== "invite_only" && !existing.verifiedAt) {
+    throw new Error("启用自动加入或强制 SSO 前必须先验证域名");
   }
   const [row] = await db
     .update(tenantDomains)
@@ -77,8 +105,12 @@ export async function setDomainJoinMode(db: Db, tenantId: string, domainId: stri
   return row;
 }
 
-export async function removeTenantDomain(db: Db, tenantId: string, domainId: string) {
-  await db.delete(tenantDomains).where(and(eq(tenantDomains.id, domainId), eq(tenantDomains.tenantId, tenantId)));
+export async function removeTenantDomain(db: Db, tenantId: string, domainId: string): Promise<boolean> {
+  const rows = await db
+    .delete(tenantDomains)
+    .where(and(eq(tenantDomains.id, domainId), eq(tenantDomains.tenantId, tenantId)))
+    .returning();
+  return rows.length > 0;
 }
 
 export type TxtLookup = (host: string) => Promise<string[][]>;
@@ -105,8 +137,9 @@ export async function verifyTenantDomain(
   const [updated] = await db
     .update(tenantDomains)
     .set({ verifiedAt: new Date(), updatedAt: new Date() })
-    .where(eq(tenantDomains.id, row.id))
+    .where(and(eq(tenantDomains.id, row.id), eq(tenantDomains.tenantId, tenantId)))
     .returning();
+  if (!updated) throw new Error("域名不存在");
   return updated;
 }
 
@@ -132,7 +165,7 @@ export async function findVerifiedDomainPolicy(db: Db, email: string): Promise<D
     tenantName: tenant.name,
     tenantSlug: tenant.slug,
     domain,
-    joinMode: row.joinMode as JoinMode,
+    joinMode: isJoinMode(row.joinMode) ? row.joinMode : "invite_only",
     verified: true,
   };
 }
@@ -150,21 +183,18 @@ export async function maybeAutoJoinTenant(
     where: and(eq(tenantMemberships.tenantId, policy.tenantId), eq(tenantMemberships.userId, input.userId)),
   });
   if (!existing && policy.joinMode === "auto_join") {
-    await db.insert(tenantMemberships).values({
-      id: newId(),
-      tenantId: policy.tenantId,
-      userId: input.userId,
-      role: "member",
-      status: "active",
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    });
-  }
-  if (existing?.status === "suspended" && policy.joinMode === "auto_join") {
     await db
-      .update(tenantMemberships)
-      .set({ status: "active", updatedAt: new Date() })
-      .where(eq(tenantMemberships.id, existing.id));
+      .insert(tenantMemberships)
+      .values({
+        id: newId(),
+        tenantId: policy.tenantId,
+        userId: input.userId,
+        role: "member",
+        status: "active",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .onConflictDoNothing({ target: [tenantMemberships.tenantId, tenantMemberships.userId] });
   }
   return policy;
 }

@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { and, desc, eq, lt, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, lt, sql } from "drizzle-orm";
 import type { WorkspaceFs } from "@zakura/core";
 import type { AppConfig } from "../config.js";
 import type { Db } from "../db/client.js";
@@ -227,6 +227,89 @@ export class FileShareService {
       .set({ status: "revoked", revokedAt: now, updatedAt: now })
       .where(eq(fileShares.id, shareId));
     return this.toDto({ ...row, status: "revoked", revokedAt: now, updatedAt: now });
+  }
+
+  /** Keep live collaboration links valid when a shared Space project is renamed. */
+  async rebaseActivePaths(
+    tenantId: string,
+    agentIds: string[],
+    fromPrefix: string,
+    toPrefix: string,
+  ): Promise<number> {
+    if (agentIds.length === 0) return 0;
+    const normalize = (value: string) => value.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+    const from = normalize(fromPrefix);
+    const to = normalize(toPrefix);
+    const rows = await this.db
+      .select()
+      .from(fileShares)
+      .where(
+        and(
+          eq(fileShares.tenantId, tenantId),
+          inArray(fileShares.agentId, agentIds),
+          eq(fileShares.status, "active"),
+        ),
+      );
+    let changed = 0;
+    for (const row of rows) {
+      const path = normalize(row.path);
+      if (path !== from && !path.startsWith(`${from}/`)) continue;
+      const suffix = path.slice(from.length);
+      const rebased = `${row.path.startsWith("/") ? "/" : ""}${to}${suffix}`;
+      const updated = await this.db
+        .update(fileShares)
+        .set({ path: rebased, updatedAt: new Date() })
+        .where(
+          and(
+            eq(fileShares.id, row.id),
+            eq(fileShares.tenantId, tenantId),
+            eq(fileShares.status, "active"),
+          ),
+        )
+        .returning();
+      changed += updated.length;
+    }
+    return changed;
+  }
+
+  /** Revoke links whose backing files are removed with a shared Space project. */
+  async revokeActivePaths(
+    tenantId: string,
+    agentIds: string[],
+    prefix: string,
+  ): Promise<number> {
+    if (agentIds.length === 0) return 0;
+    const normalizedPrefix = prefix.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+    const rows = await this.db
+      .select()
+      .from(fileShares)
+      .where(
+        and(
+          eq(fileShares.tenantId, tenantId),
+          inArray(fileShares.agentId, agentIds),
+          eq(fileShares.status, "active"),
+        ),
+      );
+    const ids = rows
+      .filter((row) => {
+        const path = row.path.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+        return path === normalizedPrefix || path.startsWith(`${normalizedPrefix}/`);
+      })
+      .map((row) => row.id);
+    if (ids.length === 0) return 0;
+    const now = new Date();
+    const revoked = await this.db
+      .update(fileShares)
+      .set({ status: "revoked", revokedAt: now, updatedAt: now })
+      .where(
+        and(
+          eq(fileShares.tenantId, tenantId),
+          inArray(fileShares.id, ids),
+          eq(fileShares.status, "active"),
+        ),
+      )
+      .returning();
+    return revoked.length;
   }
 
   /** Resolve raw token → active share row (marks expired if needed). */

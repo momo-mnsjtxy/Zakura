@@ -9,7 +9,7 @@ import {
   type ChatStreamCallbacks,
   type ModelProtocolAdapter,
 } from "../adapter.js";
-import { apiError, httpJson, httpSse } from "../http.js";
+import { apiError, httpJson, httpSse, providerStreamError } from "../http.js";
 import { acceptsImageInput, expandToolImageMessages, imageOmittedText } from "../media.js";
 import {
   assertCompleteToolCalls,
@@ -231,6 +231,9 @@ async function chat(
     }
     throw err;
   }
+  if (res.data?.error) {
+    throw providerStreamError("anthropic chat", res.data);
+  }
 
   const blocks = res.data?.content ?? [];
   const textParts: string[] = [];
@@ -322,7 +325,7 @@ export function absorbAnthropicStreamEvent(
       stop_reason?: string;
     };
     usage?: { output_tokens?: number };
-    error?: { message?: string };
+    error?: { message?: string; type?: string; code?: string | number; status?: string | number };
   };
   switch (ev.type) {
     case "message_start":
@@ -371,7 +374,7 @@ export function absorbAnthropicStreamEvent(
       if (ev.usage?.output_tokens != null) state.outputTokens = ev.usage.output_tokens;
       return empty;
     case "error":
-      throw new Error(`anthropic stream error: ${ev.error?.message ?? "unknown"}`);
+      throw providerStreamError("anthropic chat(stream)", ev);
     default:
       return empty;
   }

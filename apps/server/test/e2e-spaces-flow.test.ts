@@ -42,13 +42,17 @@ describe("e2e spaces -> agent -> start -> zakurabot message echo", () => {
 
     // ── 1. Workspace provisioning seam: fake runner node, no Docker ──────
     const starts: string[] = [];
+    let workspaceRunning = false;
     const fakeClient = {
       ping: async () => ({ ok: true, docker: { ok: true, version: "test" } }),
       startWorkspace: async (args: { spaceId: string }) => {
         starts.push(args.spaceId);
+        workspaceRunning = true;
         return { dockerId: "ctr-e2e", name: "ws-e2e", image: "full", status: "running", endpoints: {}, labels: {} };
       },
-      getWorkspace: async () => ({ status: "running", dockerId: "ctr-e2e" }),
+      getWorkspace: async () => workspaceRunning
+        ? ({ status: "running", dockerId: "ctr-e2e" })
+        : null,
       execWorkspace: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
       mkdir: async () => ({}),
     };

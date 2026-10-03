@@ -91,8 +91,14 @@ export class SecurityAuditService {
       until?: Date;
     },
   ): Promise<{ items: SecurityAuditLogDto[]; total: number }> {
-    const limit = Math.min(Math.max(opts?.limit ?? 50, 1), 200);
-    const offset = Math.max(opts?.offset ?? 0, 0);
+    const requestedLimit = Number(opts?.limit ?? 50);
+    const requestedOffset = Number(opts?.offset ?? 0);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.min(Math.max(Math.floor(requestedLimit), 1), 200)
+      : 50;
+    const offset = Number.isFinite(requestedOffset)
+      ? Math.max(Math.floor(requestedOffset), 0)
+      : 0;
     const filters = [eq(securityAuditLogs.tenantId, tenantId)];
     if (opts?.action) filters.push(eq(securityAuditLogs.action, opts.action));
     if (opts?.actorId) filters.push(eq(securityAuditLogs.actorId, opts.actorId));
@@ -138,22 +144,22 @@ export class SecurityAuditService {
   }
 
   async setRetentionDays(tenantId: string, days: number): Promise<number> {
+    if (!Number.isFinite(days)) throw new Error("retentionDays must be a finite number");
     const retentionDays = Math.min(Math.max(Math.floor(days), 7), 3650);
     const ownerKey = `tenant:${tenantId}`;
-    const existing = await this.db.query.settings.findFirst({
-      where: and(eq(settings.ownerKey, ownerKey), eq(settings.key, IDENTITY_SETTINGS_KEY)),
-    });
     const value = JSON.stringify({ retentionDays });
-    if (existing) {
-      await this.db.update(settings).set({ value }).where(eq(settings.id, existing.id));
-    } else {
-      await this.db.insert(settings).values({
+    await this.db
+      .insert(settings)
+      .values({
         id: newId(),
         ownerKey,
         key: IDENTITY_SETTINGS_KEY,
         value,
+      })
+      .onConflictDoUpdate({
+        target: [settings.ownerKey, settings.key],
+        set: { value },
       });
-    }
     return retentionDays;
   }
 

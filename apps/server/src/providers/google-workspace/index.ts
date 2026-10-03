@@ -73,6 +73,7 @@ const configSchema: ProviderConfigSchema = {
 let appConfigRef: AppConfig | null = null;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let dbRef: any = null;
+const refreshes = new Map<string, Promise<Record<string, unknown>>>();
 
 export function injectGoogleWorkspaceRuntime(config: AppConfig, db: unknown): void {
   appConfigRef = config;
@@ -145,35 +146,45 @@ async function maybeRefreshOauth(
   if (!appConfigRef) return config;
 
   try {
-    const oauth = new McpUpstreamOauthService(appConfigRef);
-    const tokens = await oauth.refresh({
-      accessToken: String(config.oauthAccessToken ?? ""),
-      refreshToken: String(config.oauthRefreshToken),
-      tokenEndpoint: String(
-        config.oauthTokenEndpoint || "https://oauth2.googleapis.com/token",
-      ),
-      clientId: String(config.oauthClientId),
-      clientSecret:
-        typeof config.oauthClientSecret === "string" ? config.oauthClientSecret : undefined,
+    const existing = refreshes.get(handle.id);
+    if (existing) return await existing;
+    let operation!: Promise<Record<string, unknown>>;
+    operation = (async () => {
+      const oauth = new McpUpstreamOauthService(appConfigRef!);
+      const tokens = await oauth.refresh({
+        accessToken: String(config.oauthAccessToken ?? ""),
+        refreshToken: String(config.oauthRefreshToken),
+        tokenEndpoint: String(
+          config.oauthTokenEndpoint || "https://oauth2.googleapis.com/token",
+        ),
+        clientId: String(config.oauthClientId),
+        clientSecret:
+          typeof config.oauthClientSecret === "string" ? config.oauthClientSecret : undefined,
+      });
+      const next = applyOauthTokensToConfig(config, {
+        ...tokens,
+        tokenEndpoint: tokens.tokenEndpoint || "https://oauth2.googleapis.com/token",
+      });
+      next.authRequired = false;
+      if (ctx?.db && appConfigRef) {
+        const { encryptJson } = await import("@zakura/core");
+        await ctx.db
+          .update(componentInstances)
+          .set({
+            configEnc: encryptJson(appConfigRef.secret, next),
+            healthStatus: "healthy",
+            lastError: null,
+            updatedAt: new Date(),
+          })
+          .where(eq(componentInstances.id, handle.id));
+      }
+      handle.config = next;
+      return next;
+    })().finally(() => {
+      if (refreshes.get(handle.id) === operation) refreshes.delete(handle.id);
     });
-    config = applyOauthTokensToConfig(config, {
-      ...tokens,
-      tokenEndpoint: tokens.tokenEndpoint || "https://oauth2.googleapis.com/token",
-    });
-    config.authRequired = false;
-    handle.config = config;
-    if (ctx?.db && appConfigRef) {
-      const { encryptJson } = await import("@zakura/core");
-      await ctx.db
-        .update(componentInstances)
-        .set({
-          configEnc: encryptJson(appConfigRef.secret, config),
-          healthStatus: "healthy",
-          lastError: null,
-          updatedAt: new Date(),
-        })
-        .where(eq(componentInstances.id, handle.id));
-    }
+    refreshes.set(handle.id, operation);
+    config = await operation;
   } catch (err) {
     ctx?.logger.warn("oauth refresh failed", {
       instanceId: handle.id,

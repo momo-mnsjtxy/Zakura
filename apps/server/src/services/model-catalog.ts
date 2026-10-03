@@ -16,15 +16,27 @@ import {
 const MODELS_DEV_URL = "https://models.dev/api.json";
 const LLM_METADATA_URL = "https://basellm.github.io/llm-metadata/api/all.json";
 
-function inferCapabilities(model: Record<string, unknown>): ModelCapability[] {
+function inferCapabilities(
+  model: Record<string, unknown>,
+  providerId = "",
+): ModelCapability[] {
   const caps = new Set<ModelCapability>();
   const id = String(model.id ?? "").toLowerCase();
   const name = String(model.name ?? "").toLowerCase();
+  const provider = providerId.toLowerCase();
   const modalities = model.modalities as
     | { input?: string[]; output?: string[] }
     | undefined;
   const inputs = (modalities?.input ?? []).map((m) => String(m).toLowerCase());
   const outputs = (modalities?.output ?? []).map((m) => String(m).toLowerCase());
+
+  if (
+    provider === "typesafe" ||
+    /(?:^|[-_. ])(?:jev|system[-_. ]?one)(?:$|[-_. ])/.test(id) ||
+    /(?:^|[-_. ])(?:jev|system[-_. ]?one)(?:$|[-_. ])/.test(name)
+  ) {
+    caps.add("evaluation");
+  }
 
   if (
     id.includes("embed") ||
@@ -52,12 +64,12 @@ function inferCapabilities(model: Record<string, unknown>): ModelCapability[] {
     caps.add("image");
   }
   if (inputs.includes("image") || outputs.includes("text")) {
-    if (!caps.has("embedding") && !caps.has("rerank")) {
+    if (!caps.has("embedding") && !caps.has("rerank") && !caps.has("evaluation")) {
       caps.add("chat");
     }
   }
   if (caps.size === 0 || outputs.includes("text") || !outputs.length) {
-    if (!caps.has("embedding") && !caps.has("rerank")) {
+    if (!caps.has("embedding") && !caps.has("rerank") && !caps.has("evaluation")) {
       caps.add("chat");
     }
   }
@@ -95,7 +107,7 @@ function normalizeEntry(
     name: typeof model.name === "string" ? model.name : modelId,
     description: typeof model.description === "string" ? model.description : undefined,
     family: typeof model.family === "string" ? model.family : undefined,
-    capabilities: inferCapabilities({ ...model, id: modelId }),
+    capabilities: inferCapabilities({ ...model, id: modelId }, providerId),
     reasoning: model.reasoning === true || Boolean(reasoningLevels?.length),
     reasoningLevels,
     defaultReasonLevel,
@@ -154,6 +166,21 @@ type CatalogMatchHints = {
   providerName?: string;
   apiBase?: string;
 };
+
+export function paginateCatalogEntries<T extends { capabilities: ModelCapability[] }>(
+  entries: T[],
+  capability: ModelCapability,
+  limit: number,
+  offset: number,
+): { entries: T[]; total: number; limit: number; offset: number } {
+  const filtered = entries.filter((entry) => entry.capabilities.includes(capability));
+  return {
+    entries: filtered.slice(offset, offset + limit),
+    total: filtered.length,
+    limit,
+    offset,
+  };
+}
 
 function lastSlashSegment(raw: string): string | null {
   const trimmed = raw.trim();
@@ -342,13 +369,14 @@ export class ModelCatalogService {
       );
     }
 
-    const rows = await this.db
+    const query = this.db
       .select()
       .from(modelCatalogEntries)
       .where(and(...conditions))
-      .orderBy(asc(modelCatalogEntries.providerName), asc(modelCatalogEntries.name))
-      .limit(limit)
-      .offset(offset);
+      .orderBy(asc(modelCatalogEntries.providerName), asc(modelCatalogEntries.name));
+    const rows = opts?.capability
+      ? await query
+      : await query.limit(limit).offset(offset);
 
     let entries = rows.map((r) => {
       const meta = JSON.parse(r.metaJson) as ModelCatalogEntry;
@@ -356,7 +384,7 @@ export class ModelCatalogService {
     });
 
     if (opts?.capability) {
-      entries = entries.filter((e) => e.capabilities.includes(opts.capability!));
+      return paginateCatalogEntries(entries, opts.capability, limit, offset);
     }
 
     const [{ count }] = await this.db
@@ -410,37 +438,50 @@ export class ModelCatalogService {
       throw new Error(`${source} 未解析到模型条目`);
     }
 
-    // 先清同 source 旧数据，再批量写入
-    await this.db
-      .delete(modelCatalogEntries)
-      .where(
-        and(
-          eq(modelCatalogEntries.tenantId, tenantId),
-          eq(modelCatalogEntries.source, source),
-        ),
-      );
+    // Metadata feeds occasionally repeat the same provider/model row. Collapse
+    // those before the unique index and replace the previous snapshot
+    // atomically so a failed refresh never destroys the last usable catalog.
+    const deduped = [
+      ...new Map(
+        entries.map((entry) => [
+          `${entry.source}\u0000${entry.providerId}\u0000${entry.modelId}`,
+          entry,
+        ]),
+      ).values(),
+    ];
+    await this.db.transaction(async (transaction) => {
+      const database = transaction as unknown as Db;
+      await database
+        .delete(modelCatalogEntries)
+        .where(
+          and(
+            eq(modelCatalogEntries.tenantId, tenantId),
+            eq(modelCatalogEntries.source, source),
+          ),
+        );
 
-    const now = new Date();
-    const chunkSize = 200;
-    for (let i = 0; i < entries.length; i += chunkSize) {
-      const chunk = entries.slice(i, i + chunkSize);
-      await this.db.insert(modelCatalogEntries).values(
-        chunk.map((e) => ({
-          id: newId(),
-          tenantId,
-          source: e.source,
-          providerId: e.providerId,
-          providerName: e.providerName,
-          modelId: e.modelId,
-          name: e.name,
-          metaJson: JSON.stringify(e),
-          createdAt: now,
-          updatedAt: now,
-        })),
-      );
-    }
+      const now = new Date();
+      const chunkSize = 200;
+      for (let i = 0; i < deduped.length; i += chunkSize) {
+        const chunk = deduped.slice(i, i + chunkSize);
+        await database.insert(modelCatalogEntries).values(
+          chunk.map((entry) => ({
+            id: newId(),
+            tenantId,
+            source: entry.source,
+            providerId: entry.providerId,
+            providerName: entry.providerName,
+            modelId: entry.modelId,
+            name: entry.name,
+            metaJson: JSON.stringify(entry),
+            createdAt: now,
+            updatedAt: now,
+          })),
+        );
+      }
+    });
 
-    return { imported: entries.length, source };
+    return { imported: deduped.length, source };
   }
 
   private async countSource(
