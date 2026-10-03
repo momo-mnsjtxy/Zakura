@@ -39,10 +39,13 @@ export function anthropicMessageId(): string {
  */
 function convertUserContent(content: unknown): {
   parts: Array<RawRecord>;
-  toolResults: Array<{ tool_call_id: string; content: string }>;
+  toolResults: Array<{ tool_call_id: string; content: string | Array<RawRecord> }>;
 } {
   const parts: Array<RawRecord> = [];
-  const toolResults: Array<{ tool_call_id: string; content: string }> = [];
+  const toolResults: Array<{
+    tool_call_id: string;
+    content: string | Array<RawRecord>;
+  }> = [];
 
   if (typeof content === "string") {
     if (content) parts.push({ type: "text", text: content });
@@ -61,22 +64,27 @@ function convertUserContent(content: unknown): {
         break;
       case "image": {
         const source = asRecord(block.source);
-        if (!source) break;
-        if (source.type === "base64" && typeof source.data === "string") {
+        if (!source) throw new Error("image 缺少 source");
+        if (source.type === "base64" && typeof source.data === "string" && source.data) {
           const media = typeof source.media_type === "string" ? source.media_type : "image/png";
           parts.push({
             type: "image_url",
             image_url: { url: `data:${media};base64,${source.data}` },
           });
-        } else if (source.type === "url" && typeof source.url === "string") {
+        } else if (source.type === "url" && typeof source.url === "string" && source.url) {
           parts.push({ type: "image_url", image_url: { url: source.url } });
+        } else {
+          throw new Error("image source 不完整");
         }
         break;
       }
       case "tool_result": {
         const id = typeof block.tool_use_id === "string" ? block.tool_use_id : null;
-        if (!id) break;
-        toolResults.push({ tool_call_id: id, content: stringifyToolResult(block.content) });
+        if (!id) throw new Error("tool_result 缺少 tool_use_id");
+        toolResults.push({
+          tool_call_id: id,
+          content: convertToolResult(block.content),
+        });
         break;
       }
       default:
@@ -88,18 +96,40 @@ function convertUserContent(content: unknown): {
   return { parts, toolResults };
 }
 
-function stringifyToolResult(content: unknown): string {
+function convertToolResult(content: unknown): string | Array<RawRecord> {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
-    const text = content
-      .map((raw) => {
-        const block = asRecord(raw);
-        if (block && block.type === "text" && typeof block.text === "string") return block.text;
-        return block ? JSON.stringify(block) : "";
-      })
-      .filter(Boolean)
-      .join("\n");
-    if (text) return text;
+    const parts: Array<RawRecord> = [];
+    for (const raw of content) {
+      const block = asRecord(raw);
+      if (!block) continue;
+      if (block.type === "text" && typeof block.text === "string") {
+        parts.push({ type: "text", text: block.text });
+        continue;
+      }
+      if (block.type === "image") {
+        const source = asRecord(block.source);
+        if (!source) throw new Error("tool_result image 缺少 source");
+        if (source.type === "base64" && typeof source.data === "string" && source.data) {
+          const media = typeof source.media_type === "string" ? source.media_type : "image/png";
+          parts.push({
+            type: "image_url",
+            image_url: { url: `data:${media};base64,${source.data}` },
+          });
+          continue;
+        }
+        if (source.type === "url" && typeof source.url === "string" && source.url) {
+          parts.push({ type: "image_url", image_url: { url: source.url } });
+          continue;
+        }
+        throw new Error("tool_result image source 不完整");
+      }
+      parts.push({ type: "text", text: JSON.stringify(block) });
+    }
+    if (parts.every((part) => part.type === "text")) {
+      return parts.map((part) => String(part.text ?? "")).filter(Boolean).join("\n");
+    }
+    if (parts.length) return parts;
   }
   return content === undefined ? "" : JSON.stringify(content);
 }
@@ -120,9 +150,12 @@ function convertAssistantContent(content: unknown): {
     if (block.type === "text" && typeof block.text === "string") {
       chunks.push(block.text);
     } else if (block.type === "tool_use") {
-      const id = typeof block.id === "string" ? block.id : `call_${randomUUID()}`;
+      const id = typeof block.id === "string" ? block.id : "";
       const name = typeof block.name === "string" ? block.name : "";
-      if (!name) continue;
+      if (!id || !name) throw new Error("tool_use 缺少 id 或 name");
+      if (!block.input || typeof block.input !== "object" || Array.isArray(block.input)) {
+        throw new Error(`tool_use ${name} 的 input 不是完整对象`);
+      }
       toolCalls.push({
         id,
         type: "function",

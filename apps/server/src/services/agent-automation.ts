@@ -4,7 +4,7 @@
  */
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { log, recordPlatformFault } from "@zakura/core";
-import { and, asc, desc, eq, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, isNull, lt, lte, or, sql } from "drizzle-orm";
 import {
   describeListener,
   matchRoutineListener,
@@ -18,10 +18,13 @@ import {
 import type { Db } from "../db/client.js";
 import {
   agentAutomationRuns,
+  agentHeartbeats,
   agentSchedules,
   agents,
+  cloudAgentRuns,
   newId,
   type AgentAutomationRun,
+  type AgentHeartbeat,
   type AgentSchedule,
 } from "../db/schema.js";
 import {
@@ -33,6 +36,34 @@ import {
 
 const TICK_MS = 20_000;
 const CLAIM_BATCH = 20;
+const QUEUED_META_PREFIX = "zakura:automation:v1:";
+const DEFAULT_HEARTBEAT_PROMPT =
+  "检查当前工作区和任务状态，处理可以自主完成的事项，并简要汇报值得用户关注的变化。";
+
+type QueuedAutomationMeta = {
+  title: string;
+  scheduleName?: string;
+  project?: string | null;
+  eventSummary?: string;
+};
+
+function encodeQueuedMeta(meta: QueuedAutomationMeta): string {
+  return `${QUEUED_META_PREFIX}${JSON.stringify(meta)}`;
+}
+
+function parseQueuedMeta(raw: string | null): QueuedAutomationMeta | null {
+  if (!raw?.startsWith(QUEUED_META_PREFIX)) return null;
+  try {
+    const value = JSON.parse(raw.slice(QUEUED_META_PREFIX.length)) as QueuedAutomationMeta;
+    return value && typeof value.title === "string" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function transactionDb(value: unknown): Db {
+  return value as Db;
+}
 
 export type AutomationTrigger = {
   tenantId: string;
@@ -56,6 +87,12 @@ export type AutomationRunner = {
     project?: string | null;
     eventSummary?: string;
   }) => Promise<{ sessionId: string; runId: string }>;
+  cancelAutomationTurn?: (input: {
+    tenantId: string;
+    agentId: string;
+    sessionId: string;
+    runId: string;
+  }) => Promise<boolean>;
 };
 
 function parseListenerJson(raw: string): RoutineListener | null {
@@ -130,7 +167,7 @@ function runDto(row: AgentAutomationRun) {
     cloudRunId: row.cloudRunId,
     status: row.status,
     prompt: row.prompt,
-    resultText: row.resultText,
+    resultText: parseQueuedMeta(row.resultText) ? null : row.resultText,
     error: row.error,
     startedAt: row.startedAt?.toISOString() ?? null,
     completedAt: row.completedAt?.toISOString() ?? null,
@@ -138,15 +175,46 @@ function runDto(row: AgentAutomationRun) {
   };
 }
 
+function heartbeatDto(row: AgentHeartbeat) {
+  return {
+    agentId: row.agentId,
+    enabled: row.enabled,
+    intervalMinutes: row.intervalMinutes,
+    prompt: row.prompt,
+    nextRunAt: row.nextRunAt?.toISOString() ?? null,
+    lastRunAt: row.lastRunAt?.toISOString() ?? null,
+    lastStatus: row.lastStatus,
+    lastError: row.lastError,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+  };
+}
+
 export class AgentAutomationService {
   private timer: ReturnType<typeof setInterval> | null = null;
+  private initialTimer: ReturnType<typeof setTimeout> | null = null;
   private ticking = false;
   private runner: AutomationRunner | null = null;
+  private readonly now: () => Date;
+  private readonly tickMs: number;
+  private readonly initialDelayMs: number;
+  private readonly orphanGraceMs: number;
 
   constructor(
     private readonly db: Db,
-    private readonly opts?: { publicBaseUrl?: string },
-  ) {}
+    private readonly opts?: {
+      publicBaseUrl?: string;
+      now?: () => Date;
+      tickMs?: number;
+      initialDelayMs?: number;
+      orphanGraceMs?: number;
+    },
+  ) {
+    this.now = opts?.now ?? (() => new Date());
+    this.tickMs = Math.max(100, opts?.tickMs ?? TICK_MS);
+    this.initialDelayMs = Math.max(0, opts?.initialDelayMs ?? 3_000);
+    this.orphanGraceMs = Math.max(0, opts?.orphanGraceMs ?? 30_000);
+  }
 
   private dto(row: AgentSchedule) {
     return scheduleDto(row, this.opts?.publicBaseUrl);
@@ -158,16 +226,29 @@ export class AgentAutomationService {
 
   start(): void {
     if (this.timer) return;
-    this.timer = setInterval(() => void this.tick(), TICK_MS);
+    this.timer = setInterval(() => void this.tick(), this.tickMs);
+    this.timer.unref?.();
     // boot 后稍等再扫，避免与 migrate 抢
-    setTimeout(() => void this.tick(), 3_000);
-    log.info("boot.automation_scheduler", { poll_sec: 20 });
+    this.initialTimer = setTimeout(() => {
+      this.initialTimer = null;
+      void this.recover()
+        .then(() => this.tick())
+        .catch((error) =>
+          recordPlatformFault("automation.recover", error, { subsystem: "automation" }),
+        );
+    }, this.initialDelayMs);
+    this.initialTimer.unref?.();
+    log.info("boot.automation_scheduler", { poll_sec: this.tickMs / 1_000 });
   }
 
   stop(): void {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
+    }
+    if (this.initialTimer) {
+      clearTimeout(this.initialTimer);
+      this.initialTimer = null;
     }
   }
 
@@ -235,7 +316,7 @@ export class AgentAutomationService {
     let webhookSecret: string | null = null;
     let nextRunAt: Date | null = null;
     const enabled = input.enabled !== false;
-    const now = new Date();
+    const now = this.now();
 
     if (triggerKind === "listener") {
       const listener = parseRoutineListener(input.listener);
@@ -311,7 +392,7 @@ export class AgentAutomationService {
     }
 
     const enabled = patch.enabled !== undefined ? patch.enabled : existing.enabled;
-    const now = new Date();
+    const now = this.now();
     let pattern = patch.pattern !== undefined ? patch.pattern.trim() : existing.pattern;
     let timezone =
       patch.timezone !== undefined ? patch.timezone.trim() || "UTC" : existing.timezone;
@@ -390,8 +471,112 @@ export class AgentAutomationService {
   async deleteSchedule(tenantId: string, agentId: string, scheduleId: string): Promise<boolean> {
     const existing = await this.getSchedule(tenantId, agentId, scheduleId);
     if (!existing) return false;
-    await this.db.delete(agentSchedules).where(eq(agentSchedules.id, scheduleId));
+    await this.db.transaction(async (tx) => {
+      const database = transactionDb(tx);
+      await database
+        .update(agentAutomationRuns)
+        .set({
+          status: "skipped",
+          error: "routine deleted before start",
+          completedAt: this.now(),
+        })
+        .where(
+          and(
+            eq(agentAutomationRuns.scheduleId, scheduleId),
+            eq(agentAutomationRuns.status, "queued"),
+          ),
+        );
+      await database
+        .delete(agentSchedules)
+        .where(
+          and(
+            eq(agentSchedules.id, scheduleId),
+            eq(agentSchedules.tenantId, tenantId),
+            eq(agentSchedules.agentId, agentId),
+          ),
+        );
+    });
     return true;
+  }
+
+  // ── heartbeats ──────────────────────────────────────────────
+
+  async getHeartbeat(tenantId: string, agentId: string) {
+    const row = await this.db.query.agentHeartbeats.findFirst({
+      where: and(
+        eq(agentHeartbeats.tenantId, tenantId),
+        eq(agentHeartbeats.agentId, agentId),
+      ),
+    });
+    return row ? heartbeatDto(row) : null;
+  }
+
+  async updateHeartbeat(
+    tenantId: string,
+    agentId: string,
+    patch: { enabled?: boolean; intervalMinutes?: number; prompt?: string },
+  ) {
+    const agent = await this.db.query.agents.findFirst({
+      where: and(eq(agents.id, agentId), eq(agents.tenantId, tenantId)),
+    });
+    if (!agent) throw new Error("Agent not found");
+    const existing = await this.db.query.agentHeartbeats.findFirst({
+      where: and(
+        eq(agentHeartbeats.tenantId, tenantId),
+        eq(agentHeartbeats.agentId, agentId),
+      ),
+    });
+    if (
+      patch.intervalMinutes !== undefined &&
+      (!Number.isFinite(patch.intervalMinutes) ||
+        patch.intervalMinutes < 5 ||
+        patch.intervalMinutes > 10_080)
+    ) {
+      throw new Error("intervalMinutes must be between 5 and 10080");
+    }
+    const intervalMinutes = Math.floor(patch.intervalMinutes ?? existing?.intervalMinutes ?? 60);
+    const enabled = patch.enabled ?? existing?.enabled ?? false;
+    const prompt = patch.prompt !== undefined ? patch.prompt.trim() : (existing?.prompt ?? "");
+    const now = this.now();
+    const cadenceChanged =
+      patch.intervalMinutes !== undefined || patch.enabled !== undefined || !existing;
+    const nextRunAt = enabled
+      ? cadenceChanged || !existing?.nextRunAt
+        ? new Date(now.getTime() + intervalMinutes * 60_000)
+        : existing.nextRunAt
+      : null;
+    const rows = await this.db
+      .insert(agentHeartbeats)
+      .values({
+        agentId,
+        tenantId,
+        enabled,
+        intervalMinutes,
+        prompt,
+        nextRunAt,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+      })
+      .onConflictDoUpdate({
+        target: agentHeartbeats.agentId,
+        set: { enabled, intervalMinutes, prompt, nextRunAt, updatedAt: now },
+      })
+      .returning();
+    if (!rows[0]) throw new Error("update heartbeat failed");
+    return heartbeatDto(rows[0]);
+  }
+
+  async runHeartbeatNow(tenantId: string, agentId: string) {
+    const row = await this.db.query.agentHeartbeats.findFirst({
+      where: and(
+        eq(agentHeartbeats.tenantId, tenantId),
+        eq(agentHeartbeats.agentId, agentId),
+      ),
+    });
+    if (!row) throw new Error("heartbeat not found");
+    const run = await this.admitHeartbeat(row, true);
+    if (!run) throw new Error("heartbeat admission failed");
+    return this.processAutomationRun(run.id, true);
   }
 
   // ── runs / manual trigger ─────────────────────────────────────
@@ -418,45 +603,166 @@ export class AgentAutomationService {
     return rows.map(runDto);
   }
 
-  /** 手动立即跑一次 schedule（不推进 next_run_at 周期逻辑之外的「额外」触发） */
+  async getRun(tenantId: string, agentId: string, runId: string) {
+    const row = await this.db.query.agentAutomationRuns.findFirst({
+      where: and(
+        eq(agentAutomationRuns.id, runId),
+        eq(agentAutomationRuns.tenantId, tenantId),
+        eq(agentAutomationRuns.agentId, agentId),
+      ),
+    });
+    return row ? runDto(row) : null;
+  }
+
+  /** Manual trigger is an extra occurrence and does not move the saved cadence. */
   async runScheduleNow(tenantId: string, agentId: string, scheduleId: string) {
     const row = await this.getSchedule(tenantId, agentId, scheduleId);
     if (!row) throw new Error("schedule not found");
-    return this.fireSchedule(row, { manual: true });
+    const run = await this.admitSchedule(row, { mode: "manual" });
+    if (!run) throw new Error("schedule admission failed");
+    return this.processAutomationRun(run.id, true);
   }
 
-  // ── poll loop ─────────────────────────────────────────────────
+  async cancelRun(tenantId: string, agentId: string, runId: string) {
+    const row = await this.db.query.agentAutomationRuns.findFirst({
+      where: and(
+        eq(agentAutomationRuns.id, runId),
+        eq(agentAutomationRuns.tenantId, tenantId),
+        eq(agentAutomationRuns.agentId, agentId),
+      ),
+    });
+    if (!row) return null;
+    if (row.status === "queued") {
+      const cancelled = await this.db
+        .update(agentAutomationRuns)
+        .set({
+          status: "skipped",
+          error: "cancelled before start",
+          completedAt: this.now(),
+        })
+        .where(and(eq(agentAutomationRuns.id, row.id), eq(agentAutomationRuns.status, "queued")))
+        .returning();
+      const current = cancelled[0] ?? await this.db.query.agentAutomationRuns.findFirst({
+        where: eq(agentAutomationRuns.id, row.id),
+      });
+      if (cancelled[0]) await this.updateSourceStatus(cancelled[0], "skipped", "cancelled");
+      return current ? { accepted: Boolean(cancelled[0]), run: runDto(current) } : null;
+    }
+    if (row.status !== "running") return { accepted: false, run: runDto(row) };
+    if (!row.sessionId || !row.cloudRunId) {
+      const cancelled = await this.db
+        .update(agentAutomationRuns)
+        .set({
+          status: "skipped",
+          error: "cancelled during start",
+          completedAt: this.now(),
+        })
+        .where(
+          and(
+            eq(agentAutomationRuns.id, row.id),
+            eq(agentAutomationRuns.status, "running"),
+            isNull(agentAutomationRuns.cloudRunId),
+          ),
+        )
+        .returning();
+      const current = cancelled[0] ?? await this.db.query.agentAutomationRuns.findFirst({
+        where: eq(agentAutomationRuns.id, row.id),
+      });
+      if (cancelled[0]) await this.updateSourceStatus(cancelled[0], "skipped", "cancelled");
+      return current ? { accepted: Boolean(cancelled[0]), run: runDto(current) } : null;
+    }
+    if (!this.runner?.cancelAutomationTurn) {
+      throw new Error("automation runner cancel not configured");
+    }
+    const accepted = await this.runner.cancelAutomationTurn({
+      tenantId,
+      agentId,
+      sessionId: row.sessionId,
+      runId: row.cloudRunId,
+    });
+    if (accepted) {
+      await this.db
+        .update(agentAutomationRuns)
+        .set({ error: "cancellation requested" })
+        .where(and(eq(agentAutomationRuns.id, row.id), eq(agentAutomationRuns.status, "running")));
+    }
+    const current = await this.db.query.agentAutomationRuns.findFirst({
+      where: eq(agentAutomationRuns.id, row.id),
+    });
+    return current ? { accepted, run: runDto(current) } : null;
+  }
 
-  async tick(): Promise<{ schedules: number }> {
-    if (this.ticking) return { schedules: 0 };
-    if (!this.runner) return { schedules: 0 };
+  // ── durable poll / recovery ────────────────────────────────────
+
+  async recover(): Promise<{ queued: number; orphaned: number; reconciled: number }> {
+    const reconciled = await this.reconcileTerminalRuns();
+    const cutoff = new Date(this.now().getTime() - this.orphanGraceMs);
+    const orphaned = await this.db
+      .select()
+      .from(agentAutomationRuns)
+      .where(
+        and(
+          eq(agentAutomationRuns.status, "running"),
+          isNull(agentAutomationRuns.cloudRunId),
+          or(
+            isNull(agentAutomationRuns.startedAt),
+            lte(agentAutomationRuns.startedAt, cutoff),
+          ),
+        ),
+      )
+      .limit(CLAIM_BATCH);
+    for (const row of orphaned) {
+      const transitioned = await this.db
+        .update(agentAutomationRuns)
+        .set({
+          status: "failed",
+          error: "automation admission interrupted",
+          completedAt: this.now(),
+        })
+        .where(and(eq(agentAutomationRuns.id, row.id), eq(agentAutomationRuns.status, "running")))
+        .returning();
+      if (transitioned[0]) {
+        await this.updateSourceStatus(
+          transitioned[0],
+          "failed",
+          "automation admission interrupted",
+        );
+      }
+    }
+    const queued = this.runner ? await this.processQueuedRuns() : 0;
+    return { queued, orphaned: orphaned.length, reconciled };
+  }
+
+  async tick(): Promise<{ schedules: number; heartbeats: number; reconciled: number }> {
+    if (this.ticking) return { schedules: 0, heartbeats: 0, reconciled: 0 };
     this.ticking = true;
     let schedules = 0;
+    let heartbeats = 0;
+    let reconciled = 0;
     try {
-      schedules = await this.claimAndFireSchedules();
+      reconciled = await this.reconcileTerminalRuns();
+      if (!this.runner) return { schedules, heartbeats, reconciled };
+      await this.processQueuedRuns();
+      schedules = await this.claimDueSchedules();
+      heartbeats = await this.claimDueHeartbeats();
+      await this.processQueuedRuns();
     } catch (err) {
       recordPlatformFault("automation.tick", err, { subsystem: "automation" });
     } finally {
       this.ticking = false;
     }
-    return { schedules };
+    return { schedules, heartbeats, reconciled };
   }
 
-  private async claimAndFireSchedules(): Promise<number> {
-    const now = new Date();
+  private async claimDueSchedules(): Promise<number> {
+    const now = this.now();
     const due = await this.db
       .select()
       .from(agentSchedules)
-      .where(
-        and(
-          eq(agentSchedules.enabled, true),
-          lte(agentSchedules.nextRunAt, now),
-        ),
-      )
+      .where(and(eq(agentSchedules.enabled, true), lte(agentSchedules.nextRunAt, now)))
       .orderBy(asc(agentSchedules.nextRunAt))
       .limit(CLAIM_BATCH);
-
-    let n = 0;
+    let admitted = 0;
     for (const row of due) {
       if (row.triggerKind === "listener") continue;
       if (row.maxRuns != null && row.runCount >= row.maxRuns) {
@@ -467,150 +773,401 @@ export class AgentAutomationService {
             nextRunAt: null,
             lastStatus: "completed",
             lastError: "max_runs reached",
-            updatedAt: new Date(),
+            updatedAt: now,
           })
-          .where(eq(agentSchedules.id, row.id));
+          .where(and(eq(agentSchedules.id, row.id), eq(agentSchedules.runCount, row.runCount)));
         continue;
       }
-      // claim：把 next 推到将来，避免并发 tick 双发
-      let next: Date;
+      let nextRunAt: Date;
       try {
-        next = nextRunAfter(row.pattern, now, { lastRunAt: now, timezone: row.timezone });
-      } catch (err) {
+        nextRunAt = nextRunAfter(row.pattern, now, { lastRunAt: now, timezone: row.timezone });
+      } catch (error) {
         await this.db
           .update(agentSchedules)
           .set({
             enabled: false,
+            nextRunAt: null,
             lastStatus: "failed",
-            lastError: err instanceof Error ? err.message : String(err),
-            updatedAt: new Date(),
+            lastError: (error instanceof Error ? error.message : String(error)).slice(0, 500),
+            updatedAt: now,
           })
-          .where(eq(agentSchedules.id, row.id));
+          .where(and(eq(agentSchedules.id, row.id), eq(agentSchedules.runCount, row.runCount)));
         continue;
       }
-      const claimed = await this.db
-        .update(agentSchedules)
+      if (await this.admitSchedule(row, { mode: "due", nextRunAt })) admitted += 1;
+    }
+    return admitted;
+  }
+
+  private async claimDueHeartbeats(): Promise<number> {
+    const now = this.now();
+    const due = await this.db
+      .select()
+      .from(agentHeartbeats)
+      .where(and(eq(agentHeartbeats.enabled, true), lte(agentHeartbeats.nextRunAt, now)))
+      .orderBy(asc(agentHeartbeats.nextRunAt))
+      .limit(CLAIM_BATCH);
+    let admitted = 0;
+    for (const row of due) {
+      if (await this.admitHeartbeat(row, false)) admitted += 1;
+    }
+    return admitted;
+  }
+
+  private async admitSchedule(
+    row: AgentSchedule,
+    opts:
+      | { mode: "manual" }
+      | { mode: "due"; nextRunAt: Date }
+      | { mode: "listener"; eventSummary: string; inbound: RoutineInboundEvent },
+  ): Promise<AgentAutomationRun | null> {
+    const now = this.now();
+    const isListener = row.triggerKind === "listener";
+    const disable =
+      opts.mode === "listener" &&
+      ((row.maxRuns != null && row.runCount + 1 >= row.maxRuns) ||
+        (() => {
+          const listener = parseListenerJson(row.listenerJson);
+          return listener ? shouldAutoStopListener(listener, opts.inbound) : false;
+        })());
+    const meta: QueuedAutomationMeta = {
+      title: `${isListener ? "事件" : "定时"}：${row.name}`.slice(0, 80),
+      scheduleName: row.name,
+      project: row.project,
+      ...(opts.mode === "listener" ? { eventSummary: opts.eventSummary } : {}),
+    };
+    return this.db.transaction(async (tx) => {
+      const database = transactionDb(tx);
+      let claimed: AgentSchedule | undefined;
+      if (opts.mode === "due") {
+        const nextCount = row.runCount + 1;
+        const maxReached = row.maxRuns != null && nextCount >= row.maxRuns;
+        [claimed] = await database
+          .update(agentSchedules)
+          .set({
+            runCount: sql`${agentSchedules.runCount} + 1`,
+            lastRunAt: now,
+            lastStatus: "queued",
+            lastError: null,
+            nextRunAt: maxReached ? null : opts.nextRunAt,
+            ...(maxReached ? { enabled: false } : {}),
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(agentSchedules.id, row.id),
+              eq(agentSchedules.enabled, true),
+              eq(agentSchedules.runCount, row.runCount),
+              row.nextRunAt
+                ? eq(agentSchedules.nextRunAt, row.nextRunAt)
+                : isNull(agentSchedules.nextRunAt),
+            ),
+          )
+          .returning();
+      } else if (opts.mode === "listener") {
+        [claimed] = await database
+          .update(agentSchedules)
+          .set({
+            runCount: sql`${agentSchedules.runCount} + 1`,
+            lastRunAt: now,
+            lastStatus: "queued",
+            lastError: null,
+            ...(disable ? { enabled: false, nextRunAt: null } : {}),
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(agentSchedules.id, row.id),
+              eq(agentSchedules.enabled, true),
+              eq(agentSchedules.runCount, row.runCount),
+              ...(row.maxRuns != null ? [lt(agentSchedules.runCount, row.maxRuns)] : []),
+            ),
+          )
+          .returning();
+      } else {
+        [claimed] = await database
+          .update(agentSchedules)
+          .set({
+            runCount: sql`${agentSchedules.runCount} + 1`,
+            lastRunAt: now,
+            lastStatus: "queued",
+            lastError: null,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(agentSchedules.id, row.id),
+              eq(agentSchedules.tenantId, row.tenantId),
+              eq(agentSchedules.agentId, row.agentId),
+            ),
+          )
+          .returning();
+      }
+      if (!claimed) return null;
+      const inserted = await database
+        .insert(agentAutomationRuns)
+        .values({
+          id: newId(),
+          tenantId: row.tenantId,
+          agentId: row.agentId,
+          kind: isListener ? "listener" : "schedule",
+          scheduleId: row.id,
+          status: "queued",
+          prompt: row.prompt,
+          resultText: encodeQueuedMeta(meta),
+          createdAt: now,
+        })
+        .returning();
+      return inserted[0] ?? null;
+    });
+  }
+
+  private async admitHeartbeat(
+    row: AgentHeartbeat,
+    manual: boolean,
+  ): Promise<AgentAutomationRun | null> {
+    const now = this.now();
+    const nextRunAt = new Date(now.getTime() + Math.max(5, row.intervalMinutes) * 60_000);
+    return this.db.transaction(async (tx) => {
+      const database = transactionDb(tx);
+      const claimed = await database
+        .update(agentHeartbeats)
         .set({
-          nextRunAt: next,
-          updatedAt: new Date(),
+          lastRunAt: now,
+          lastStatus: "queued",
+          lastError: null,
+          ...(!manual ? { nextRunAt } : {}),
+          updatedAt: now,
         })
         .where(
           and(
-            eq(agentSchedules.id, row.id),
-            eq(agentSchedules.enabled, true),
-            // 仍是 due 的那一版（next_run_at 未变）
-            row.nextRunAt
-              ? eq(agentSchedules.nextRunAt, row.nextRunAt)
-              : sql`${agentSchedules.nextRunAt} is null`,
+            eq(agentHeartbeats.agentId, row.agentId),
+            eq(agentHeartbeats.tenantId, row.tenantId),
+            ...(manual ? [] : [
+              eq(agentHeartbeats.enabled, true),
+              row.nextRunAt
+                ? eq(agentHeartbeats.nextRunAt, row.nextRunAt)
+                : isNull(agentHeartbeats.nextRunAt),
+            ]),
           ),
         )
         .returning();
-      if (!claimed.length) continue;
-
-      void this.fireSchedule({ ...row, nextRunAt: next }, { manual: false }).catch((err: unknown) => {
-        recordPlatformFault("automation.fire", err, { subsystem: "automation" });
-      });
-      n += 1;
-    }
-    return n;
+      if (!claimed[0]) return null;
+      const inserted = await database
+        .insert(agentAutomationRuns)
+        .values({
+          id: newId(),
+          tenantId: row.tenantId,
+          agentId: row.agentId,
+          kind: "heartbeat",
+          scheduleId: null,
+          status: "queued",
+          prompt: row.prompt.trim() || DEFAULT_HEARTBEAT_PROMPT,
+          resultText: encodeQueuedMeta({ title: "心跳检查" }),
+          createdAt: now,
+        })
+        .returning();
+      return inserted[0] ?? null;
+    });
   }
 
-  private async fireSchedule(
-    row: AgentSchedule,
-    opts: { manual: boolean; eventSummary?: string; inbound?: RoutineInboundEvent },
-  ): Promise<ReturnType<typeof runDto>> {
-    if (!this.runner) throw new Error("automation runner not configured");
-    const isListener = row.triggerKind === "listener";
-    const logId = newId();
-    const now = new Date();
-    await this.db.insert(agentAutomationRuns).values({
-      id: logId,
-      tenantId: row.tenantId,
-      agentId: row.agentId,
-      kind: isListener ? "listener" : "schedule",
-      scheduleId: row.id,
-      status: "running",
-      prompt: row.prompt,
-      startedAt: now,
-      createdAt: now,
-    });
+  private async processQueuedRuns(): Promise<number> {
+    if (!this.runner) return 0;
+    const rows = await this.db
+      .select({ id: agentAutomationRuns.id })
+      .from(agentAutomationRuns)
+      .where(eq(agentAutomationRuns.status, "queued"))
+      .orderBy(asc(agentAutomationRuns.createdAt))
+      .limit(CLAIM_BATCH);
+    let processed = 0;
+    for (const row of rows) {
+      const result = await this.processAutomationRun(row.id, false);
+      if (result) processed += 1;
+    }
+    return processed;
+  }
 
+  private async processAutomationRun(runId: string, rethrow: boolean) {
+    if (!this.runner) throw new Error("automation runner not configured");
+    const startedAt = this.now();
+    const claimed = await this.db
+      .update(agentAutomationRuns)
+      .set({ status: "running", startedAt })
+      .where(and(eq(agentAutomationRuns.id, runId), eq(agentAutomationRuns.status, "queued")))
+      .returning();
+    if (!claimed[0]) {
+      const current = await this.db.query.agentAutomationRuns.findFirst({
+        where: eq(agentAutomationRuns.id, runId),
+      });
+      return current ? runDto(current) : null;
+    }
+    const row = claimed[0];
+    let meta = parseQueuedMeta(row.resultText);
+    if (!meta && row.scheduleId) {
+      const schedule = await this.db.query.agentSchedules.findFirst({
+        where: eq(agentSchedules.id, row.scheduleId),
+      });
+      if (schedule) {
+        meta = {
+          title: `${row.kind === "listener" ? "事件" : "定时"}：${schedule.name}`.slice(0, 80),
+          scheduleName: schedule.name,
+          project: schedule.project,
+        };
+      }
+    }
+    meta ??= { title: row.kind === "heartbeat" ? "心跳检查" : "自动任务" };
     try {
-      const title = `${isListener ? "事件" : "定时"}：${row.name}`.slice(0, 80);
-      const { sessionId, runId } = await this.runner.startAutomationTurn({
+      const started = await this.runner.startAutomationTurn({
         tenantId: row.tenantId,
         agentId: row.agentId,
         prompt: row.prompt,
-        title,
-        kind: isListener ? "listener" : "schedule",
-        scheduleId: row.id,
-        scheduleName: row.name,
-        project: row.project,
-        ...(opts.eventSummary ? { eventSummary: opts.eventSummary } : {}),
+        title: meta.title,
+        kind: row.kind as "schedule" | "heartbeat" | "listener",
+        ...(row.scheduleId ? { scheduleId: row.scheduleId } : {}),
+        ...(meta.scheduleName ? { scheduleName: meta.scheduleName } : {}),
+        ...(meta.project !== undefined ? { project: meta.project } : {}),
+        ...(meta.eventSummary ? { eventSummary: meta.eventSummary } : {}),
       });
-      await this.db
+      const updated = await this.db
         .update(agentAutomationRuns)
         .set({
-          status: "completed",
-          sessionId,
-          cloudRunId: runId,
-          completedAt: new Date(),
-          resultText: `started session ${sessionId}`,
+          sessionId: started.sessionId,
+          cloudRunId: started.runId,
+          resultText: null,
+          error: null,
         })
-        .where(eq(agentAutomationRuns.id, logId));
-
-      const disable =
-        !opts.manual &&
-        ((row.maxRuns != null && row.runCount + 1 >= row.maxRuns) ||
-          (opts.inbound &&
-            (() => {
-              const listener = parseListenerJson(row.listenerJson);
-              return listener ? shouldAutoStopListener(listener, opts.inbound!) : false;
-            })()));
-
-      await this.db
-        .update(agentSchedules)
-        .set({
-          runCount: sql`${agentSchedules.runCount} + 1`,
-          lastRunAt: new Date(),
-          lastStatus: "ok",
-          lastError: null,
-          ...(disable ? { enabled: false, nextRunAt: null } : {}),
-          updatedAt: new Date(),
-        })
-        .where(eq(agentSchedules.id, row.id));
-
-      const log = await this.db.query.agentAutomationRuns.findFirst({
-        where: eq(agentAutomationRuns.id, logId),
+        .where(and(eq(agentAutomationRuns.id, row.id), eq(agentAutomationRuns.status, "running")))
+        .returning();
+      if (updated[0]) {
+        await this.updateSourceStatus(updated[0], "running", null);
+        return runDto(updated[0]);
+      }
+      const current = await this.db.query.agentAutomationRuns.findFirst({
+        where: eq(agentAutomationRuns.id, row.id),
       });
-      return runDto(log!);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      await this.db
+      if (current?.status === "skipped") {
+        const persisted = await this.db
+          .update(agentAutomationRuns)
+          .set({ sessionId: started.sessionId, cloudRunId: started.runId, resultText: null })
+          .where(eq(agentAutomationRuns.id, row.id))
+          .returning();
+        await this.runner.cancelAutomationTurn?.({
+          tenantId: row.tenantId,
+          agentId: row.agentId,
+          sessionId: started.sessionId,
+          runId: started.runId,
+        });
+        return runDto(persisted[0] ?? current);
+      }
+      return current ? runDto(current) : null;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const failed = await this.db
         .update(agentAutomationRuns)
         .set({
           status: "failed",
+          resultText: null,
           error: message,
-          completedAt: new Date(),
+          completedAt: this.now(),
         })
-        .where(eq(agentAutomationRuns.id, logId));
-      await this.db
-        .update(agentSchedules)
-        .set({
-          lastRunAt: new Date(),
-          lastStatus: "failed",
-          lastError: message.slice(0, 500),
-          updatedAt: new Date(),
-        })
-        .where(eq(agentSchedules.id, row.id));
-      throw err;
+        .where(and(eq(agentAutomationRuns.id, row.id), eq(agentAutomationRuns.status, "running")))
+        .returning();
+      if (failed[0]) await this.updateSourceStatus(failed[0], "failed", message);
+      if (rethrow) throw error;
+      recordPlatformFault("automation.fire", error, { subsystem: "automation" });
+      return failed[0] ? runDto(failed[0]) : null;
     }
   }
 
-  /**
-   * Slack 等已接入的入站消息：扫该 agent 的 listener routine。
-   * 命中则另开 system 会话执行任务说明（与频道对话独立）。
-   */
+  private async reconcileTerminalRuns(): Promise<number> {
+    const rows = await this.db
+      .select()
+      .from(agentAutomationRuns)
+      .where(
+        and(
+          eq(agentAutomationRuns.status, "running"),
+          sql`${agentAutomationRuns.cloudRunId} is not null`,
+        ),
+      )
+      .orderBy(asc(agentAutomationRuns.createdAt))
+      .limit(CLAIM_BATCH * 5);
+    let reconciled = 0;
+    for (const row of rows) {
+      const cloudRun = row.cloudRunId
+        ? await this.db.query.cloudAgentRuns.findFirst({
+            where: eq(cloudAgentRuns.id, row.cloudRunId),
+          })
+        : null;
+      if (cloudRun && ["queued", "running", "recovering"].includes(cloudRun.status)) continue;
+      const status = cloudRun?.status === "completed"
+        ? "completed"
+        : cloudRun?.status === "cancelled"
+          ? "skipped"
+          : "failed";
+      const message =
+        status === "completed"
+          ? null
+          : cloudRun?.error || (cloudRun ? `cloud run ${cloudRun.status}` : "cloud run missing");
+      const transitioned = await this.db
+        .update(agentAutomationRuns)
+        .set({
+          status,
+          completedAt: cloudRun?.completedAt ?? this.now(),
+          resultText: status === "completed" && row.sessionId
+            ? `completed session ${row.sessionId}`
+            : null,
+          error: message,
+        })
+        .where(and(eq(agentAutomationRuns.id, row.id), eq(agentAutomationRuns.status, "running")))
+        .returning();
+      if (!transitioned[0]) continue;
+      await this.updateSourceStatus(
+        transitioned[0],
+        status === "completed" ? "ok" : status,
+        message,
+      );
+      reconciled += 1;
+    }
+    return reconciled;
+  }
+
+  private async updateSourceStatus(
+    run: AgentAutomationRun,
+    status: "queued" | "running" | "ok" | "failed" | "skipped",
+    error: string | null,
+  ): Promise<void> {
+    const patch = {
+      lastStatus: status,
+      lastError: error?.slice(0, 500) ?? null,
+      updatedAt: this.now(),
+    };
+    if (run.scheduleId) {
+      await this.db
+        .update(agentSchedules)
+        .set(patch)
+        .where(
+          and(
+            eq(agentSchedules.id, run.scheduleId),
+            eq(agentSchedules.lastRunAt, run.createdAt),
+          ),
+        );
+      return;
+    }
+    if (run.kind === "heartbeat") {
+      await this.db
+        .update(agentHeartbeats)
+        .set(patch)
+        .where(
+          and(
+            eq(agentHeartbeats.tenantId, run.tenantId),
+            eq(agentHeartbeats.agentId, run.agentId),
+            eq(agentHeartbeats.lastRunAt, run.createdAt),
+          ),
+        );
+    }
+  }
+
+  /** Match inbound events and durably admit at most one run per listener version. */
   async matchInbound(
     tenantId: string,
     agentId: string,
@@ -627,24 +1184,23 @@ export class AgentAutomationService {
           eq(agentSchedules.triggerKind, "listener"),
         ),
       );
-    let n = 0;
+    let admitted = 0;
     for (const row of rows) {
       const listener = parseListenerJson(row.listenerJson);
       if (!listener || !matchRoutineListener(listener, ev)) continue;
-      if (row.maxRuns != null && row.runCount >= row.maxRuns) continue;
-      void this.fireSchedule(row, {
-        manual: false,
+      const run = await this.admitSchedule(row, {
+        mode: "listener",
         eventSummary: summarizeInbound(ev),
         inbound: ev,
-      }).catch((err: unknown) => {
-        recordPlatformFault("automation.listener", err, { subsystem: "automation" });
       });
-      n += 1;
+      if (!run) continue;
+      admitted += 1;
+      await this.processAutomationRun(run.id, false);
     }
-    return n;
+    return admitted;
   }
 
-  /** 公开 webhook：验签后按这条 routine 的 listener 过滤并触发 */
+  /** Public webhook: authenticate, atomically reserve maxRuns, then start one job. */
   async handleWebhook(
     scheduleId: string,
     input: {
@@ -674,23 +1230,21 @@ export class AgentAutomationService {
     if (!row.enabled) return { ok: true, matched: 0 };
     const listener = parseListenerJson(row.listenerJson);
     if (!listener) return { ok: false, error: "invalid listener", status: 400 };
-    const hits = input.events.filter((ev) => matchRoutineListener(listener, ev));
-    // webhook 源：空 events 也视为一次触发（外部系统随便 POST）
-    const toFire =
-      hits.length > 0
-        ? hits
-        : listener.source === "webhook"
-          ? [{ source: "webhook" as const, type: "post" }]
-          : [];
-    for (const ev of toFire.slice(0, 1)) {
-      await this.fireSchedule(row, {
-        manual: false,
-        eventSummary: summarizeInbound(ev),
-        inbound: ev,
-      });
-    }
-    return { ok: true, matched: toFire.length };
+    const hits = input.events.filter((event) => matchRoutineListener(listener, event));
+    const event = hits[0] ?? (listener.source === "webhook"
+      ? { source: "webhook" as const, type: "post" }
+      : null);
+    if (!event) return { ok: true, matched: 0 };
+    const run = await this.admitSchedule(row, {
+      mode: "listener",
+      eventSummary: summarizeInbound(event),
+      inbound: event,
+    });
+    if (!run) return { ok: true, matched: 0 };
+    await this.processAutomationRun(run.id, true);
+    return { ok: true, matched: 1 };
   }
+
 }
 
 export { CronParseError, RoutineListenerError };

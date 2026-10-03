@@ -25,6 +25,7 @@ describe("platform service durable lifecycle", () => {
   let failCreateAt = 0;
   let failRemovals = false;
   let healthStatus = 200;
+  let runtimeLogs = "ready";
   const runtime = {
     ping: async () => ({ ok: true, version: "fake-docker" }),
     ensureNetwork: async () => undefined,
@@ -44,7 +45,7 @@ describe("platform service durable lifecycle", () => {
         ports: (spec.ports ?? []).map((port) => ({ ...port, hostPort: port.hostPort ?? 19080 })),
       };
     },
-    logs: async () => "ready",
+    logs: async () => runtimeLogs,
     stop: async () => undefined,
     remove: async (id: string) => {
       if (failRemovals) throw new Error("fake remove failure");
@@ -169,5 +170,52 @@ describe("platform service durable lifecycle", () => {
     await manager.stop("firecrawl");
     await eventually(async () => (await manager.get("firecrawl"))?.status === "stopped");
     assert.equal(containers.length, 0);
+  });
+
+  it("diagnoses container drift without mutation and redacts configured secrets", async () => {
+    const manager = new PlatformServiceManager(db, runtime as never, config, {
+      fetch: async () => new Response("ok", { status: 200 }),
+    });
+    await manager.patch("searxng", {
+      mode: "managed",
+      config: {
+        apiKey: "diagnostic-secret",
+        env: { UPSTREAM_PASSWORD: "password-secret" },
+      },
+    });
+    const { platformServices } = await import("../src/db/schema.js");
+    const row = await db.query.platformServices.findFirst({
+      where: eq(platformServices.serviceKey, "searxng"),
+    });
+    assert.ok(row);
+    await db
+      .update(platformServices)
+      .set({
+        desiredState: "running",
+        status: "running",
+        containersJson: JSON.stringify([
+          { name: "zakura-ps-searxng", dockerId: "stale-id", role: "main" },
+        ]),
+      })
+      .where(eq(platformServices.id, row.id));
+    containers.splice(0, containers.length, {
+      id: "unexpected-id",
+      name: "zakura-ps-searxng-old",
+      labels: { "zakura.service": "searxng" },
+    });
+    runtimeLogs = "token=diagnostic-secret password=password-secret";
+
+    const before = containers.map((container) => ({ ...container }));
+    const diagnostics = await manager.diagnose("searxng", { tail: 50 });
+    assert.equal(diagnostics.runtime.reachable, true);
+    assert.deepEqual(diagnostics.missingContainers, ["zakura-ps-searxng"]);
+    assert.deepEqual(diagnostics.unexpectedContainers, ["zakura-ps-searxng-old"]);
+    assert.deepEqual(diagnostics.staleReferences, ["zakura-ps-searxng"]);
+    assert.doesNotMatch(diagnostics.logs, /diagnostic-secret|password-secret/);
+    assert.match(diagnostics.logs, /\[REDACTED\]/);
+    assert.deepEqual(containers, before, "diagnostics must not mutate runtime state");
+
+    runtimeLogs = "ready";
+    containers.splice(0);
   });
 });

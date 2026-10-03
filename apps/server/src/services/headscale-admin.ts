@@ -44,6 +44,9 @@ export type HeadscaleAdminConfig = {
   /** Public HTTPS login-server URL, e.g. https://headscale.example.com */
   url: string;
   apiKey: string;
+  /** Injectable for deterministic control-plane tests. */
+  fetch?: typeof fetch;
+  requestTimeoutMs?: number;
 };
 
 function normalizeBase(url: string): string {
@@ -71,11 +74,15 @@ export class HeadscaleAdminClient {
   readonly loginServer: string;
   private readonly apiKey: string;
   private readonly apiBase: string;
+  private readonly fetchImpl: typeof fetch;
+  private readonly requestTimeoutMs: number;
 
   constructor(cfg: HeadscaleAdminConfig) {
     this.loginServer = normalizeBase(cfg.url);
     this.apiKey = cfg.apiKey.trim();
     this.apiBase = `${this.loginServer}/api/v1`;
+    this.fetchImpl = cfg.fetch ?? globalThis.fetch;
+    this.requestTimeoutMs = cfg.requestTimeoutMs ?? 20_000;
   }
 
   private async request<T>(
@@ -83,7 +90,7 @@ export class HeadscaleAdminClient {
     path: string,
     body?: unknown,
   ): Promise<T> {
-    const res = await fetch(`${this.apiBase}${path}`, {
+    const res = await this.fetchImpl(`${this.apiBase}${path}`, {
       method,
       headers: {
         Authorization: `Bearer ${this.apiKey}`,
@@ -91,6 +98,7 @@ export class HeadscaleAdminClient {
         ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(this.requestTimeoutMs),
     });
     const text = await res.text();
     let json: unknown = null;
@@ -296,4 +304,3 @@ export class HeadscaleAdminClient {
     };
   }
 }
-

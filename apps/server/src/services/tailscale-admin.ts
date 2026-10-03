@@ -51,6 +51,15 @@ export type TailscaleAuthKeyResult = {
 const TOKEN_URL = "https://api.tailscale.com/api/v2/oauth/token";
 const API_BASE = "https://api.tailscale.com/api/v2";
 
+export type TailscaleAdminClientOptions = {
+  fetch?: typeof fetch;
+  now?: () => number;
+  tokenUrl?: string;
+  apiBase?: string;
+  tokenTimeoutMs?: number;
+  apiTimeoutMs?: number;
+};
+
 function basicAuth(clientId: string, clientSecret: string): string {
   return Buffer.from(`${clientId}:${clientSecret}`, "utf8").toString("base64");
 }
@@ -93,8 +102,24 @@ export type TailscaleAclEnsureResult = {
 const DEFAULT_TAG_OWNERS = ["autogroup:admin"] as const;
 
 export class TailscaleAdminClient {
-  constructor(private creds: TailscaleOAuthCredentials) {
+  private readonly fetchImpl: typeof fetch;
+  private readonly now: () => number;
+  private readonly tokenUrl: string;
+  private readonly apiBase: string;
+  private readonly tokenTimeoutMs: number;
+  private readonly apiTimeoutMs: number;
+
+  constructor(
+    private creds: TailscaleOAuthCredentials,
+    opts: TailscaleAdminClientOptions = {},
+  ) {
     this.creds.tags = normalizeTailscaleTags(creds.tags);
+    this.fetchImpl = opts.fetch ?? globalThis.fetch;
+    this.now = opts.now ?? Date.now;
+    this.tokenUrl = opts.tokenUrl ?? TOKEN_URL;
+    this.apiBase = (opts.apiBase ?? API_BASE).replace(/\/+$/, "");
+    this.tokenTimeoutMs = opts.tokenTimeoutMs ?? 20_000;
+    this.apiTimeoutMs = opts.apiTimeoutMs ?? 30_000;
   }
 
   get credentials(): TailscaleOAuthCredentials {
@@ -116,7 +141,7 @@ export class TailscaleAdminClient {
     if (
       this.creds.accessToken &&
       this.creds.accessTokenExpiresAt &&
-      this.creds.accessTokenExpiresAt > Date.now() + skew &&
+      this.creds.accessTokenExpiresAt > this.now() + skew &&
       // Untagged token is fine for omitTags callers; tagged ops need a tagged token
       (wantOmit || !this.creds.accessTokenOmitTags)
     ) {
@@ -131,14 +156,14 @@ export class TailscaleAdminClient {
       body.set("tags", this.creds.tags.join(" "));
     }
 
-    const res = await fetch(TOKEN_URL, {
+    const res = await this.fetchImpl(this.tokenUrl, {
       method: "POST",
       headers: {
         Authorization: `Basic ${basicAuth(this.creds.clientId, this.creds.clientSecret)}`,
         "Content-Type": "application/x-www-form-urlencoded",
       },
       body,
-      signal: AbortSignal.timeout(20_000),
+      signal: AbortSignal.timeout(this.tokenTimeoutMs),
     });
 
     const text = await res.text();
@@ -161,7 +186,7 @@ export class TailscaleAdminClient {
 
     const expiresIn = typeof json.expires_in === "number" ? json.expires_in : 3600;
     this.creds.accessToken = json.access_token;
-    this.creds.accessTokenExpiresAt = Date.now() + expiresIn * 1000;
+    this.creds.accessTokenExpiresAt = this.now() + expiresIn * 1000;
     this.creds.accessTokenOmitTags = wantOmit;
     return json.access_token;
   }
@@ -173,7 +198,7 @@ export class TailscaleAdminClient {
     opts?: { omitTags?: boolean },
   ): Promise<T> {
     const token = await this.ensureAccessToken({ omitTags: opts?.omitTags });
-    const res = await fetch(`${API_BASE}${path}`, {
+    const res = await this.fetchImpl(`${this.apiBase}${path}`, {
       method,
       headers: {
         Authorization: `Bearer ${token}`,
@@ -181,7 +206,7 @@ export class TailscaleAdminClient {
         ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,
-      signal: AbortSignal.timeout(30_000),
+      signal: AbortSignal.timeout(this.apiTimeoutMs),
     });
     const text = await res.text();
     if (!res.ok) {

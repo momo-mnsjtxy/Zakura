@@ -33,6 +33,7 @@ type LiveTunnel = {
   relayClose: () => void;
   tunnelStop: () => Promise<void>;
   timer?: ReturnType<typeof setTimeout>;
+  stopPromise?: Promise<void>;
 };
 
 const liveTunnels = new Map<string, LiveTunnel>();
@@ -85,6 +86,18 @@ export type CreateExposureInput = {
   protocol?: PortExposureProtocol;
 };
 
+export type ExposureRuntimeAdapter = {
+  startCloudflareQuickTunnel: typeof startCloudflareQuickTunnel;
+  startTailscaleServe: typeof startTailscaleServe;
+  probeTailscaleBackend: typeof probeTailscaleBackend;
+};
+
+const defaultRuntimeAdapter: ExposureRuntimeAdapter = {
+  startCloudflareQuickTunnel,
+  startTailscaleServe,
+  probeTailscaleBackend,
+};
+
 export class ExposureService {
   private nodes: import("./runtime-nodes.js").RuntimeNodeService | null = null;
 
@@ -96,6 +109,7 @@ export class ExposureService {
     private readonly settings: NetworkSettingsService,
     private readonly security: SecurityPolicyService,
     private readonly audit: NetworkAuditService,
+    private readonly tunnelRuntime: ExposureRuntimeAdapter = defaultRuntimeAdapter,
   ) {
     void _config;
   }
@@ -209,7 +223,7 @@ export class ExposureService {
         usable = false;
         reason = "运行时尚未实现，暂不可用";
       } else if (p.provider === "tailscale-serve") {
-        const probe = await probeTailscaleBackend();
+        const probe = await this.tunnelRuntime.probeTailscaleBackend();
         if (!probe.ok) {
           usable = false;
           reason = probe.message;
@@ -399,7 +413,7 @@ export class ExposureService {
         relayHost = remote.relayHost;
         relayPort = remote.relayPort;
         tunnelStop = async () => {
-          await client.stopExposure(row!.id).catch(() => undefined);
+          await client.stopExposure(row!.id);
         };
       } else {
         const container = await this.workspace.getWorkspaceContainer(agent.spaceId);
@@ -411,12 +425,12 @@ export class ExposureService {
 
         try {
           if (providerId === "cloudflare-quick") {
-            const tunnel = await startCloudflareQuickTunnel(targetUrl);
+            const tunnel = await this.tunnelRuntime.startCloudflareQuickTunnel(targetUrl);
             publicUrl = tunnel.publicUrl;
             tunnelStop = tunnel.stop;
           } else if (providerId === "tailscale-serve") {
             const mountPath = `/zakura/${row!.id.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 12) || row!.id.slice(0, 8)}`;
-            const tunnel = await startTailscaleServe({
+            const tunnel = await this.tunnelRuntime.startTailscaleServe({
               targetUrl,
               mountPath,
             });
@@ -507,20 +521,40 @@ export class ExposureService {
     });
     if (!row) return null;
 
+    const retryingFailedStop =
+      row.status === "error" && row.lastError?.startsWith("Failed to stop exposure:");
+    if (
+      row.status !== "active" &&
+      row.status !== "starting" &&
+      !retryingFailedStop &&
+      !liveTunnels.has(exposureId)
+    ) {
+      const agent = await this.db.query.agents.findFirst({
+        where: and(eq(agents.id, row.agentId), eq(agents.tenantId, tenantId)),
+      });
+      return serializeExposure(row, agent ? { name: agent.name, slug: agent.slug } : null);
+    }
+
+    const failures: string[] = [];
     const live = liveTunnels.get(exposureId);
     if (live) {
       if (live.timer) clearTimeout(live.timer);
       try {
         live.relayClose();
-      } catch {
-        /* ignore */
+      } catch (err) {
+        failures.push(`relay: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      if (!live.stopPromise) {
+        live.stopPromise = live.tunnelStop().finally(() => {
+          live.stopPromise = undefined;
+        });
       }
       try {
-        await live.tunnelStop();
-      } catch {
-        /* ignore */
+        await live.stopPromise;
+      } catch (err) {
+        failures.push(`tunnel: ${err instanceof Error ? err.message : String(err)}`);
       }
-      liveTunnels.delete(exposureId);
+      if (!failures.length) liveTunnels.delete(exposureId);
     } else if (row.runtimeNodeId && this.nodes) {
       // Server 重启后内存隧道丢失：尽量通知远程 Runner 停掉 cloudflared
       try {
@@ -528,14 +562,31 @@ export class ExposureService {
           allowOffline: true,
         });
         await client.stopExposure(exposureId);
-      } catch {
-        /* ignore */
+      } catch (err) {
+        failures.push(`runner: ${err instanceof Error ? err.message : String(err)}`);
       }
+    } else if (row.status === "active" || row.status === "starting" || retryingFailedStop) {
+      failures.push("tunnel runtime owner unavailable; cleanup is retryable");
+    }
+
+    if (failures.length) {
+      const message = `Failed to stop exposure: ${failures.join("; ")}`;
+      await this.db
+        .update(portExposures)
+        .set({ status: "error", lastError: message, updatedAt: new Date() })
+        .where(and(eq(portExposures.id, exposureId), eq(portExposures.tenantId, tenantId)));
+      await this.audit.append(tenantId, "exposure.stop_error", {
+        actor,
+        targetType: "port_exposure",
+        targetId: exposureId,
+        detail: { port: row.port, publicUrl: row.publicUrl, error: message },
+      });
+      throw new Error(message);
     }
 
     const now = new Date();
     const nextStatus =
-      row.status === "active" || row.status === "starting"
+      row.status === "active" || row.status === "starting" || retryingFailedStop
         ? actor.type === "system" && actor.id === "ttl"
           ? "expired"
           : "stopped"
@@ -545,6 +596,7 @@ export class ExposureService {
       .update(portExposures)
       .set({
         status: nextStatus,
+        lastError: null,
         stoppedAt: now,
         updatedAt: now,
       })
@@ -592,10 +644,22 @@ export class ExposureService {
           inArray(portExposures.status, ["active", "starting"]),
         ),
       );
+    const failures: string[] = [];
+    let stopped = 0;
     for (const row of rows) {
-      await this.stop(tenantId, row.id, actor);
+      try {
+        await this.stop(tenantId, row.id, actor);
+        stopped += 1;
+      } catch (err) {
+        failures.push(`${row.id}: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
-    return rows.length;
+    if (failures.length) {
+      throw new Error(
+        `Stopped ${stopped}/${rows.length} exposures; retry cleanup for ${failures.join("; ")}`,
+      );
+    }
+    return stopped;
   }
 
   async expireDue(tenantId?: string): Promise<number> {

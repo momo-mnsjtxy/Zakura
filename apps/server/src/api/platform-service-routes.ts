@@ -165,6 +165,26 @@ export function registerPlatformServiceRoutes(
     }
   });
 
+  /** Read-only deployment diagnosis; never changes Docker or desired state. */
+  app.get("/api/platform-services/:key/diagnostics", async (c) => {
+    const session = getSession(c);
+    if (!session) return c.json({ error: "Unauthorized" }, 401);
+    if (!canAccessPlatformServices(config, session)) {
+      return c.json({ error: "Forbidden" }, 403);
+    }
+    const key = c.req.param("key");
+    if (!isPlatformServiceKey(key)) return c.json({ error: "Unknown service" }, 404);
+    try {
+      const tail = Number(c.req.query("tail") ?? 100);
+      const diagnostics = await platformServices.diagnose(key, {
+        tail: Number.isFinite(tail) ? tail : 100,
+      });
+      return c.json({ diagnostics });
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
+    }
+  });
+
   /** Config only — never auto-starts */
   app.patch("/api/platform-services/:key", async (c) => {
     const session = getSession(c);

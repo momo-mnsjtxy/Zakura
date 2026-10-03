@@ -315,6 +315,23 @@ export function registerNetworkRoutes(
         updatedBy: session.email,
         actorId: session.userId,
       });
+      if (!policy.enabled || !policy.exposureEnabled) {
+        try {
+          await exposures.stopAllActive(session.tenantId, {
+            type: "system",
+            id: "security-policy",
+          });
+        } catch (cleanupError) {
+          return c.json(
+            {
+              policy,
+              cleanupPending: true,
+              error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+            },
+            503,
+          );
+        }
+      }
       return c.json({ policy });
     } catch (err) {
       return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
@@ -347,11 +364,21 @@ export function registerNetworkRoutes(
   app.post("/api/settings/network/active-exposures/stop-all", async (c) => {
     const session = c.get("session")!;
     if (!isSessionAdmin(session)) return c.json({ error: "Admin only" }, 403);
-    const n = await exposures.stopAllActive(session.tenantId, {
-      type: "user",
-      id: session.userId,
-    });
-    return c.json({ stopped: n });
+    try {
+      const n = await exposures.stopAllActive(session.tenantId, {
+        type: "user",
+        id: session.userId,
+      });
+      return c.json({ stopped: n });
+    } catch (err) {
+      return c.json(
+        {
+          cleanupPending: true,
+          error: err instanceof Error ? err.message : String(err),
+        },
+        503,
+      );
+    }
   });
 
   // Agent-scoped exposure CRUD
@@ -398,11 +425,21 @@ export function registerNetworkRoutes(
 
   app.delete("/api/exposures/:id", async (c) => {
     const session = c.get("session")!;
-    const stopped = await exposures.stop(session.tenantId, c.req.param("id"), {
-      type: "user",
-      id: session.userId,
-    });
-    if (!stopped) return c.json({ error: "Not found" }, 404);
-    return c.json({ exposure: stopped });
+    try {
+      const stopped = await exposures.stop(session.tenantId, c.req.param("id"), {
+        type: "user",
+        id: session.userId,
+      });
+      if (!stopped) return c.json({ error: "Not found" }, 404);
+      return c.json({ exposure: stopped });
+    } catch (err) {
+      return c.json(
+        {
+          cleanupPending: true,
+          error: err instanceof Error ? err.message : String(err),
+        },
+        503,
+      );
+    }
   });
 }

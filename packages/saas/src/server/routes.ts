@@ -738,6 +738,79 @@ export function registerSaasRoutes(
     }
   });
 
+  app.get("/api/admin/oauth-clients", async (c) => {
+    if (!deps.oauthClientsAdmin) return c.json({ error: "OAuth client admin unavailable" }, 503);
+    const session = c.get("session")!;
+    const tenantId = c.req.query("tenantId")?.trim() || session.tenantId;
+    const tenant = await (dbUnknown as any).query.tenants.findFirst({
+      where: eq((schema.tenants as any).id, tenantId),
+    });
+    if (!tenant) return c.json({ error: "Tenant not found" }, 404);
+    const direction = c.req.query("direction") ?? "all";
+    if (!["all", "inbound", "outbound"].includes(direction)) {
+      return c.json({ error: "direction must be all, inbound or outbound" }, 400);
+    }
+    const page = Math.max(Number.parseInt(c.req.query("page") ?? "1", 10) || 1, 1);
+    const pageSize = Math.min(
+      Math.max(Number.parseInt(c.req.query("pageSize") ?? "20", 10) || 20, 1),
+      100,
+    );
+    const q = c.req.query("q")?.trim().toLowerCase() || "";
+    const rows = await deps.oauthClientsAdmin.list(tenantId);
+    let items: Array<Record<string, unknown> & { direction: "inbound" | "outbound" }> = [
+      ...(direction === "outbound"
+        ? []
+        : rows.inbound.map((item) => ({ ...item, direction: "inbound" as const }))),
+      ...(direction === "inbound"
+        ? []
+        : rows.outbound.map((item) => ({ ...item, direction: "outbound" as const }))),
+    ];
+    if (q) {
+      items = items.filter((item) =>
+        Object.values(item).some(
+          (value) => typeof value === "string" && value.toLowerCase().includes(q),
+        ),
+      );
+    }
+    items.sort((left, right) => {
+      const a = String(left["createdAt"] ?? left["id"] ?? "");
+      const b = String(right["createdAt"] ?? right["id"] ?? "");
+      return b.localeCompare(a);
+    });
+    const total = items.length;
+    const offset = (page - 1) * pageSize;
+    return c.json({
+      items: items.slice(offset, offset + pageSize),
+      total,
+      page,
+      pageSize,
+      tenantId,
+    });
+  });
+
+  app.delete("/api/admin/oauth-clients/:direction/:id", async (c) => {
+    if (!deps.oauthClientsAdmin) return c.json({ error: "OAuth client admin unavailable" }, 503);
+    const session = c.get("session")!;
+    const direction = c.req.param("direction");
+    if (direction !== "inbound" && direction !== "outbound") {
+      return c.json({ error: "direction must be inbound or outbound" }, 400);
+    }
+    const tenantId = c.req.query("tenantId")?.trim() || session.tenantId;
+    const removed = await deps.oauthClientsAdmin.revoke({
+      tenantId,
+      direction,
+      id: c.req.param("id"),
+    });
+    if (!removed) return c.json({ error: "OAuth client not found" }, 404);
+    await appendAudit?.(tenantId, "admin.oauth_client_revoke", {
+      actorId: session.userId,
+      targetType: "oauth_client",
+      targetId: c.req.param("id"),
+      detail: { direction },
+    });
+    return c.json({ ok: true });
+  });
+
   // 用户 / 团队 / 成员 / 共享 Runner 的列表与 CRUD（含封号）
   registerAdminResourceRoutes(app, deps);
 }

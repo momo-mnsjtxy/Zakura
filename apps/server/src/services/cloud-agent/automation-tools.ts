@@ -14,6 +14,9 @@ export const UPDATE_ROUTINE_TOOL = "update_routine";
 export const DELETE_ROUTINE_TOOL = "delete_routine";
 export const PAUSE_ROUTINE_TOOL = "pause_routine";
 export const RUN_ROUTINE_TOOL = "run_routine_now";
+export const GET_HEARTBEAT_TOOL = "get_heartbeat";
+export const CONFIGURE_HEARTBEAT_TOOL = "configure_heartbeat";
+export const RUN_HEARTBEAT_TOOL = "run_heartbeat_now";
 
 const SET = new Set([
   LIST_AUTOMATION_RUNS_TOOL,
@@ -23,6 +26,9 @@ const SET = new Set([
   DELETE_ROUTINE_TOOL,
   PAUSE_ROUTINE_TOOL,
   RUN_ROUTINE_TOOL,
+  GET_HEARTBEAT_TOOL,
+  CONFIGURE_HEARTBEAT_TOOL,
+  RUN_HEARTBEAT_TOOL,
 ]);
 
 export function isAutomationToolName(name: string): boolean {
@@ -104,6 +110,41 @@ export function listAutomationToolDefinitions(): ModelToolDefinition[] {
             },
           },
         },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: GET_HEARTBEAT_TOOL,
+        description: "Get this agent's periodic heartbeat configuration and latest status.",
+        parameters: { type: "object", properties: {} },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: CONFIGURE_HEARTBEAT_TOOL,
+        description:
+          "Enable, pause, or update this agent's periodic heartbeat. The minimum interval is 5 minutes.",
+        parameters: {
+          type: "object",
+          properties: {
+            enabled: { type: "boolean" },
+            interval_minutes: { type: "integer", minimum: 5, maximum: 10080 },
+            prompt: {
+              type: "string",
+              description: "Optional heartbeat intent; blank uses the platform default.",
+            },
+          },
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: RUN_HEARTBEAT_TOOL,
+        description: "Run this agent's saved heartbeat once now without changing its cadence.",
+        parameters: { type: "object", properties: {} },
       },
     },
     {
@@ -281,6 +322,24 @@ export async function callAutomationTool(
         limit: typeof args.limit === "number" ? args.limit : 20,
       });
       return { text: JSON.stringify({ runs }, null, 2) };
+    }
+    if (name === GET_HEARTBEAT_TOOL) {
+      const heartbeat = await automation.getHeartbeat(agent.tenantId, agent.id);
+      return { text: JSON.stringify({ heartbeat }, null, 2) };
+    }
+    if (name === CONFIGURE_HEARTBEAT_TOOL) {
+      const heartbeat = await automation.updateHeartbeat(agent.tenantId, agent.id, {
+        ...(typeof args.enabled === "boolean" ? { enabled: args.enabled } : {}),
+        ...(typeof args.interval_minutes === "number"
+          ? { intervalMinutes: args.interval_minutes }
+          : {}),
+        ...(typeof args.prompt === "string" ? { prompt: args.prompt } : {}),
+      });
+      return { text: JSON.stringify({ heartbeat }, null, 2) };
+    }
+    if (name === RUN_HEARTBEAT_TOOL) {
+      const run = await automation.runHeartbeatNow(agent.tenantId, agent.id);
+      return { text: JSON.stringify({ run }, null, 2) };
     }
     return { text: `Unknown automation tool: ${name}`, isError: true };
   } catch (err) {

@@ -223,6 +223,18 @@ export type SaasHostDeps = {
     enableForUser: (userId: string) => Promise<unknown>;
     syncManaged: () => Promise<unknown>;
   };
+  /** Optional platform-admin inventory/revocation for tenant OAuth clients. */
+  oauthClientsAdmin?: {
+    list: (tenantId: string) => Promise<{
+      inbound: Array<Record<string, unknown>>;
+      outbound: Array<Record<string, unknown>>;
+    }>;
+    revoke: (input: {
+      tenantId: string;
+      direction: "inbound" | "outbound";
+      id: string;
+    }) => Promise<boolean>;
+  };
 };
 
 export type SaasApp = Hono<{ Variables: { session?: SaasSession } }>;

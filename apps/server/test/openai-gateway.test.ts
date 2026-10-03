@@ -16,6 +16,7 @@ import {
 } from "../src/services/openai-gateway.js";
 import { hasApiKeyScope } from "../src/services/auth.js";
 import { registerOpenAiGatewayRoutes } from "../src/api/openai-gateway-routes.js";
+import { ModelCallAbortedError } from "../src/model-router/index.js";
 
 const clientTool = (name: string) => ({
   type: "function" as const,
@@ -218,9 +219,223 @@ describe("OpenAI gateway session continuation", () => {
     assert.equal(context.sessionId, "session-existing");
     assert.equal(created, 0);
   });
+
+  it("does not merge the same client session key across different API keys", async () => {
+    const agent = {
+      id: "agent-1",
+      tenantId: "tenant-1",
+      name: "Test Agent",
+      slug: "test-agent",
+      configJson: "{}",
+      enableMemory: false,
+    } as unknown as Agent;
+    let created = 0;
+    const stored = {
+      id: "session-key-a",
+      tenantId: "tenant-1",
+      agentId: "agent-1",
+      lastSeq: 1,
+      updatedAt: new Date().toISOString(),
+      originJson: JSON.stringify({
+        source: "api",
+        channel: "openai-gateway",
+        clientSessionKey: "shared-session",
+        apiKeyId: "key-a",
+      }),
+    };
+    const service = new OpenAiGatewayService({
+      agentService: { get: async () => agent } as unknown as AgentService,
+      modelRouter: { resolveRoute: async () => null } as unknown as ModelRouterService,
+      store: {
+        getSession: async () => stored,
+        listGatewaySessions: async () => [stored],
+        listEvents: async () => [],
+        createSession: async (input: Record<string, unknown>) => ({
+          id: `new-${++created}`,
+          tenantId: "tenant-1",
+          agentId: "agent-1",
+          lastSeq: 0,
+          title: "OpenAI Gateway",
+          ...input,
+        }),
+        appendEvent: async () => ({}),
+        warmSession: async () => {},
+        updateSession: async () => null,
+      } as unknown as CloudAgentSessionStore,
+      gatewaySessionCache: {
+        read: async () => stored.id,
+        write: async () => {},
+      },
+    });
+
+    const context = await service.prepare(
+      "tenant-1",
+      "agent-1",
+      { messages: [{ role: "user", content: "hello" }] },
+      { clientSessionKey: "shared-session", apiKeyId: "key-b" },
+    );
+    await context.bookkeeping;
+    assert.equal(context.sessionId, "new-1");
+    assert.equal(created, 1);
+  });
 });
 
 describe("OpenAI gateway thin proxy", () => {
+  it("preserves image detail and maps reasoning_effort into route options", async () => {
+    const agent = {
+      id: "agent-1",
+      tenantId: "tenant-1",
+      name: "Test Agent",
+      slug: "test-agent",
+      configJson: "{}",
+      enableMemory: false,
+    } as unknown as Agent;
+    const service = new OpenAiGatewayService({
+      agentService: { get: async () => agent } as unknown as AgentService,
+      modelRouter: { resolveRoute: async () => null } as unknown as ModelRouterService,
+      store: {
+        createSession: async () => ({ id: "session-1", tenantId: "tenant-1", agentId: "agent-1", lastSeq: 0, title: "OpenAI Gateway" }),
+        getSession: async () => null,
+        listEvents: async () => [],
+        listGatewaySessions: async () => [],
+        appendEvent: async () => ({}),
+        warmSession: async () => {},
+        updateSession: async () => null,
+      } as unknown as CloudAgentSessionStore,
+    });
+    const context = await service.prepare("tenant-1", "agent-1", {
+      messages: [{
+        role: "user",
+        content: [{
+          type: "image_url",
+          image_url: { url: "data:image/png;base64,UE5H", detail: "original" },
+        }],
+      }],
+      reasoning_effort: "high",
+    });
+    await context.bookkeeping;
+    assert.equal(context.messages[0]?.parts?.[0]?.type, "image_url");
+    assert.equal(
+      context.messages[0]?.parts?.[0]?.type === "image_url"
+        ? context.messages[0].parts[0].imageUrl.detail
+        : undefined,
+      "original",
+    );
+    assert.deepEqual(context.invokeOptions.routeOptions?.reasoning, { effort: "high" });
+    assert.equal(context.invokeOptions.extensions?.reasoning, undefined);
+  });
+
+  it("rejects partial tool arguments before invoking a model", async () => {
+    const agent = {
+      id: "agent-1", tenantId: "tenant-1", name: "Agent", slug: "agent",
+      configJson: "{}", enableMemory: false,
+    } as unknown as Agent;
+    const service = new OpenAiGatewayService({
+      agentService: { get: async () => agent } as unknown as AgentService,
+      modelRouter: { resolveRoute: async () => null } as unknown as ModelRouterService,
+      store: {} as CloudAgentSessionStore,
+    });
+    await assert.rejects(
+      service.prepare("tenant-1", "agent-1", {
+        messages: [{
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "call-1",
+            type: "function",
+            function: { name: "lookup", arguments: '{"q":' },
+          }],
+        }],
+      }),
+      /不是完整 JSON 对象/,
+    );
+  });
+
+  it("orders bookkeeping before deltas and rolls back partial failures", async () => {
+    const events: string[] = [];
+    const agent = {
+      id: "agent-1", tenantId: "tenant-1", name: "Agent", slug: "agent",
+      configJson: "{}", enableMemory: false,
+    } as unknown as Agent;
+    const service = new OpenAiGatewayService({
+      agentService: { get: async () => agent } as unknown as AgentService,
+      modelRouter: {
+        resolveRoute: async () => null,
+        chatStream: async (_tenant: string, _messages: unknown, _query: unknown, _options: unknown, callbacks: { onDelta?: (text: string) => void }) => {
+          callbacks.onDelta?.("partial");
+          throw Object.assign(new Error("terminated"), { retryable: true });
+        },
+      } as unknown as ModelRouterService,
+      store: {
+        createSession: async () => ({ id: "session-1", tenantId: "tenant-1", agentId: "agent-1", lastSeq: 0, title: "OpenAI Gateway" }),
+        getSession: async () => null,
+        listEvents: async () => [],
+        listGatewaySessions: async () => [],
+        warmSession: async () => {},
+        updateSession: async () => null,
+        appendEvent: async (event: { type: string }) => {
+          if (event.type === "user_message") await new Promise((resolve) => setTimeout(resolve, 5));
+          events.push(event.type);
+          return {};
+        },
+      } as unknown as CloudAgentSessionStore,
+    });
+    const context = await service.prepare("tenant-1", "agent-1", {
+      messages: [{ role: "user", content: "hello" }],
+    });
+    await assert.rejects(
+      service.invoke("tenant-1", context, { onDelta: () => {} }),
+      /terminated/,
+    );
+    assert.deepEqual(events, [
+      "user_message",
+      "run_start",
+      "assistant_delta",
+      "assistant_rollback",
+      "run_error",
+      "run_end",
+    ]);
+  });
+
+  it("records request abort as cancelled without a run error", async () => {
+    const events: Array<{ type: string; status?: unknown }> = [];
+    const agent = {
+      id: "agent-1", tenantId: "tenant-1", name: "Agent", slug: "agent",
+      configJson: "{}", enableMemory: false,
+    } as unknown as Agent;
+    const service = new OpenAiGatewayService({
+      agentService: { get: async () => agent } as unknown as AgentService,
+      modelRouter: {
+        resolveRoute: async () => null,
+        chatStream: async (_tenant: string, _messages: unknown, _query: unknown, _options: unknown, callbacks: { signal?: AbortSignal }) =>
+          new Promise((_resolve, reject) => {
+            callbacks.signal?.addEventListener("abort", () => reject(new ModelCallAbortedError()), { once: true });
+          }),
+      } as unknown as ModelRouterService,
+      store: {
+        createSession: async () => ({ id: "session-1", tenantId: "tenant-1", agentId: "agent-1", lastSeq: 0, title: "OpenAI Gateway" }),
+        getSession: async () => null,
+        listEvents: async () => [],
+        listGatewaySessions: async () => [],
+        warmSession: async () => {},
+        updateSession: async () => null,
+        appendEvent: async (event: { type: string; payload?: Record<string, unknown> }) => {
+          events.push({ type: event.type, status: event.payload?.status });
+          return {};
+        },
+      } as unknown as CloudAgentSessionStore,
+    });
+    const context = await service.prepare("tenant-1", "agent-1", {
+      messages: [{ role: "user", content: "hello" }],
+    });
+    const controller = new AbortController();
+    const pending = service.invoke("tenant-1", context, { signal: controller.signal });
+    controller.abort();
+    await assert.rejects(pending, ModelCallAbortedError);
+    assert.equal(events.some((event) => event.type === "run_error"), false);
+    assert.equal(events.find((event) => event.type === "run_end")?.status, "cancelled");
+  });
+
   it("normalizes OpenAI developer instructions for OpenAI-compatible ACP clients", async () => {
     let seenMessages: Array<{ role: string; content: string | null }> = [];
     const agent = {
@@ -459,6 +674,63 @@ describe("OpenAI gateway responses bridge", () => {
     assert.equal((tools[0].function as { name: string }).name, "shell");
   });
 
+  it("preserves structured media in tool outputs and rejects partial calls", async () => {
+    const { translateResponsesRequest } = await import(
+      "../src/services/openai-gateway-responses.js"
+    );
+    const translated = translateResponsesRequest({
+      input: [
+        {
+          type: "function_call",
+          call_id: "call-media",
+          name: "inspect",
+          arguments: "{}",
+        },
+        {
+          type: "function_call_output",
+          call_id: "call-media",
+          output: [
+            { type: "input_text", text: "screenshot" },
+            {
+              type: "input_image",
+              image_url: "data:image/png;base64,UE5H",
+              detail: "original",
+            },
+          ],
+        },
+      ],
+    });
+    const tool = (translated.messages as Array<Record<string, unknown>>)[1]!;
+    assert.equal(tool.role, "tool");
+    assert.deepEqual(tool.content, [
+      { type: "text", text: "screenshot" },
+      {
+        type: "image_url",
+        image_url: {
+          url: "data:image/png;base64,UE5H",
+          detail: "original",
+        },
+      },
+    ]);
+    assert.throws(
+      () => translateResponsesRequest({
+        input: [{
+          type: "function_call",
+          call_id: "call-bad",
+          name: "inspect",
+          arguments: '{"path":',
+        }],
+      }),
+      /不是完整 JSON 对象/,
+    );
+    assert.throws(
+      () => translateResponsesRequest({
+        input: [{ type: "function_call_output", output: "orphan" }],
+      }),
+      /缺少 call_id/,
+    );
+  });
+
   it("feeds translated Responses requests through gateway prepare", async () => {
     const agent = {
       id: "agent-1",
@@ -498,7 +770,12 @@ describe("OpenAI gateway responses bridge", () => {
   });
 
   it("stamps sequence numbers on Responses SSE events", async () => {
-    const { responsesEvent, responsesId, itemId } = await import(
+    const {
+      createResponsesEventFactory,
+      responsesEvent,
+      responsesId,
+      itemId,
+    } = await import(
       "../src/services/openai-gateway-responses.js"
     );
     const a = responsesEvent("response.created", { response: { id: "r" } });
@@ -508,5 +785,10 @@ describe("OpenAI gateway responses bridge", () => {
     assert.ok((b.sequence_number as number) > (a.sequence_number as number));
     assert.ok(responsesId().startsWith("resp_"));
     assert.ok(itemId("fc").startsWith("fc_"));
+    const firstStream = createResponsesEventFactory();
+    const secondStream = createResponsesEventFactory();
+    assert.equal(firstStream("response.created").sequence_number, 1);
+    assert.equal(firstStream("response.completed").sequence_number, 2);
+    assert.equal(secondStream("response.created").sequence_number, 1);
   });
 });

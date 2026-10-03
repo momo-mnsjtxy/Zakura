@@ -26,13 +26,21 @@ export type CloudflareTunnelSummary = {
 
 const API = "https://api.cloudflare.com/client/v4";
 
+export type CloudflareAdminClientOptions = {
+  fetch?: typeof fetch;
+  apiBase?: string;
+  timeoutMs?: number;
+};
+
 async function cfFetch<T>(
   apiToken: string,
   method: string,
   path: string,
   body?: unknown,
+  opts: CloudflareAdminClientOptions = {},
 ): Promise<T> {
-  const res = await fetch(`${API}${path}`, {
+  const fetchImpl = opts.fetch ?? globalThis.fetch;
+  const res = await fetchImpl(`${(opts.apiBase ?? API).replace(/\/+$/, "")}${path}`, {
     method,
     headers: {
       Authorization: `Bearer ${apiToken}`,
@@ -40,7 +48,7 @@ async function cfFetch<T>(
       ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
     },
     body: body !== undefined ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(30_000),
+    signal: AbortSignal.timeout(opts.timeoutMs ?? 30_000),
   });
   const json = (await res.json()) as {
     success?: boolean;
@@ -57,7 +65,10 @@ async function cfFetch<T>(
 }
 
 export class CloudflareAdminClient {
-  constructor(private creds: CloudflareApiCredentials) {}
+  constructor(
+    private creds: CloudflareApiCredentials,
+    private readonly opts: CloudflareAdminClientOptions = {},
+  ) {}
 
   get credentials(): CloudflareApiCredentials {
     return this.creds;
@@ -80,6 +91,8 @@ export class CloudflareAdminClient {
       this.creds.apiToken,
       "GET",
       `/accounts/${this.creds.accountId}/cfd_tunnel?is_deleted=false`,
+      undefined,
+      this.opts,
     );
     return (result ?? []).map((t) => ({
       id: String(t.id ?? ""),
@@ -104,6 +117,7 @@ export class CloudflareAdminClient {
       "POST",
       `/accounts/${this.creds.accountId}/cfd_tunnel`,
       { name, config_src: "cloudflare" },
+      this.opts,
     );
     if (!created?.id) throw new Error("Cloudflare create tunnel returned no id");
 
@@ -124,6 +138,8 @@ export class CloudflareAdminClient {
       this.creds.apiToken,
       "GET",
       `/accounts/${this.creds.accountId}/cfd_tunnel/${tunnelId}/token`,
+      undefined,
+      this.opts,
     );
     if (!token || typeof token !== "string") {
       throw new Error("Cloudflare tunnel token endpoint returned empty token");

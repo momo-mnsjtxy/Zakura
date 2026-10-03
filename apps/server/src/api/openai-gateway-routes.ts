@@ -8,8 +8,8 @@ import type { Db } from "../db/client.js";
 import type { OpenAiGatewayBody, OpenAiGatewayService } from "../services/openai-gateway.js";
 import { resolveClientSessionKey } from "../services/openai-gateway.js";
 import {
+  createResponsesEventFactory,
   itemId,
-  responsesEvent,
   responsesId,
   translateResponsesRequest,
 } from "../services/openai-gateway-responses.js";
@@ -73,7 +73,16 @@ function asRecordBody(raw: unknown): Record<string, unknown> {
     : {};
 }
 
-type GatewayErrorStatus = 400 | 401 | 403 | 404 | 422 | 500;
+type GatewayErrorStatus = 400 | 401 | 403 | 404 | 422 | 500 | 503;
+
+function gatewayInvokeErrorStatus(error: unknown): GatewayErrorStatus {
+  const status = Number((error as { status?: unknown })?.status);
+  if (status === 400 || status === 401 || status === 403 || status === 404 || status === 422) {
+    return status;
+  }
+  if (status >= 500 || (error as { retryable?: unknown })?.retryable === true) return 503;
+  return 500;
+}
 
 function openAiError(
   c: Context<{ Variables: AppVariables }>,
@@ -121,6 +130,17 @@ async function authenticateGatewayRequest(
   const keyed = await authenticateApiKey(db, raw);
   if (!keyed) {
     return { response: openAiError(c, "API Key 无效或已过期", 401, "authentication_error") };
+  }
+  if (keyed.tenant.suspendedAt) {
+    return {
+      response: openAiError(
+        c,
+        "所在团队已被封禁，Gateway 不可用",
+        403,
+        "permission_error",
+        "account_suspended",
+      ),
+    };
   }
   if (!keyed.apiKey.agentId) {
     return { response: openAiError(c, "该 API Key 未绑定 Agent", 403, "permission_error") };
@@ -234,7 +254,12 @@ export function registerOpenAiGatewayRoutes(
       return openAiError(c, "请求体必须是 JSON", 400);
     }
     // Codex ≥1.2 只说 Responses 协议；翻译成 chat 请求复用既有网关链路。
-    const translated = translateResponsesRequest(rawBody);
+    let translated: OpenAiGatewayBody;
+    try {
+      translated = translateResponsesRequest(rawBody);
+    } catch (err) {
+      return openAiError(c, err instanceof Error ? err.message : String(err), 400);
+    }
     let context;
     try {
       context = await deps.gateway.prepare(
@@ -251,6 +276,7 @@ export function registerOpenAiGatewayRoutes(
     }
     c.header("X-Zakura-Session-Id", context.sessionId);
     const responseId = responsesId();
+    const responseEvent = createResponsesEventFactory();
     const createdAt = Math.floor(Date.now() / 1000);
     const model = context.model ?? "zakura";
     const streamRequested = (asRecordBody(rawBody).stream ?? false) === true;
@@ -301,7 +327,11 @@ export function registerOpenAiGatewayRoutes(
           usage: usageOf(result),
         });
       } catch (err) {
-        return openAiError(c, err instanceof Error ? err.message : String(err), 400);
+        return openAiError(
+          c,
+          err instanceof Error ? err.message : String(err),
+          gatewayInvokeErrorStatus(err),
+        );
       }
     }
 
@@ -318,7 +348,7 @@ export function registerOpenAiGatewayRoutes(
         const closeReasoning = () => {
           if (!reasoningId) return;
           send(
-            responsesEvent("response.reasoning_summary_text.done", {
+            responseEvent("response.reasoning_summary_text.done", {
               item_id: reasoningId,
               output_index: outputIndex,
               summary_index: 0,
@@ -326,7 +356,7 @@ export function registerOpenAiGatewayRoutes(
             }),
           );
           send(
-            responsesEvent("response.reasoning_summary_part.done", {
+            responseEvent("response.reasoning_summary_part.done", {
               item_id: reasoningId,
               output_index: outputIndex,
               summary_index: 0,
@@ -339,13 +369,13 @@ export function registerOpenAiGatewayRoutes(
             status: "completed",
             summary: [{ type: "summary_text", text: reasoningText }],
           };
-          send(responsesEvent("response.output_item.done", { output_index: outputIndex, item }));
+          send(responseEvent("response.output_item.done", { output_index: outputIndex, item }));
           outputItems.push(item);
           reasoningId = null;
         };
         try {
           send(
-            responsesEvent("response.created", {
+            responseEvent("response.created", {
               response: {
                 id: responseId,
                 object: "response",
@@ -362,13 +392,13 @@ export function registerOpenAiGatewayRoutes(
                 outputIndex += 1;
                 reasoningId = itemId("rs");
                 send(
-                  responsesEvent("response.output_item.added", {
+                  responseEvent("response.output_item.added", {
                     output_index: outputIndex,
                     item: { id: reasoningId, type: "reasoning", status: "in_progress", summary: [] },
                   }),
                 );
                 send(
-                  responsesEvent("response.reasoning_summary_part.added", {
+                  responseEvent("response.reasoning_summary_part.added", {
                     item_id: reasoningId,
                     output_index: outputIndex,
                     summary_index: 0,
@@ -378,7 +408,7 @@ export function registerOpenAiGatewayRoutes(
               }
               reasoningText += text;
               send(
-                responsesEvent("response.reasoning_summary_text.delta", {
+                responseEvent("response.reasoning_summary_text.delta", {
                   item_id: reasoningId,
                   output_index: outputIndex,
                   summary_index: 0,
@@ -392,7 +422,7 @@ export function registerOpenAiGatewayRoutes(
                 outputIndex += 1;
                 messageId = itemId("msg");
                 send(
-                  responsesEvent("response.output_item.added", {
+                  responseEvent("response.output_item.added", {
                     output_index: outputIndex,
                     item: {
                       id: messageId,
@@ -404,7 +434,7 @@ export function registerOpenAiGatewayRoutes(
                   }),
                 );
                 send(
-                  responsesEvent("response.content_part.added", {
+                  responseEvent("response.content_part.added", {
                     item_id: messageId,
                     output_index: outputIndex,
                     content_index: 0,
@@ -414,7 +444,7 @@ export function registerOpenAiGatewayRoutes(
               }
               messageText += text;
               send(
-                responsesEvent("response.output_text.delta", {
+                responseEvent("response.output_text.delta", {
                   item_id: messageId,
                   output_index: outputIndex,
                   content_index: 0,
@@ -427,7 +457,7 @@ export function registerOpenAiGatewayRoutes(
           closeReasoning();
           if (messageId) {
             send(
-              responsesEvent("response.output_text.done", {
+              responseEvent("response.output_text.done", {
                 item_id: messageId,
                 output_index: outputIndex,
                 content_index: 0,
@@ -435,7 +465,7 @@ export function registerOpenAiGatewayRoutes(
               }),
             );
             send(
-              responsesEvent("response.content_part.done", {
+              responseEvent("response.content_part.done", {
                 item_id: messageId,
                 output_index: outputIndex,
                 content_index: 0,
@@ -449,14 +479,14 @@ export function registerOpenAiGatewayRoutes(
               status: "completed",
               content: [{ type: "output_text", text: messageText, annotations: [] }],
             };
-            send(responsesEvent("response.output_item.done", { output_index: outputIndex, item: messageItem }));
+            send(responseEvent("response.output_item.done", { output_index: outputIndex, item: messageItem }));
             outputItems.push(messageItem);
           }
           for (const call of result.toolCalls ?? []) {
             outputIndex += 1;
             const fcId = itemId("fc");
             send(
-              responsesEvent("response.output_item.added", {
+              responseEvent("response.output_item.added", {
                 output_index: outputIndex,
                 item: {
                   id: fcId,
@@ -470,7 +500,7 @@ export function registerOpenAiGatewayRoutes(
             );
             if (call.function.arguments) {
               send(
-                responsesEvent("response.function_call_arguments.delta", {
+                responseEvent("response.function_call_arguments.delta", {
                   item_id: fcId,
                   output_index: outputIndex,
                   delta: call.function.arguments,
@@ -478,7 +508,7 @@ export function registerOpenAiGatewayRoutes(
               );
             }
             send(
-              responsesEvent("response.function_call_arguments.done", {
+              responseEvent("response.function_call_arguments.done", {
                 item_id: fcId,
                 output_index: outputIndex,
                 arguments: call.function.arguments,
@@ -492,7 +522,7 @@ export function registerOpenAiGatewayRoutes(
               name: call.function.name,
               arguments: call.function.arguments,
             };
-            send(responsesEvent("response.output_item.done", { output_index: outputIndex, item: fnItem }));
+            send(responseEvent("response.output_item.done", { output_index: outputIndex, item: fnItem }));
             outputItems.push(fnItem);
           }
           const incomplete = result.finishReason === "length";
@@ -506,13 +536,13 @@ export function registerOpenAiGatewayRoutes(
             output: outputItems,
             usage: usageOf(result),
           };
-          send(responsesEvent(incomplete ? "response.incomplete" : "response.completed", { response }));
+          send(responseEvent(incomplete ? "response.incomplete" : "response.completed", { response }));
           controller.enqueue(encoder.encode("data: [DONE]\n\n"));
           controller.close();
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           send(
-            responsesEvent("response.failed", {
+            responseEvent("response.failed", {
               response: {
                 id: responseId,
                 object: "response",
@@ -600,7 +630,11 @@ export function registerOpenAiGatewayRoutes(
             : {}),
         });
       } catch (err) {
-        return openAiError(c, err instanceof Error ? err.message : String(err), 400);
+        return openAiError(
+          c,
+          err instanceof Error ? err.message : String(err),
+          gatewayInvokeErrorStatus(err),
+        );
       }
     }
 
@@ -800,7 +834,15 @@ export function registerOpenAiGatewayRoutes(
       return c.json(anthropicErrorBody("max_tokens 是必填字段"), 400);
     }
 
-    const body = translateAnthropicRequest(raw);
+    let body: OpenAiGatewayBody;
+    try {
+      body = translateAnthropicRequest(raw);
+    } catch (err) {
+      return c.json(
+        anthropicErrorBody(err instanceof Error ? err.message : String(err)),
+        400,
+      );
+    }
     if (!auth.keyed.apiKey.agentId) {
       return c.json(anthropicErrorBody("该 API Key 未绑定 Agent", "permission_error"), 403);
     }
@@ -839,7 +881,7 @@ export function registerOpenAiGatewayRoutes(
       } catch (err) {
         return c.json(
           anthropicErrorBody(err instanceof Error ? err.message : String(err)),
-          400,
+          gatewayInvokeErrorStatus(err),
         );
       }
     }

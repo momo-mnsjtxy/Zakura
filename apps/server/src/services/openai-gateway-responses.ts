@@ -35,7 +35,18 @@ function responsesContentToChat(content: unknown): string | Array<RawRecord> | n
           : typeof (asRecord(part.image_url) ?? {}).url === "string"
             ? (asRecord(part.image_url) as RawRecord).url
             : undefined;
-      if (url) parts.push({ type: "image_url", image_url: { url } });
+      if (!url) throw new Error("input_image 缺少有效 image_url");
+      const detail =
+        part.detail === "low" ||
+        part.detail === "high" ||
+        part.detail === "auto" ||
+        part.detail === "original"
+          ? part.detail
+          : undefined;
+      parts.push({
+        type: "image_url",
+        image_url: { url, ...(detail ? { detail } : {}) },
+      });
       continue;
     }
     // refusal 等罕见 part：丢弃，保持 chat 兼容。
@@ -73,8 +84,18 @@ export function responsesInputToMessages(input: unknown): Array<RawRecord> {
     if (type === "function_call") {
       // assistant 发起的工具调用：转成带 tool_calls 的 assistant 消息。
       const name = typeof record.name === "string" ? record.name : "";
-      const callId = typeof record.call_id === "string" ? record.call_id : `call_${messages.length}`;
+      const callId = typeof record.call_id === "string" ? record.call_id : "";
       const args = typeof record.arguments === "string" ? record.arguments : "{}";
+      if (!name.trim()) throw new Error("function_call 缺少 name");
+      if (!callId) throw new Error("function_call 缺少 call_id");
+      try {
+        const parsed = JSON.parse(args) as unknown;
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error("not an object");
+        }
+      } catch {
+        throw new Error(`function_call ${name} 的 arguments 不是完整 JSON 对象`);
+      }
       messages.push({
         role: "assistant",
         content: typeof record.content === "string" ? record.content : "",
@@ -90,9 +111,15 @@ export function responsesInputToMessages(input: unknown): Array<RawRecord> {
     }
     if (type === "function_call_output") {
       const callId = typeof record.call_id === "string" ? record.call_id : "";
+      if (!callId) throw new Error("function_call_output 缺少 call_id");
       const output = record.output;
+      const translated = responsesContentToChat(output);
       const content =
-        typeof output === "string" ? output : JSON.stringify(output ?? "");
+        translated !== null
+          ? translated
+          : output === undefined
+            ? ""
+            : JSON.stringify(output);
       messages.push({ role: "tool", tool_call_id: callId, content });
       continue;
     }
@@ -183,6 +210,18 @@ export function resetResponsesEventSeq(): void {
 /** 事件按 Responses 协议带递增 sequence_number。 */
 export function responsesEvent(type: string, payload: RawRecord = {}): ResponsesEvent {
   return { type, sequence_number: nextSeq(), ...payload };
+}
+
+/** Per-response event sequencer; concurrent streams must not share counters. */
+export function createResponsesEventFactory(
+  initialSequence = 0,
+): (type: string, payload?: RawRecord) => ResponsesEvent {
+  let sequence = initialSequence;
+  return (type, payload = {}) => ({
+    type,
+    sequence_number: ++sequence,
+    ...payload,
+  });
 }
 
 export function responsesId(): string {

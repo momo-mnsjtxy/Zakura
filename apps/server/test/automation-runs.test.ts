@@ -204,4 +204,15 @@ describe("automation run history", () => {
     });
     assert.equal(floored.length, 1);
   });
+
+  it("honors the documented kind filter on the authenticated route", async () => {
+    const response = await app.request(
+      `/api/agents/${agentId}/automation/runs?kind=heartbeat&limit=10`,
+    );
+    assert.equal(response.status, 200);
+    const body = await response.json() as { runs: Array<{ kind: string; prompt: string }> };
+    assert.equal(body.runs.length, 1);
+    assert.equal(body.runs[0]?.kind, "heartbeat");
+    assert.equal(body.runs[0]?.prompt, "hb");
+  });
 });

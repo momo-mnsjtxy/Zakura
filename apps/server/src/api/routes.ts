@@ -23,11 +23,15 @@ import {
   mcpPolicies,
   newId,
   oauthIdentities,
+  oauthAuthCodes,
+  oauthClients,
   oauthLoginStates,
+  oauthRefreshTokens,
   providerCatalog,
   settings,
   tenantMemberships,
   tenants,
+  upstreamOauthClients as upstreamOauthClientRows,
   users,
 } from "../db/schema.js";
 import {
@@ -2659,6 +2663,7 @@ export async function createApiApp(deps: {
       registerZakurabotSessionRoutes(app, zakurabotGateway);
       automation.setRunner({
         startAutomationTurn: (input) => cloudRuntime.startAutomationTurn(input),
+        cancelAutomationTurn: ({ sessionId, runId }) => cloudStore.requestCancel(sessionId, runId),
       });
       automation.start();
       askUser.setFollowUp((input) => cloudRuntime.enqueueFollowUp(input));
@@ -3057,6 +3062,46 @@ export async function createApiApp(deps: {
             meta: { tenantId, role },
           });
           return { action: "challenge" as const, ticket, methods: factors.methods };
+        },
+        oauthClientsAdmin: {
+          list: async (tenantId: string) => ({
+            inbound: await oauth.listClients(tenantId),
+            outbound: await upstreamOauthClients.list(tenantId),
+          }),
+          revoke: async ({ tenantId, direction, id }: {
+            tenantId: string;
+            direction: "inbound" | "outbound";
+            id: string;
+          }) => {
+            if (direction === "outbound") {
+              const rows = await db
+                .delete(upstreamOauthClientRows)
+                .where(and(eq(upstreamOauthClientRows.id, id), eq(upstreamOauthClientRows.tenantId, tenantId)))
+                .returning();
+              return rows.length > 0;
+            }
+            const client = await db.query.oauthClients.findFirst({ where: eq(oauthClients.id, id) });
+            if (!client) return false;
+            if (client.tenantId === tenantId) {
+              const rows = await db
+                .delete(oauthClients)
+                .where(and(eq(oauthClients.id, id), eq(oauthClients.tenantId, tenantId)))
+                .returning();
+              return rows.length > 0;
+            }
+            if (client.tenantId) return false;
+            return db.transaction(async (tx) => {
+              const refresh = await tx
+                .delete(oauthRefreshTokens)
+                .where(and(eq(oauthRefreshTokens.tenantId, tenantId), eq(oauthRefreshTokens.clientId, client.clientId)))
+                .returning();
+              const codes = await tx
+                .delete(oauthAuthCodes)
+                .where(and(eq(oauthAuthCodes.tenantId, tenantId), eq(oauthAuthCodes.clientId, client.clientId)))
+                .returning();
+              return refresh.length > 0 || codes.length > 0;
+            });
+          },
         },
         switchTenantSession,
         isSessionAdmin,
@@ -3555,5 +3600,5 @@ export async function createApiApp(deps: {
     });
   }
 
-  return Object.assign(app, { zakurabotGateway, tenantContentLifecycle });
+  return Object.assign(app, { zakurabotGateway, tenantContentLifecycle, automation });
 }

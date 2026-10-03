@@ -16,6 +16,7 @@ import type { CloudAgentSessionStore } from "./cloud-agent-session.js";
 import { DeltaPublisher } from "./cloud-agent/loop.js";
 import type { ModelRouterService } from "./model-router.js";
 import { parseRouteOptions } from "../model-router/types.js";
+import { ModelCallAbortedError } from "../model-router/http.js";
 import { readGwClientSession, writeGwClientSession } from "./redis-store.js";
 
 /** 无客户端 session 头时，只在最近空闲窗口内做 messages 归并 */
@@ -70,6 +71,8 @@ export type OpenAiGatewayContext = {
   invokeOptions: ModelChatInvokeOptions;
   /** 会话首轮（用于临时标题 / 自动标题） */
   isFirstTurn: boolean;
+  /** User/run bookkeeping must precede every streamed assistant event. */
+  bookkeeping?: Promise<void>;
 };
 
 export type OpenAiGatewayPrepareOptions = {
@@ -100,9 +103,20 @@ function parseContent(raw: unknown): {
     }
     if (part.type === "image_url") {
       const image = asRecord(part.image_url ?? part.imageUrl);
-      if (typeof image.url === "string" && image.url.trim()) {
-        parts.push({ type: "image_url", imageUrl: { url: image.url } });
+      if (typeof image.url !== "string" || !image.url.trim()) {
+        throw new Error("image_url 缺少有效 url");
       }
+      const detail =
+        image.detail === "low" ||
+        image.detail === "high" ||
+        image.detail === "auto" ||
+        image.detail === "original"
+          ? image.detail
+          : undefined;
+      parts.push({
+        type: "image_url",
+        imageUrl: { url: image.url, ...(detail ? { detail } : {}) },
+      });
     }
   }
   const text = parts
@@ -118,16 +132,32 @@ function parseToolCalls(raw: unknown): ModelToolCall[] | undefined {
   for (const item of raw) {
     const record = asRecord(item);
     const fn = asRecord(record.function);
-    if (typeof fn.name !== "string" || !fn.name.trim()) continue;
+    if (typeof fn.name !== "string" || !fn.name.trim()) {
+      throw new Error("tool_call 缺少 function.name");
+    }
+    let argumentsText: string;
+    if (typeof fn.arguments === "string") {
+      argumentsText = fn.arguments || "{}";
+      try {
+        const parsed = JSON.parse(argumentsText) as unknown;
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error("not an object");
+        }
+      } catch {
+        throw new Error(`tool_call ${fn.name} 的 arguments 不是完整 JSON 对象`);
+      }
+    } else {
+      argumentsText = JSON.stringify(fn.arguments ?? {});
+    }
     calls.push({
       id: typeof record.id === "string" && record.id ? record.id : `call_${calls.length}`,
       type: "function",
+      ...(typeof record.namespace === "string" && record.namespace
+        ? { namespace: record.namespace }
+        : {}),
       function: {
         name: fn.name,
-        arguments:
-          typeof fn.arguments === "string"
-            ? fn.arguments
-            : JSON.stringify(fn.arguments ?? {}),
+        arguments: argumentsText,
       },
     });
   }
@@ -156,6 +186,7 @@ function parseMessages(raw: unknown): ModelChatMessage[] {
           : null;
     if (!role) throw new Error("messages 中存在无效 role");
     const parsed = parseContent(record.content);
+    const toolCalls = parseToolCalls(record.tool_calls ?? record.toolCalls);
     messages.push({
       role,
       content: parsed.content,
@@ -166,9 +197,7 @@ function parseMessages(raw: unknown): ModelChatMessage[] {
         : typeof record.toolCallId === "string"
           ? { toolCallId: record.toolCallId }
           : {}),
-      ...(parseToolCalls(record.tool_calls ?? record.toolCalls)
-        ? { toolCalls: parseToolCalls(record.tool_calls ?? record.toolCalls) }
-        : {}),
+      ...(toolCalls ? { toolCalls } : {}),
     });
   }
   if (messages.length === 0) throw new Error("messages 不能为空");
@@ -227,13 +256,6 @@ function parseGatewayExtensions(body: OpenAiGatewayBody): Record<string, unknown
   // 显式丢掉客户端带来的 stream_options，避免上游 400
   delete extensions.stream_options;
   delete extensions.streamOptions;
-  if (typeof body.reasoning_effort === "string" && body.reasoning_effort.trim()) {
-    const reasoning = asRecord(body.reasoning);
-    extensions.reasoning = {
-      ...reasoning,
-      effort: body.reasoning_effort.trim(),
-    };
-  }
   return extensions;
 }
 
@@ -416,6 +438,10 @@ export class OpenAiGatewayService {
     const [session] = await Promise.all([sessionPromise, routeWarmPromise]);
     mark("parallel");
 
+    const reasoning = asRecord(body.reasoning);
+    if (typeof body.reasoning_effort === "string" && body.reasoning_effort.trim()) {
+      reasoning.effort = body.reasoning_effort.trim();
+    }
     const routeOptions = parseRouteOptions({
       ...asRecord(body.routeOptions ?? body.route_options),
       ...(typeof body.temperature === "number" ? { temperature: body.temperature } : {}),
@@ -424,7 +450,10 @@ export class OpenAiGatewayService {
         ? { maxTokens: body.max_completion_tokens }
         : {}),
       ...(typeof body.maxTokens === "number" ? { maxTokens: body.maxTokens } : {}),
-      reasoning: body.reasoning ?? asRecord(body.routeOptions ?? body.route_options).reasoning,
+      reasoning:
+        Object.keys(reasoning).length > 0
+          ? reasoning
+          : asRecord(body.routeOptions ?? body.route_options).reasoning,
     });
     const extensions = parseGatewayExtensions(body);
     const invokeOptions: ModelChatInvokeOptions = {
@@ -459,8 +488,9 @@ export class OpenAiGatewayService {
     if (skipUserAppend) {
       replyToMessageId = this.extractLastUserMessageId(recentEvents) ?? messageId;
     }
-    // 模型上下文来自请求体，不依赖这两条落库；串行写但不 await，让 invoke 立刻开流
-    void (async () => {
+    // Prepare can return promptly, but invoke awaits this chain so no assistant
+    // delta can overtake the authoritative user_message/run_start events.
+    const bookkeeping = (async () => {
       try {
         if (!skipUserAppend) {
           // 首轮临时标题，跑完后再由 autoTitle 润色
@@ -507,6 +537,7 @@ export class OpenAiGatewayService {
       messages,
       invokeOptions,
       isFirstTurn,
+      bookkeeping,
     };
   }
 
@@ -519,11 +550,12 @@ export class OpenAiGatewayService {
       signal?: AbortSignal;
     },
   ): Promise<ModelChatResult> {
+    let publisher: DeltaPublisher | undefined;
+    let reasoningPublisher: DeltaPublisher | undefined;
     try {
+      await context.bookkeeping;
       if (callbacks?.signal?.aborted) {
-        const err = new Error("Aborted");
-        err.name = "AbortError";
-        throw err;
+        throw new ModelCallAbortedError();
       }
 
       const routeQuery = {
@@ -533,13 +565,13 @@ export class OpenAiGatewayService {
       };
 
       const messageId = newId();
-      const publisher = new DeltaPublisher(
+      publisher = new DeltaPublisher(
         this.deps.store,
         context.sessionId,
         context.runId,
         messageId,
       );
-      const reasoningPublisher = new DeltaPublisher(
+      reasoningPublisher = new DeltaPublisher(
         this.deps.store,
         context.sessionId,
         context.runId,
@@ -555,12 +587,12 @@ export class OpenAiGatewayService {
             context.invokeOptions,
             {
               onDelta: (text) => {
+                publisher!.push(text);
                 callbacks.onDelta?.(text);
-                publisher.push(text);
               },
               onReasoningDelta: (text) => {
+                reasoningPublisher!.push(text);
                 callbacks.onReasoningDelta?.(text);
-                reasoningPublisher.push(text);
               },
               signal: callbacks.signal,
             },
@@ -612,19 +644,41 @@ export class OpenAiGatewayService {
       }
       return result;
     } catch (err) {
+      await publisher?.drain();
+      await reasoningPublisher?.drain();
       const message = err instanceof Error ? err.message : String(err);
+      const cancelled =
+        callbacks?.signal?.aborted === true ||
+        (err instanceof Error && err.name === "AbortError") ||
+        (err as { aborted?: unknown })?.aborted === true;
       try {
-        await this.deps.store.appendEvent({
-          sessionId: context.sessionId,
-          type: "run_error",
-          runId: context.runId,
-          payload: { runId: context.runId, message },
-        });
+        if (!cancelled && (publisher?.emitted || reasoningPublisher?.emitted)) {
+          await this.deps.store.appendEvent({
+            sessionId: context.sessionId,
+            type: "assistant_rollback",
+            runId: context.runId,
+            payload: {
+              messageId: publisher?.messageId ?? reasoningPublisher!.messageId,
+              reason: "stream_interrupted",
+            },
+          });
+        }
+        if (!cancelled) {
+          await this.deps.store.appendEvent({
+            sessionId: context.sessionId,
+            type: "run_error",
+            runId: context.runId,
+            payload: { runId: context.runId, message },
+          });
+        }
         await this.deps.store.appendEvent({
           sessionId: context.sessionId,
           type: "run_end",
           runId: context.runId,
-          payload: { runId: context.runId, status: "failed" },
+          payload: {
+            runId: context.runId,
+            status: cancelled ? "cancelled" : "failed",
+          },
         });
       } catch {
         /* 收尾失败不掩盖原始错误 */
@@ -755,29 +809,32 @@ export class OpenAiGatewayService {
     const apiKeyId = cleanSessionKey(input.apiKeyId);
 
     if (key) {
-      const cachedId = await this.readGatewaySessionCache(input.agent.id, key);
+      const cacheKey = apiKeyId ? `${apiKeyId}:${key}` : key;
+      const cachedId = await this.readGatewaySessionCache(input.agent.id, cacheKey);
       if (cachedId) {
         const cached = await this.deps.store.getSession(
           input.tenantId,
           input.agent.id,
           cachedId,
         );
-        if (cached && this.isGatewayOrigin(cached.originJson)) return cached;
+        if (cached && this.isGatewayOrigin(cached.originJson, apiKeyId)) return cached;
       }
 
       const byId = await this.deps.store.getSession(input.tenantId, input.agent.id, key);
-      if (byId && this.isGatewayOrigin(byId.originJson)) {
-        this.writeGatewaySessionCache(input.agent.id, key, byId.id);
+      if (byId && this.isGatewayOrigin(byId.originJson, apiKeyId)) {
+        this.writeGatewaySessionCache(input.agent.id, cacheKey, byId.id);
         return byId;
       }
 
       const byClientKey = await this.findGatewaySession(
         input.tenantId,
         input.agent.id,
-        (origin) => origin.clientSessionKey === key,
+        (origin) =>
+          origin.clientSessionKey === key &&
+          (!apiKeyId || origin.apiKeyId === apiKeyId),
       );
       if (byClientKey) {
-        this.writeGatewaySessionCache(input.agent.id, key, byClientKey.id);
+        this.writeGatewaySessionCache(input.agent.id, cacheKey, byClientKey.id);
         return byClientKey;
       }
 
@@ -794,7 +851,7 @@ export class OpenAiGatewayService {
         },
         model: input.model ?? null,
       });
-      this.writeGatewaySessionCache(input.agent.id, key, created.id);
+      this.writeGatewaySessionCache(input.agent.id, cacheKey, created.id);
       return created;
     }
 
@@ -807,6 +864,7 @@ export class OpenAiGatewayService {
         { limit: 3 },
       );
       const candidates = recent.filter((session) => {
+        if (!this.isGatewayOrigin(session.originJson, apiKeyId)) return false;
         const updated = +new Date(session.updatedAt);
         return Number.isFinite(updated) && Date.now() - updated <= GATEWAY_MATCH_IDLE_MS;
       });
@@ -854,10 +912,16 @@ export class OpenAiGatewayService {
     void write(agentId, key, sessionId).catch(() => undefined);
   }
 
-  private isGatewayOrigin(originJson: string | null | undefined): boolean {
+  private isGatewayOrigin(
+    originJson: string | null | undefined,
+    apiKeyId?: string | null,
+  ): boolean {
     try {
       const origin = JSON.parse(originJson || "{}") as Record<string, unknown>;
-      return origin.channel === "openai-gateway";
+      return (
+        origin.channel === "openai-gateway" &&
+        (!apiKeyId || origin.apiKeyId === apiKeyId)
+      );
     } catch {
       return false;
     }

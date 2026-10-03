@@ -133,6 +133,61 @@ describe("translateAnthropicRequest", () => {
     assert.equal(messagesOf(out)[0]!.content, "x\ny");
   });
 
+  it("tool_result 保留图片媒体并拒绝不完整关联", () => {
+    const translated = translateAnthropicRequest({
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "tool-media",
+              content: [
+                { type: "text", text: "screen" },
+                {
+                  type: "image",
+                  source: {
+                    type: "base64",
+                    media_type: "image/png",
+                    data: "UE5H",
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+    assert.deepEqual(messagesOf(translated), [
+      {
+        role: "tool",
+        tool_call_id: "tool-media",
+        content: [
+          { type: "text", text: "screen" },
+          {
+            type: "image_url",
+            image_url: { url: "data:image/png;base64,UE5H" },
+          },
+        ],
+      },
+    ]);
+    assert.throws(
+      () => translateAnthropicRequest({
+        messages: [{ role: "user", content: [{ type: "tool_result", content: "x" }] }],
+      }),
+      /tool_use_id/,
+    );
+    assert.throws(
+      () => translateAnthropicRequest({
+        messages: [{
+          role: "assistant",
+          content: [{ type: "tool_use", id: "partial", name: "lookup" }],
+        }],
+      }),
+      /input 不是完整对象/,
+    );
+  });
+
   it("工具定义映射为 function 形状", () => {
     const out = translateAnthropicRequest({
       messages: [],

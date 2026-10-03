@@ -191,10 +191,81 @@ export function registerAutomationRoutes(
     const agent = await requireAgent(session.tenantId, c.req.param("id"));
     if (!agent) return c.json({ error: "Agent not found" }, 404);
     const limitRaw = Number(c.req.query("limit") ?? "30");
+    const kindRaw = c.req.query("kind");
+    const kind = kindRaw === "schedule" || kindRaw === "heartbeat" ? kindRaw : undefined;
     const runs = await automation.listRuns(session.tenantId, agent.id, {
       limit: Number.isFinite(limitRaw) ? limitRaw : 30,
+      ...(kind ? { kind } : {}),
     });
     return c.json({ runs });
+  });
+
+  app.get("/api/agents/:id/automation/runs/:rid", async (c) => {
+    const session = c.get("session")!;
+    const agent = await requireAgent(session.tenantId, c.req.param("id"));
+    if (!agent) return c.json({ error: "Agent not found" }, 404);
+    const run = await automation.getRun(session.tenantId, agent.id, c.req.param("rid"));
+    if (!run) return c.json({ error: "Not found" }, 404);
+    return c.json({ run });
+  });
+
+  app.post("/api/agents/:id/automation/runs/:rid/cancel", async (c) => {
+    const session = c.get("session")!;
+    const agent = await requireAgent(session.tenantId, c.req.param("id"));
+    if (!agent) return c.json({ error: "Agent not found" }, 404);
+    try {
+      const result = await automation.cancelRun(
+        session.tenantId,
+        agent.id,
+        c.req.param("rid"),
+      );
+      if (!result) return c.json({ error: "Not found" }, 404);
+      return c.json(result, result.accepted ? 202 : 200);
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
+    }
+  });
+
+  // ── heartbeat ───────────────────────────────────────────────
+
+  app.get("/api/agents/:id/heartbeat", async (c) => {
+    const session = c.get("session")!;
+    const agent = await requireAgent(session.tenantId, c.req.param("id"));
+    if (!agent) return c.json({ error: "Agent not found" }, 404);
+    const heartbeat = await automation.getHeartbeat(session.tenantId, agent.id);
+    return c.json({ heartbeat });
+  });
+
+  app.patch("/api/agents/:id/heartbeat", async (c) => {
+    const session = c.get("session")!;
+    const agent = await requireAgent(session.tenantId, c.req.param("id"));
+    if (!agent) return c.json({ error: "Agent not found" }, 404);
+    type HeartbeatPatch = { enabled?: boolean; intervalMinutes?: number; prompt?: string };
+    const body = await c.req.json<HeartbeatPatch>().catch(() => ({} as HeartbeatPatch));
+    if (
+      body.intervalMinutes !== undefined &&
+      (!Number.isFinite(body.intervalMinutes) || body.intervalMinutes < 5)
+    ) {
+      return c.json({ error: "intervalMinutes must be at least 5" }, 400);
+    }
+    try {
+      const heartbeat = await automation.updateHeartbeat(session.tenantId, agent.id, body);
+      return c.json({ heartbeat });
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : String(err) }, errStatus(err));
+    }
+  });
+
+  app.post("/api/agents/:id/heartbeat/run", async (c) => {
+    const session = c.get("session")!;
+    const agent = await requireAgent(session.tenantId, c.req.param("id"));
+    if (!agent) return c.json({ error: "Agent not found" }, 404);
+    try {
+      const run = await automation.runHeartbeatNow(session.tenantId, agent.id);
+      return c.json({ run }, 202);
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : String(err) }, errStatus(err));
+    }
   });
 
   app.get("/api/agents/:id/routines/:sid/webhook-secret", async (c) => {

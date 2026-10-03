@@ -62,6 +62,30 @@ export type PlatformServicePublic = {
   progress: PlatformServiceProgressSnapshot;
 };
 
+export type PlatformServiceDiagnostics = {
+  key: PlatformServiceKey;
+  generatedAt: string;
+  service: Pick<
+    PlatformServicePublic,
+    "mode" | "desiredState" | "status" | "healthStatus" | "endpointUrl" | "lastError"
+  >;
+  runtime: {
+    reachable: boolean;
+    version: string | null;
+    error: string | null;
+  };
+  expectedContainers: string[];
+  discoveredContainers: Array<{ name: string; id: string; status: string }>;
+  missingContainers: string[];
+  unexpectedContainers: string[];
+  staleReferences: string[];
+  logs: string;
+};
+
+export type PlatformServiceManagerOptions = {
+  fetch?: typeof fetch;
+};
+
 type LiveHealth = {
   status: "healthy" | "unhealthy" | "unknown";
   error: string | null;
@@ -102,12 +126,16 @@ export class PlatformServiceManager {
   private readonly jobs = new Map<string, Promise<void>>();
   /** Runtime-only health state; never persisted in platform_services. */
   private readonly liveHealth = new Map<PlatformServiceKey, LiveHealth>();
+  private readonly fetchImpl: typeof fetch;
 
   constructor(
     private readonly db: Db,
     private readonly runtime: DockerRuntime,
     private readonly config: AppConfig,
-  ) {}
+    opts: PlatformServiceManagerOptions = {},
+  ) {
+    this.fetchImpl = opts.fetch ?? globalThis.fetch;
+  }
 
   async ensureRows(): Promise<void> {
     for (const key of PLATFORM_SERVICE_KEYS) {
@@ -536,7 +564,7 @@ export class PlatformServiceManager {
     try {
       const path = def.healthPath.startsWith("/") ? def.healthPath : `/${def.healthPath}`;
       const url = `${endpoint.replace(/\/$/, "")}${path}`;
-      const res = await fetch(url, {
+      const res = await this.fetchImpl(url, {
         method: def.healthMethod ?? "GET",
         signal: AbortSignal.timeout(8000),
         headers: cfg.apiKey ? { Authorization: `Bearer ${cfg.apiKey}` } : undefined,
@@ -665,6 +693,7 @@ export class PlatformServiceManager {
   /** Live container logs for the service (real docker logs, not status copy). */
   async getContainerLogs(key: PlatformServiceKey, tail = 200): Promise<string> {
     const row = await this.requireRow(key);
+    const cfg = this.readConfig(row);
     const refs = parseContainers(row.containersJson);
     const chunks: string[] = [];
     for (const ref of refs) {
@@ -672,7 +701,7 @@ export class PlatformServiceManager {
       try {
         const body = await this.runtime.logs(ref.dockerId, tail);
         if (body.trim()) {
-          chunks.push(`--- ${ref.name} ---\n${body.trimEnd()}`);
+          chunks.push(`--- ${ref.name} ---\n${this.redactDiagnostics(body.trimEnd(), cfg)}`);
         }
       } catch (err) {
         chunks.push(
@@ -681,6 +710,91 @@ export class PlatformServiceManager {
       }
     }
     return chunks.join("\n\n");
+  }
+
+  /**
+   * Deterministic deployment diagnosis without mutating Docker state. Container
+   * inventory is reconciled against both persisted refs and catalog names.
+   */
+  async diagnose(
+    key: PlatformServiceKey,
+    opts: { tail?: number } = {},
+  ): Promise<PlatformServiceDiagnostics> {
+    const row = await this.requireRow(key);
+    const service = this.toPublic(row);
+    const def = PLATFORM_SERVICE_CATALOG[key];
+    const expectedContainers = def.containers.map((role) => containerNameFor(key, role.role));
+    const persisted = parseContainers(row.containersJson);
+
+    let runtimeReachable = false;
+    let runtimeVersion: string | null = null;
+    let runtimeError: string | null = null;
+    let listed: Awaited<ReturnType<DockerRuntime["list"]>> = [];
+    try {
+      const ping = await this.runtime.ping();
+      runtimeReachable = ping.ok;
+      runtimeVersion = ping.ok ? ping.version ?? null : null;
+      runtimeError = ping.ok ? null : ping.error || "Docker ping failed";
+      if (ping.ok) listed = await this.runtime.list({ purpose: "platform-service" });
+    } catch (err) {
+      runtimeError = err instanceof Error ? err.message : String(err);
+    }
+
+    const discovered = listed.filter(
+      (container) =>
+        container.labels?.["zakura.service"] === key ||
+        expectedContainers.includes(container.name),
+    );
+    const discoveredNames = new Set(discovered.map((container) => container.name));
+    const expectedSet = new Set(expectedContainers);
+    const discoveredIds = new Set(discovered.map((container) => container.id));
+    const missingContainers =
+      service.mode === "managed" && service.desiredState === "running"
+        ? expectedContainers.filter((name) => !discoveredNames.has(name))
+        : [];
+    const unexpectedContainers = discovered
+      .filter((container) => !expectedSet.has(container.name))
+      .map((container) => container.name);
+    const staleReferences = persisted
+      .filter((ref) => ref.dockerId && !discoveredIds.has(ref.dockerId))
+      .map((ref) => ref.name);
+
+    return {
+      key,
+      generatedAt: new Date().toISOString(),
+      service: {
+        mode: service.mode,
+        desiredState: service.desiredState,
+        status: service.status,
+        healthStatus: service.healthStatus,
+        endpointUrl: service.endpointUrl,
+        lastError: service.lastError,
+      },
+      runtime: {
+        reachable: runtimeReachable,
+        version: runtimeVersion,
+        error: runtimeError,
+      },
+      expectedContainers,
+      discoveredContainers: discovered.map((container) => ({
+        name: container.name,
+        id: container.id,
+        status: container.status,
+      })),
+      missingContainers,
+      unexpectedContainers,
+      staleReferences,
+      logs: await this.getContainerLogs(key, Math.min(Math.max(opts.tail ?? 100, 20), 2_000)),
+    };
+  }
+
+  private redactDiagnostics(text: string, cfg: PlatformServiceConfig): string {
+    const secrets = [cfg.apiKey, ...Object.values(cfg.env ?? {})]
+      .filter((value): value is string => typeof value === "string" && value.length >= 4)
+      .sort((a, b) => b.length - a.length);
+    let out = text;
+    for (const secret of secrets) out = out.split(secret).join("[REDACTED]");
+    return out;
   }
 
   private async startManaged(key: PlatformServiceKey): Promise<void> {
@@ -810,7 +924,7 @@ export class PlatformServiceManager {
           await new Promise((r) => setTimeout(r, 800));
           const cLog = await this.runtime.logs(running.id, 100);
           if (cLog.trim()) {
-            appendPlatformServiceLog(key, cLog, {
+            appendPlatformServiceLog(key, this.redactDiagnostics(cLog, cfg), {
               step: running.name,
               phase: "creating",
               percent: basePct + 40,
@@ -898,7 +1012,10 @@ export class PlatformServiceManager {
         try {
           const cLog = await this.runtime.logs(ref.dockerId, 40);
           if (cLog.trim()) {
-            appendPlatformServiceLog(key, cLog, { step: ref.name, phase: "health" });
+            appendPlatformServiceLog(key, this.redactDiagnostics(cLog, cfg), {
+              step: ref.name,
+              phase: "health",
+            });
           }
         } catch {
           /* ignore */

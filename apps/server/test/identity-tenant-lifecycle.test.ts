@@ -254,14 +254,17 @@ describe("identity tenancy lifecycle on PGlite", () => {
     });
 
     const app = new Hono<{ Variables: { session?: SaasSession } }>();
+    const adminAudit: string[] = [];
+    const revokedOauth: string[] = [];
+    let routeSession: SaasSession = {
+      userId: routeOwner.id,
+      tenantId: routeTenant.tenant.id,
+      email: routeOwner.email,
+      role: "owner",
+      isPlatformAdmin: true,
+    };
     app.use("*", async (context, next) => {
-      context.set("session", {
-        userId: routeOwner.id,
-        tenantId: routeTenant.tenant.id,
-        email: routeOwner.email,
-        role: "owner",
-        isPlatformAdmin: true,
-      });
+      context.set("session", routeSession);
       await next();
     });
     const deps = {
@@ -284,6 +287,31 @@ describe("identity tenancy lifecycle on PGlite", () => {
       switchTenantSession: async () => null,
       isSessionAdmin: (session: SaasSession) => session.role === "owner" || session.role === "admin",
       ensurePlatformMeta: async () => ({ setupCompleted: true, mode: "multi-tenant", version: "test" }),
+      appendAudit: async (_tenantId: string, action: string) => { adminAudit.push(action); },
+      oauthClientsAdmin: {
+        list: async (_tenantId: string) => ({
+          inbound: [
+            { id: "in-1", clientName: "Alpha", createdAt: "2026-01-01T00:00:00.000Z" },
+            { id: "in-2", clientName: "Beta", createdAt: "2026-02-01T00:00:00.000Z" },
+          ],
+          outbound: [{ id: "out-1", clientName: "Gamma", createdAt: "2026-03-01T00:00:00.000Z" }],
+        }),
+        revoke: async ({ direction, id }: { direction: "inbound" | "outbound"; id: string }) => {
+          revokedOauth.push(`${direction}:${id}`);
+          return id === "in-1";
+        },
+      },
+      runtimeNodes: {
+        listAllRemote: async () => [{
+          id: "runner-1", tenantId: routeTenant.tenant.id, name: "Runner", slug: "runner",
+          kind: "remote", status: "ready", isShared: false, createdByUserId: routeOwner.id,
+          lastSeenAt: new Date(), createdAt: new Date(),
+        }],
+        setShared: async (_nodeId: string, isShared: boolean) => ({
+          id: "runner-1", tenantId: routeTenant.tenant.id, name: "Runner", isShared,
+          createdByUserId: routeOwner.id,
+        }),
+      },
       resolveRegistrationJoin: async (email: string) =>
         email.endsWith("@autojoin.example.test")
           ? ({ action: "auto_join" as const, tenantId: lifecycleTenant.tenant.id, role: "member" as const })
@@ -291,6 +319,10 @@ describe("identity tenancy lifecycle on PGlite", () => {
       schema,
     } satisfies SaasHostDeps & { schema: typeof schema };
     registerSaasRoutes(app, deps);
+
+    routeSession = { ...routeSession, isPlatformAdmin: false };
+    assert.equal((await app.request("http://test/api/admin/stats")).status, 403);
+    routeSession = { ...routeSession, isPlatformAdmin: true };
 
     const unverifiedAutoJoin = await app.request("http://test/api/auth/register", {
       method: "POST",
@@ -337,6 +369,39 @@ describe("identity tenancy lifecycle on PGlite", () => {
     const missingDefaults = await app.request("http://test/api/admin/agent-defaults");
     assert.equal(missingDefaults.status, 503);
 
+    const oauthPage = await app.request(
+      `http://test/api/admin/oauth-clients?tenantId=${routeTenant.tenant.id}&page=2&pageSize=1`,
+    );
+    assert.equal(oauthPage.status, 200, await oauthPage.clone().text());
+    const oauthPageBody = await oauthPage.json() as { total: number; items: Array<{ id: string }> };
+    assert.equal(oauthPageBody.total, 3);
+    assert.equal(oauthPageBody.items[0]?.id, "in-2");
+    assert.equal(
+      (await app.request("http://test/api/admin/oauth-clients?direction=sideways")).status,
+      400,
+    );
+    assert.equal(
+      (await app.request(
+        `http://test/api/admin/oauth-clients/inbound/in-1?tenantId=${routeTenant.tenant.id}`,
+        { method: "DELETE" },
+      )).status,
+      200,
+    );
+    assert.deepEqual(revokedOauth, ["inbound:in-1"]);
+    assert.ok(adminAudit.includes("admin.oauth_client_revoke"));
+
+    const runnerPatch = await app.request("http://test/api/admin/runners/runner-1", {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ isShared: true }),
+    });
+    assert.equal(runnerPatch.status, 200, await runnerPatch.clone().text());
+    assert.ok(adminAudit.includes("admin.runner_share"));
+    const runnerList = await app.request("http://test/api/admin/runners?page=1&pageSize=1");
+    assert.equal(runnerList.status, 200, await runnerList.clone().text());
+    const runnerListBody = await runnerList.json() as { total: number; items: unknown[] };
+    assert.equal(runnerListBody.total, 1);
+    assert.equal(runnerListBody.items.length, 1);
+
     const invalidRole = await app.request(
       `http://test/api/admin/tenants/${routeTenant.tenant.id}/members`,
       {
@@ -346,6 +411,28 @@ describe("identity tenancy lifecycle on PGlite", () => {
       },
     );
     assert.equal(invalidRole.status, 400, await invalidRole.clone().text());
+
+    const addMember = () => app.request(
+      `http://test/api/admin/tenants/${routeTenant.tenant.id}/members`,
+      {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ userId: ownerB, role: "member" }),
+      },
+    );
+    const concurrentAdds = await Promise.all([addMember(), addMember()]);
+    assert.deepEqual(concurrentAdds.map((response) => response.status).sort(), [201, 409]);
+
+    const platformAdminA = await addUser(`platform-admin-a-${newId()}@example.test`);
+    const platformAdminB = await addUser(`platform-admin-b-${newId()}@example.test`);
+    await db.update(users).set({ isPlatformAdmin: true }).where(
+      or(eq(users.id, platformAdminA.id), eq(users.id, platformAdminB.id)),
+    );
+    const demote = (id: string) => app.request(`http://test/api/admin/users/${id}`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ isPlatformAdmin: false }),
+    });
+    const concurrentDemotions = await Promise.all([demote(platformAdminA.id), demote(platformAdminB.id)]);
+    assert.deepEqual(concurrentDemotions.map((response) => response.status).sort(), [200, 400]);
 
     const oldPayload = verifySession(
       "route-secret",

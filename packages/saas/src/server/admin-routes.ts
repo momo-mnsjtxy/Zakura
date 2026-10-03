@@ -84,6 +84,13 @@ function mapSuspension(row: {
   };
 }
 
+function isUniqueViolation(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const value = error as { code?: unknown; cause?: unknown };
+  if (value.code === "23505") return true;
+  return value.cause !== error && isUniqueViolation(value.cause);
+}
+
 function daysAgo(n: number): Date {
   return new Date(Date.now() - n * 24 * 60 * 60 * 1000);
 }
@@ -466,11 +473,38 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
     patch.isPlatformAdmin = nextAdmin;
     patch.canUseLocalRunner = nextLocal;
 
-    const [updated] = await db
-      .update(users)
-      .set(patch)
-      .where(eq(users.id, target.id))
-      .returning();
+    let updated: Record<string, any> | undefined;
+    try {
+      const mutation = await db.transaction(async (tx: AnyDb) => {
+        if (body.isPlatformAdmin === false && target.isPlatformAdmin) {
+          await tx.execute(sql`select id from ${users} where is_platform_admin = true for update`);
+          const lockedTarget = await tx.query.users.findFirst({ where: eq(users.id, target.id) });
+          if (!lockedTarget) return { error: "Not found" } as const;
+          if (lockedTarget.isPlatformAdmin) {
+            const [other] = await tx
+              .select({ n: count() })
+              .from(users)
+              .where(
+                and(
+                  eq(users.isPlatformAdmin, true),
+                  isNull(users.suspendedAt),
+                  ne(users.id, target.id),
+                ),
+              );
+            if (Number(other?.n ?? 0) === 0) {
+              return { error: "至少保留一个平台管理员" } as const;
+            }
+          }
+        }
+        const [row] = await tx.update(users).set(patch).where(eq(users.id, target.id)).returning();
+        return { row } as const;
+      });
+      if ("error" in mutation) return c.json({ error: mutation.error }, 400);
+      updated = mutation.row;
+    } catch (error) {
+      if (isUniqueViolation(error)) return c.json({ error: "该邮箱已被占用" }, 409);
+      throw error;
+    }
     if (!updated) return c.json({ error: "Update failed" }, 500);
 
     bumpUser(target.id);
@@ -933,8 +967,9 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
         suspendedByUserId: session.userId,
         updatedAt: now,
       })
-      .where(eq(tenants.id, id))
+      .where(and(eq(tenants.id, id), isNull(tenants.suspendedAt)))
       .returning();
+    if (!updated) return c.json({ error: "该团队已被封禁或不存在" }, 409);
 
     bumpTenant(id);
     await tenantService.notifyTenantSuspended?.(id);
@@ -963,6 +998,7 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
       })
       .where(eq(tenants.id, id))
       .returning();
+    if (!updated) return c.json({ error: "Not found" }, 404);
 
     bumpTenant(id);
     await deps.appendAudit?.(id, "admin.tenant_unsuspend", {
@@ -1027,15 +1063,20 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
     if (existing) return c.json({ error: "该用户已在团队中" }, 409);
 
     const now = new Date();
-    await db.insert(tenantMemberships).values({
-      id: newId(),
-      tenantId,
-      userId: user.id,
-      role,
-      status: "active",
-      createdAt: now,
-      updatedAt: now,
-    });
+    const inserted = await db
+      .insert(tenantMemberships)
+      .values({
+        id: newId(),
+        tenantId,
+        userId: user.id,
+        role,
+        status: "active",
+        createdAt: now,
+        updatedAt: now,
+      })
+      .onConflictDoNothing({ target: [tenantMemberships.tenantId, tenantMemberships.userId] })
+      .returning();
+    if (!inserted.length) return c.json({ error: "该用户已在团队中" }, 409);
     await deps.appendAudit?.(tenantId, "admin.member_add", {
       actorId: session.userId,
       targetType: "user",
@@ -1184,6 +1225,12 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
       const updated = await deps.runtimeNodes.setShared(c.req.param("id"), body.isShared, {
         userId: session.userId,
         isPlatformAdmin: true,
+      });
+      await deps.appendAudit?.(session.tenantId, "admin.runner_share", {
+        actorId: session.userId,
+        targetType: "runtime_node",
+        targetId: updated.id,
+        detail: { tenantId: updated.tenantId, isShared: updated.isShared },
       });
       return c.json({
         runner: {
