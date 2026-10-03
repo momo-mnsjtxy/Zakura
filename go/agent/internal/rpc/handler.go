@@ -50,7 +50,7 @@ func (h *Handler) Dispatch(ctx context.Context, msg Msg, send func(Msg)) {
 		h.reply(msg, result, err, send)
 		return
 	}
-	if handled, result, err := h.dispatchHost(msg, send); handled {
+	if handled, result, err := h.dispatchHost(ctx, msg, send); handled {
 		h.reply(msg, result, err, send)
 		return
 	}

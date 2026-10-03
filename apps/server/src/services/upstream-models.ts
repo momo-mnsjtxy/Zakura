@@ -403,27 +403,7 @@ export class UpstreamModelsService {
   }
 
   async removeMany(tenantId: string, ids: string[]) {
-    const unique = [...new Set(ids.map((id) => id.trim()).filter(Boolean))];
-    if (unique.length === 0) return { deleted: 0 };
-    const deleted = await this.db.transaction(async (tx) => {
-      const database = tx as unknown as Db;
-      await this.lockTenant(database, tenantId);
-      const rows = await database
-        .delete(upstreamModels)
-        .where(
-          and(eq(upstreamModels.tenantId, tenantId), inArray(upstreamModels.id, unique)),
-        )
-        .returning();
-      const capabilities = new Set(
-        rows
-          .filter((row) => row.isDefault)
-          .map((row) => row.capability as ModelCapability),
-      );
-      for (const capability of capabilities) {
-        await this.promoteDefault(database, tenantId, capability);
-      }
-      return rows;
-    });
+    const deleted = await this.deleteIdsAndPromote(tenantId, ids);
     if (deleted.length > 0) this.onMutate?.(tenantId);
     return { deleted: deleted.length };
   }
@@ -510,26 +490,16 @@ export class UpstreamModelsService {
     const staleIds = existing
       .filter((model) => !liveIds.has(model.nativeModel.trim()))
       .map((model) => model.id);
+    const deleted = await this.deleteIdsAndPromote(tenantId, staleIds);
     const now = new Date();
     const message =
       remote.models.length > 0
-        ? staleIds.length > 0
-          ? `已移除 ${staleIds.length} 个上游不再提供的模型`
+        ? deleted.length > 0
+          ? `已移除 ${deleted.length} 个上游不再提供的模型`
           : "上游模型检查通过"
         : remote.message ?? "上游未返回可用模型";
 
-    if (staleIds.length > 0) {
-      await this.db
-        .delete(upstreamModels)
-        .where(
-          and(
-            eq(upstreamModels.tenantId, tenantId),
-            eq(upstreamModels.upstreamId, upstreamId),
-            inArray(upstreamModels.id, staleIds),
-          ),
-        );
-      this.onMutate?.(tenantId);
-    }
+    if (deleted.length > 0) this.onMutate?.(tenantId);
 
     await this.db
       .update(modelUpstreams)
@@ -543,7 +513,7 @@ export class UpstreamModelsService {
     return {
       status: remote.models.length > 0 ? ("healthy" as const) : ("empty" as const),
       liveModels: remote.models.length,
-      removed: staleIds.length,
+      removed: deleted.length,
       message,
     };
   }
@@ -576,16 +546,14 @@ export class UpstreamModelsService {
               eq(upstreamModels.tenantId, tenantId),
               eq(upstreamModels.upstreamId, upstreamId),
             ),
-          );
+        );
         if (existing.length > 0) {
-          await this.db.delete(upstreamModels).where(
-            and(
-              eq(upstreamModels.tenantId, tenantId),
-              eq(upstreamModels.upstreamId, upstreamId),
-            ),
+          const deleted = await this.deleteIdsAndPromote(
+            tenantId,
+            existing.map((row) => row.id),
           );
-          this.onMutate?.(tenantId);
-          pruned = existing.length;
+          if (deleted.length > 0) this.onMutate?.(tenantId);
+          pruned = deleted.length;
         }
       }
       return {
@@ -623,10 +591,11 @@ export class UpstreamModelsService {
         (row) => !selectedModelIds.has(row.nativeModel.trim()),
       );
       if (toRemove.length > 0) {
-        await this.db.delete(upstreamModels).where(
-          inArray(upstreamModels.id, toRemove.map((row) => row.id)),
+        const deleted = await this.deleteIdsAndPromote(
+          tenantId,
+          toRemove.map((row) => row.id),
         );
-        removedBeforeSync = toRemove.length;
+        removedBeforeSync = deleted.length;
       }
     }
     let created = 0;
@@ -755,13 +724,11 @@ export class UpstreamModelsService {
         (r) => !touchedKeys.has(`${r.nativeModel}::${r.capability}`),
       );
       if (toDelete.length > 0) {
-        await this.db.delete(upstreamModels).where(
-          inArray(
-            upstreamModels.id,
-            toDelete.map((r) => r.id),
-          ),
+        const deleted = await this.deleteIdsAndPromote(
+          tenantId,
+          toDelete.map((row) => row.id),
         );
-        pruned = toDelete.length;
+        pruned += deleted.length;
       }
     }
 
@@ -850,6 +817,32 @@ export class UpstreamModelsService {
       .from(tenants)
       .where(eq(tenants.id, tenantId))
       .for("update");
+  }
+
+  private async deleteIdsAndPromote(
+    tenantId: string,
+    ids: string[],
+  ): Promise<UpstreamModel[]> {
+    const unique = [...new Set(ids.map((id) => id.trim()).filter(Boolean))];
+    if (unique.length === 0) return [];
+    return this.db.transaction(async (tx) => {
+      const database = tx as unknown as Db;
+      await this.lockTenant(database, tenantId);
+      const rows = await database
+        .delete(upstreamModels)
+        .where(
+          and(eq(upstreamModels.tenantId, tenantId), inArray(upstreamModels.id, unique)),
+        )
+        .returning();
+      for (const capability of new Set(
+        rows
+          .filter((row) => row.isDefault)
+          .map((row) => row.capability as ModelCapability),
+      )) {
+        await this.promoteDefault(database, tenantId, capability);
+      }
+      return rows;
+    });
   }
 
   private async promoteDefault(

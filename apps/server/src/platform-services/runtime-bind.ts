@@ -8,13 +8,21 @@ import {
 
 let manager: PlatformServiceManager | null = null;
 let usage: PlatformServiceUsageService | null = null;
+let generation = 0;
 
 export function bindPlatformServiceRuntime(
   m: PlatformServiceManager,
   u: PlatformServiceUsageService,
-): void {
+): () => void {
+  const boundGeneration = ++generation;
   manager = m;
   usage = u;
+  return () => {
+    if (generation !== boundGeneration) return;
+    generation += 1;
+    manager = null;
+    usage = null;
+  };
 }
 
 export type ManagedResolve = {
@@ -28,7 +36,10 @@ export async function resolveManagedForSearchEngine(
 ): Promise<ManagedResolve | null> {
   const key = serviceKeyForSearchEngine(engineId);
   if (!key || !manager) return null;
-  const r = await manager.resolveManaged(key);
+  const bound = manager;
+  const boundGeneration = generation;
+  const r = await bound.resolveManaged(key);
+  if (generation !== boundGeneration || manager !== bound) return null;
   if (!r) return null;
   return { ...r, serviceKey: key };
 }
@@ -38,7 +49,10 @@ export async function resolveManagedForFetchBackend(
 ): Promise<ManagedResolve | null> {
   const key = serviceKeyForFetchBackend(backendId);
   if (!key || !manager) return null;
-  const r = await manager.resolveManaged(key);
+  const bound = manager;
+  const boundGeneration = generation;
+  const r = await bound.resolveManaged(key);
+  if (generation !== boundGeneration || manager !== bound) return null;
   if (!r) return null;
   return { ...r, serviceKey: key };
 }
@@ -49,7 +63,10 @@ export async function consumeManagedUsage(opts: {
   serviceKey: PlatformServiceKey | string;
 }): Promise<void> {
   if (!usage) return;
-  await usage.checkAndIncrement(opts);
+  const bound = usage;
+  const boundGeneration = generation;
+  if (usage !== bound || generation !== boundGeneration) return;
+  await bound.checkAndIncrement(opts);
 }
 
 export function getPlatformServiceManager(): PlatformServiceManager | null {

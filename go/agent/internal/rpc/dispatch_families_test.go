@@ -99,6 +99,16 @@ func TestHostDispatchMalformedRepliesOnce(t *testing.T) {
 	}
 }
 
+func TestHostExecHonorsCanceledRequestContextBeforeProcessStart(t *testing.T) {
+	h := New("runner", t.TempDir())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	got := collectDispatch(h, ctx, Msg{ID: "cancel-host", Method: "host.exec", Params: json.RawMessage(`{"command":["never-started"]}`)})
+	if len(got) != 1 || got[0].OK == nil || *got[0].OK || got[0].Error != context.Canceled.Error() {
+		t.Fatalf("messages = %#v", got)
+	}
+}
+
 type countingCloser struct{ closes atomic.Int32 }
 
 func (c *countingCloser) Close() error                { c.closes.Add(1); return nil }

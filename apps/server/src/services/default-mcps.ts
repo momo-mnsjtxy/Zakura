@@ -11,12 +11,46 @@ function normUrl(url: string): string {
   return normalizeMcpHttpUrl(url).replace(/\/$/, "").toLowerCase();
 }
 
+function matchesDefaultMcp(
+  row: { endpointUrl: string | null; configEnc: string },
+  targetUrl: string,
+  secret: string,
+): boolean {
+  const endpoint = (row.endpointUrl ?? "").replace(/\/$/, "").toLowerCase();
+  if (endpoint && endpoint === targetUrl) return true;
+  try {
+    const cfg = decryptJson<{ mcpUrl?: string }>(secret, row.configEnc);
+    return Boolean(cfg.mcpUrl && normUrl(cfg.mcpUrl) === targetUrl);
+  } catch {
+    return false;
+  }
+}
+
+const ensureFlights = new Map<string, Promise<string[]>>();
+
 /**
  * 确保租户已安装「新建 Agent 默认绑定」的无鉴权 HTTP MCP（如 Grep）。
  * 已存在则复用并尽量保持 running；失败不抛，由调用方决定是否绑定。
  * @returns 可绑定的 instanceId 列表
  */
 export async function ensureDefaultAgentMcps(
+  db: Db,
+  orchestrator: Orchestrator,
+  appConfig: AppConfig,
+  tenantId: string,
+): Promise<string[]> {
+  const pending = ensureFlights.get(tenantId);
+  if (pending) return pending;
+  const run = ensureDefaultAgentMcpsOnce(db, orchestrator, appConfig, tenantId);
+  ensureFlights.set(tenantId, run);
+  try {
+    return await run;
+  } finally {
+    if (ensureFlights.get(tenantId) === run) ensureFlights.delete(tenantId);
+  }
+}
+
+async function ensureDefaultAgentMcpsOnce(
   db: Db,
   orchestrator: Orchestrator,
   appConfig: AppConfig,
@@ -40,26 +74,9 @@ export async function ensureDefaultAgentMcps(
         );
 
       let row =
-        existing.find((i) => {
-          const ep = (i.endpointUrl ?? "").replace(/\/$/, "").toLowerCase();
-          if (ep && ep === targetUrl) return true;
-          if (i.slug === mcp.id) return true;
-          return false;
-        }) ?? null;
-
-      if (!row) {
-        for (const i of existing) {
-          try {
-            const cfg = decryptJson<{ mcpUrl?: string }>(appConfig.secret, i.configEnc);
-            if (cfg.mcpUrl && normUrl(cfg.mcpUrl) === targetUrl) {
-              row = i;
-              break;
-            }
-          } catch {
-            /* ignore corrupt config */
-          }
-        }
-      }
+        existing.find((instance) =>
+          matchesDefaultMcp(instance, targetUrl, appConfig.secret),
+        ) ?? null;
 
       if (!row) {
         const slugBase = mcp.id.slice(0, 32) || `mcp-${Date.now().toString(36)}`;
@@ -78,17 +95,32 @@ export async function ensureDefaultAgentMcps(
           }
         }
 
-        row = await orchestrator.createInstance({
-          tenantId,
-          providerId: "generic-mcp",
-          name: mcp.name,
-          slug,
-          config: {
-            mcpUrl: normalizeMcpHttpUrl(mcp.mcpUrl),
-            apiKey: "",
-            headerName: "Authorization",
-          },
-        });
+        try {
+          row = await orchestrator.createInstance({
+            tenantId,
+            providerId: "generic-mcp",
+            name: mcp.name,
+            slug,
+            config: {
+              mcpUrl: normalizeMcpHttpUrl(mcp.mcpUrl),
+              apiKey: "",
+              headerName: "Authorization",
+            },
+          });
+        } catch (createError) {
+          // Another replica may have won the unique tenant+slug insert. Read
+          // the durable winner rather than returning an empty/default binding.
+          const raced = await db.query.componentInstances.findFirst({
+            where: and(
+              eq(componentInstances.tenantId, tenantId),
+              eq(componentInstances.slug, slug),
+            ),
+          });
+          if (!raced || !matchesDefaultMcp(raced, targetUrl, appConfig.secret)) {
+            throw createError;
+          }
+          row = raced;
+        }
       }
 
       if (row.status !== "running") {
@@ -122,8 +154,20 @@ export async function bindDefaultMcpsToAgent(
   instanceIds: string[],
   agentId?: string,
 ): Promise<void> {
+  await bindDefaultMcpsToAgentDetailed(db, tenantId, spaceId, instanceIds, agentId);
+}
+
+export async function bindDefaultMcpsToAgentDetailed(
+  db: Db,
+  tenantId: string,
+  spaceId: string,
+  instanceIds: string[],
+  agentId?: string,
+): Promise<{ bound: string[]; failed: Array<{ instanceId: string; error: string }> }> {
   const now = new Date();
-  for (const instanceId of instanceIds) {
+  const bound: string[] = [];
+  const failed: Array<{ instanceId: string; error: string }> = [];
+  for (const instanceId of [...new Set(instanceIds)]) {
     try {
       await db
         .insert(agentBindings)
@@ -136,11 +180,15 @@ export async function bindDefaultMcpsToAgent(
           createdAt: now,
         })
         .onConflictDoNothing();
+      bound.push(instanceId);
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      failed.push({ instanceId, error: message });
       console.warn(
         `[default-mcps] bind ${instanceId} -> space ${spaceId} failed:`,
-        err instanceof Error ? err.message : err,
+        message,
       );
     }
   }
+  return { bound, failed };
 }

@@ -122,7 +122,7 @@ async function main() {
   const orchestrator = new Orchestrator(db, runtime, config);
   const platformServices = new PlatformServiceManager(db, runtime, config);
   const platformServiceUsage = new PlatformServiceUsageService(db, config);
-  bindPlatformServiceRuntime(platformServices, platformServiceUsage);
+  const unbindPlatformServiceRuntime = bindPlatformServiceRuntime(platformServices, platformServiceUsage);
   await platformServices.ensureRows().catch((err) => {
     telemetry.recordFault("platform_services.ensure_rows", err, {
       subsystem: "platform_services",
@@ -480,6 +480,7 @@ async function main() {
   runnerHub.attach(server as import("node:http").Server);
   apiApp.zakurabotGateway?.attach(server as import("node:http").Server);
   server.on("close", () => {
+    unbindPlatformServiceRuntime();
     browserService.dispose();
     disposeDesktopState(agentService.workspace);
     apiApp.automation.stop();
@@ -488,6 +489,7 @@ async function main() {
       marketSync.stopAndDrain(),
       imageUpdateChecker.stopAndDrain(),
       telemetry.shutdown(),
+      toolCallStore.flush(),
     ]);
   });
 }

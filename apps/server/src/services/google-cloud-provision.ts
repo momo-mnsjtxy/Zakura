@@ -159,6 +159,53 @@ export type GoogleProvisionResult = {
   }>;
 };
 
+export type GoogleProvisionTransport = {
+  fetch?: typeof fetch;
+  now?: () => number;
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+  signal?: AbortSignal;
+  requestTimeoutMs?: number;
+  operationTimeoutMs?: number;
+};
+
+function abortError(): Error {
+  return Object.assign(new Error("Google provisioning aborted"), { name: "AbortError" });
+}
+
+function throwIfAborted(transport: GoogleProvisionTransport): void {
+  if (transport.signal?.aborted) throw abortError();
+}
+
+function requestSignal(transport: GoogleProvisionTransport, timeoutMs?: number): AbortSignal {
+  throwIfAborted(transport);
+  const timeout = AbortSignal.timeout(timeoutMs ?? transport.requestTimeoutMs ?? 20_000);
+  return transport.signal ? AbortSignal.any([transport.signal, timeout]) : timeout;
+}
+
+async function sleepFor(
+  ms: number,
+  transport: GoogleProvisionTransport,
+): Promise<void> {
+  throwIfAborted(transport);
+  if (transport.sleep) return transport.sleep(ms, transport.signal);
+  await new Promise<void>((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortError());
+    };
+    const timer = setTimeout(() => {
+      transport.signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    timer.unref?.();
+    transport.signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function isAbort(err: unknown): boolean {
+  return err instanceof Error && err.name === "AbortError";
+}
+
 function b64url(input: Buffer | string): string {
   const buf = typeof input === "string" ? Buffer.from(input) : input;
   return buf.toString("base64url");
@@ -372,11 +419,12 @@ export function makeTestServiceAccount(projectId = "test-project"): GoogleServic
 async function serviceAccountAccessToken(
   sa: GoogleServiceAccountJson,
   scope = "https://www.googleapis.com/auth/cloud-platform",
+  transport: GoogleProvisionTransport = {},
 ): Promise<string> {
   if (!sa.client_email || !sa.private_key) {
     throw new Error("Service Account JSON 缺少 client_email / private_key");
   }
-  const now = Math.floor(Date.now() / 1000);
+  const now = Math.floor((transport.now ?? Date.now)() / 1000);
   const header = b64url(JSON.stringify({ alg: "RS256", typ: "JWT" }));
   const claim = b64url(
     JSON.stringify({
@@ -394,15 +442,18 @@ async function serviceAccountAccessToken(
   const sig = signer.sign(sa.private_key.replace(/\\n/g, "\n"), "base64url");
   const jwt = `${unsigned}.${sig}`;
 
-  const res = await fetch(sa.token_uri || "https://oauth2.googleapis.com/token", {
+  const res = await (transport.fetch ?? globalThis.fetch)(
+    sa.token_uri || "https://oauth2.googleapis.com/token",
+    {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
       grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
       assertion: jwt,
     }),
-    signal: AbortSignal.timeout(20000),
-  });
+      signal: requestSignal(transport),
+    },
+  );
   const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
   if (!res.ok || typeof json.access_token !== "string") {
     throw new Error(
@@ -416,15 +467,16 @@ async function serviceAccountAccessToken(
 async function fetchProjectInfo(
   projectId: string,
   token: string,
+  transport: GoogleProvisionTransport = {},
 ): Promise<NonNullable<GoogleProvisionResult["projectInfo"]>> {
   const url = `https://cloudresourcemanager.googleapis.com/v1/projects/${encodeURIComponent(projectId)}`;
   try {
-    const res = await fetch(url, {
+    const res = await (transport.fetch ?? globalThis.fetch)(url, {
       headers: {
         Authorization: `Bearer ${token}`,
         "x-goog-user-project": projectId,
       },
-      signal: AbortSignal.timeout(20000),
+      signal: requestSignal(transport),
     });
     const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
     if (!res.ok) {
@@ -441,6 +493,7 @@ async function fetchProjectInfo(
       state: typeof json.lifecycleState === "string" ? json.lifecycleState : undefined,
     };
   } catch (err) {
+    if (isAbort(err)) throw err;
     return {
       projectId,
       error: err instanceof Error ? err.message : String(err),
@@ -453,20 +506,22 @@ async function getServiceState(
   projectId: string,
   service: string,
   token: string,
+  transport: GoogleProvisionTransport = {},
 ): Promise<string> {
   const url = `https://serviceusage.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/services/${encodeURIComponent(service)}`;
   try {
-    const res = await fetch(url, {
+    const res = await (transport.fetch ?? globalThis.fetch)(url, {
       headers: {
         Authorization: `Bearer ${token}`,
         "x-goog-user-project": projectId,
       },
-      signal: AbortSignal.timeout(20000),
+      signal: requestSignal(transport),
     });
     if (!res.ok) return "UNKNOWN";
     const json = (await res.json().catch(() => ({}))) as { state?: string };
     return json.state || "UNKNOWN";
-  } catch {
+  } catch (err) {
+    if (isAbort(err)) throw err;
     return "UNKNOWN";
   }
 }
@@ -488,17 +543,20 @@ async function waitServiceOperation(
   token: string,
   projectId: string,
   timeoutMs = 90_000,
+  transport: GoogleProvisionTransport = {},
 ): Promise<void> {
   const name = operationName.replace(/^\//, "");
   const url = `https://serviceusage.googleapis.com/v1/${name}`;
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const res = await fetch(url, {
+  const now = transport.now ?? Date.now;
+  const deadline = now() + (transport.operationTimeoutMs ?? timeoutMs);
+  while (now() < deadline) {
+    throwIfAborted(transport);
+    const res = await (transport.fetch ?? globalThis.fetch)(url, {
       headers: {
         Authorization: `Bearer ${token}`,
         "x-goog-user-project": projectId,
       },
-      signal: AbortSignal.timeout(20000),
+      signal: requestSignal(transport),
     });
     const json = (await res.json().catch(() => ({}))) as {
       done?: boolean;
@@ -517,7 +575,7 @@ async function waitServiceOperation(
       }
       return;
     }
-    await new Promise((r) => setTimeout(r, 1500));
+    await sleepFor(1_500, transport);
   }
   throw new Error(`启用操作超时：${operationName}`);
 }
@@ -526,13 +584,14 @@ async function enableService(
   projectId: string,
   service: string,
   token: string,
+  transport: GoogleProvisionTransport = {},
 ): Promise<"enabled" | "already" | string> {
   // 已启用则跳过
-  const before = await getServiceState(projectId, service, token);
+  const before = await getServiceState(projectId, service, token, transport);
   if (before === "ENABLED") return "already";
 
   const url = `https://serviceusage.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/services/${encodeURIComponent(service)}:enable`;
-  const res = await fetch(url, {
+  const res = await (transport.fetch ?? globalThis.fetch)(url, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${token}`,
@@ -540,7 +599,7 @@ async function enableService(
       "x-goog-user-project": projectId,
     },
     body: "{}",
-    signal: AbortSignal.timeout(60000),
+    signal: requestSignal(transport, 60_000),
   });
   const text = await res.text();
 
@@ -573,20 +632,21 @@ async function enableService(
 
   try {
     if (operationName) {
-      await waitServiceOperation(operationName, token, projectId);
+      await waitServiceOperation(operationName, token, projectId, 90_000, transport);
     }
     // 再确认最终状态（LRO 成功后偶发短暂延迟）
     for (let i = 0; i < 5; i++) {
-      const state = await getServiceState(projectId, service, token);
+      const state = await getServiceState(projectId, service, token, transport);
       if (state === "ENABLED") return "enabled";
-      await new Promise((r) => setTimeout(r, 1000));
+      await sleepFor(1_000, transport);
     }
-    const finalState = await getServiceState(projectId, service, token);
+    const finalState = await getServiceState(projectId, service, token, transport);
     if (finalState === "ENABLED") return "enabled";
     return classifyEnableError(
       `启用后状态仍为 ${finalState}（MCP 工具调用会报 The caller does not have permission）`,
     );
   } catch (err) {
+    if (isAbort(err)) throw err;
     return classifyEnableError(err instanceof Error ? err.message : String(err));
   }
 }
@@ -614,6 +674,7 @@ export async function provisionGoogleWorkspaceMcp(opts: {
   serviceAccountJson: unknown;
   projectId?: string;
   products?: GoogleMcpProductId[];
+  transport?: GoogleProvisionTransport;
 }): Promise<GoogleProvisionResult> {
   const sa = parseServiceAccount(opts.serviceAccountJson);
   const projectId = (opts.projectId || sa.project_id || "").trim();
@@ -624,21 +685,27 @@ export async function provisionGoogleWorkspaceMcp(opts: {
     throw new Error("请提供 type=service_account 的密钥 JSON（不是 OAuth Client 下载文件）");
   }
 
-  const token = await serviceAccountAccessToken(sa);
+  const transport = opts.transport ?? {};
+  throwIfAborted(transport);
+  const token = await serviceAccountAccessToken(
+    sa,
+    "https://www.googleapis.com/auth/cloud-platform",
+    transport,
+  );
   const redirectUri = mcpOauthRedirectUri(opts.config);
 
   const products = opts.products?.length
     ? GOOGLE_MCP_PRODUCTS.filter((p) => opts.products!.includes(p.id))
     : [...GOOGLE_MCP_PRODUCTS];
 
-  const projectInfo = await fetchProjectInfo(projectId, token);
+  const projectInfo = await fetchProjectInfo(projectId, token, transport);
 
   const enabled: string[] = [];
   const alreadyEnabled: string[] = [];
   const failed: Array<{ service: string; error: string }> = [];
 
   for (const service of GOOGLE_WORKSPACE_MCP_SERVICES) {
-    const result = await enableService(projectId, service, token);
+    const result = await enableService(projectId, service, token, transport);
     if (result === "enabled") enabled.push(service);
     else if (result === "already") alreadyEnabled.push(service);
     else failed.push({ service, error: result });
@@ -646,7 +713,7 @@ export async function provisionGoogleWorkspaceMcp(opts: {
 
   const serviceStates: NonNullable<GoogleProvisionResult["serviceStates"]> = [];
   for (const service of GOOGLE_WORKSPACE_MCP_SERVICES) {
-    const state = await getServiceState(projectId, service, token);
+    const state = await getServiceState(projectId, service, token, transport);
     serviceStates.push({ service, state });
   }
 

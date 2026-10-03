@@ -1,12 +1,10 @@
 package docker
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 )
@@ -30,8 +28,7 @@ func dockerBin() string {
 func Probe() Ping {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, dockerBin(), "version", "--format", "{{.Server.Version}}")
-	out, err := cmd.CombinedOutput()
+	out, err := dockerCommands.CombinedOutput(ctx, "version", "--format", "{{.Server.Version}}")
 	if err != nil {
 		return Ping{OK: false, Error: ErrUnavailable.Error()}
 	}
@@ -123,7 +120,7 @@ func Run(ctx context.Context, spec RunSpec) (ContainerInfo, error) {
 		return ContainerInfo{}, fmt.Errorf("image 不能为空")
 	}
 	if spec.Name != "" {
-		_ = exec.CommandContext(ctx, dockerBin(), "rm", "-f", spec.Name).Run()
+		_ = dockerCommands.Run(ctx, "rm", "-f", spec.Name)
 	}
 	args := []string{"run", "-d"}
 	if spec.StdinOpen {
@@ -176,8 +173,7 @@ func Run(ctx context.Context, spec RunSpec) (ContainerInfo, error) {
 	}
 	args = append(args, spec.Image)
 	args = append(args, spec.Command...)
-	cmd := exec.CommandContext(ctx, dockerBin(), args...)
-	out, err := cmd.CombinedOutput()
+	out, err := dockerCommands.CombinedOutput(ctx, args...)
 	if err != nil {
 		return ContainerInfo{}, fmt.Errorf("docker run: %s", strings.TrimSpace(string(out)))
 	}
@@ -189,9 +185,9 @@ func Stop(ctx context.Context, idOrName string, remove bool) error {
 	if err := Require(); err != nil {
 		return err
 	}
-	_ = exec.CommandContext(ctx, dockerBin(), "stop", idOrName).Run()
+	_ = dockerCommands.Run(ctx, "stop", idOrName)
 	if remove {
-		return exec.CommandContext(ctx, dockerBin(), "rm", "-f", idOrName).Run()
+		return dockerCommands.Run(ctx, "rm", "-f", idOrName)
 	}
 	return nil
 }
@@ -200,15 +196,14 @@ func Inspect(ctx context.Context, idOrName string) (ContainerInfo, error) {
 	if err := Require(); err != nil {
 		return ContainerInfo{}, err
 	}
-	cmd := exec.CommandContext(ctx, dockerBin(), "inspect", idOrName)
-	out, err := cmd.CombinedOutput()
+	out, err := dockerCommands.CombinedOutput(ctx, "inspect", idOrName)
 	if err != nil {
 		return ContainerInfo{}, fmt.Errorf("docker inspect: %s", strings.TrimSpace(string(out)))
 	}
 	var raw []struct {
-		Id     string `json:"Id"`
-		Name   string `json:"Name"`
-		State  struct {
+		Id    string `json:"Id"`
+		Name  string `json:"Name"`
+		State struct {
 			Status string `json:"Status"`
 		} `json:"State"`
 		Config struct {
@@ -260,20 +255,7 @@ func Exec(ctx context.Context, idOrName string, command []string, workdir string
 	}
 	args = append(args, idOrName)
 	args = append(args, command...)
-	cmd := exec.CommandContext(ctx, dockerBin(), args...)
-	var outBuf, errBuf bytes.Buffer
-	cmd.Stdout = &outBuf
-	cmd.Stderr = &errBuf
-	runErr := cmd.Run()
-	code = 0
-	if runErr != nil {
-		if ee, ok := runErr.(*exec.ExitError); ok {
-			code = ee.ExitCode()
-		} else {
-			return outBuf.String(), errBuf.String(), 1, runErr
-		}
-	}
-	return outBuf.String(), errBuf.String(), code, nil
+	return dockerCommands.Exec(ctx, args)
 }
 
 func Logs(ctx context.Context, idOrName string, tail int) (string, error) {
@@ -281,7 +263,7 @@ func Logs(ctx context.Context, idOrName string, tail int) (string, error) {
 		return "", err
 	}
 	args := []string{"logs", "--tail", fmt.Sprintf("%d", tail), idOrName}
-	out, err := exec.CommandContext(ctx, dockerBin(), args...).CombinedOutput()
+	out, err := dockerCommands.CombinedOutput(ctx, args...)
 	return string(out), err
 }
 
@@ -289,7 +271,7 @@ func Copy(ctx context.Context, src, dest string) error {
 	if err := Require(); err != nil {
 		return err
 	}
-	out, err := exec.CommandContext(ctx, dockerBin(), "cp", src, dest).CombinedOutput()
+	out, err := dockerCommands.CombinedOutput(ctx, "cp", src, dest)
 	if err != nil {
 		return fmt.Errorf("docker cp: %s", strings.TrimSpace(string(out)))
 	}
@@ -304,7 +286,7 @@ func List(ctx context.Context, label string) ([]ContainerInfo, error) {
 	if label != "" {
 		args = append(args, "--filter", "label="+label)
 	}
-	out, err := exec.CommandContext(ctx, dockerBin(), args...).CombinedOutput()
+	out, err := dockerCommands.CombinedOutput(ctx, args...)
 	if err != nil {
 		return nil, fmt.Errorf("docker ps: %s", strings.TrimSpace(string(out)))
 	}

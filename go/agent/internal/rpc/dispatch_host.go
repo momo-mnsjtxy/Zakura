@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -14,7 +15,7 @@ import (
 // dispatchHost owns the host process and interactive-stream RPC family.  It
 // deliberately returns a value rather than replying itself: Dispatch remains
 // the single reply boundary for every request.
-func (h *Handler) dispatchHost(msg Msg, send func(Msg)) (bool, any, error) {
+func (h *Handler) dispatchHost(ctx context.Context, msg Msg, send func(Msg)) (bool, any, error) {
 	if !isHostMethod(msg.Method) {
 		return false, nil, nil
 	}
@@ -25,9 +26,9 @@ func (h *Handler) dispatchHost(msg Msg, send func(Msg)) (bool, any, error) {
 	var err error
 	switch msg.Method {
 	case "host.exec":
-		result, err = h.hostExec(msg.Params)
+		result, err = h.hostExec(ctx, msg.Params)
 	case "host.exec.start":
-		result, err = h.hostExecStart(msg.Params)
+		result, err = h.hostExecStart(ctx, msg.Params)
 	case "host.exec.get":
 		result, err = h.hostExecGet(msg.Params)
 	case "host.exec.kill":
@@ -64,7 +65,7 @@ func decodeParams(raw json.RawMessage, dst any) error {
 	return json.Unmarshal(raw, dst)
 }
 
-func (h *Handler) hostExec(raw json.RawMessage) (any, error) {
+func (h *Handler) hostExec(ctx context.Context, raw json.RawMessage) (any, error) {
 	var p struct {
 		host.ExecParams
 		SpaceID string `json:"spaceId"`
@@ -75,10 +76,10 @@ func (h *Handler) hostExec(raw json.RawMessage) (any, error) {
 		root = h.workspace(p.SpaceID)
 		_ = host.EnsureDir(root)
 	}
-	return host.Run(root, p.ExecParams)
+	return host.RunContext(ctx, root, p.ExecParams)
 }
 
-func (h *Handler) hostExecStart(raw json.RawMessage) (any, error) {
+func (h *Handler) hostExecStart(ctx context.Context, raw json.RawMessage) (any, error) {
 	var p struct {
 		host.ExecParams
 		SpaceID string `json:"spaceId"`
@@ -89,7 +90,7 @@ func (h *Handler) hostExecStart(raw json.RawMessage) (any, error) {
 		root = h.workspace(p.SpaceID)
 		_ = host.EnsureDir(root)
 	}
-	return h.jobs.Start(root, p.ExecParams)
+	return h.jobs.StartContext(ctx, root, p.ExecParams)
 }
 
 func (h *Handler) hostExecGet(raw json.RawMessage) (any, error) {

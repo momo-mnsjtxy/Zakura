@@ -27,7 +27,14 @@ type ExecResult struct {
 }
 
 func Run(root string, p ExecParams) (ExecResult, error) {
-	ctx := context.Background()
+	return RunContext(context.Background(), root, p)
+}
+
+func RunContext(parent context.Context, root string, p ExecParams) (ExecResult, error) {
+	if err := parent.Err(); err != nil {
+		return ExecResult{}, err
+	}
+	ctx := parent
 	if p.TimeoutMs > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(p.TimeoutMs)*time.Millisecond)
@@ -104,6 +111,18 @@ type Job struct {
 	exitCode *int
 	cmd      *exec.Cmd
 	cancel   context.CancelFunc
+	done     chan struct{}
+}
+
+type jobWriter struct {
+	job    *Job
+	buffer *bytes.Buffer
+}
+
+func (w jobWriter) Write(p []byte) (int, error) {
+	w.job.mu.Lock()
+	defer w.job.mu.Unlock()
+	return w.buffer.Write(p)
 }
 
 type JobSnap struct {
@@ -115,16 +134,28 @@ type JobSnap struct {
 }
 
 type Registry struct {
-	mu   sync.Mutex
-	jobs map[string]*Job
+	mu        sync.Mutex
+	jobs      map[string]*Job
+	retention time.Duration
+	after     func(time.Duration, func())
 }
 
 func NewRegistry() *Registry {
-	return &Registry{jobs: map[string]*Job{}}
+	return &Registry{
+		jobs: map[string]*Job{}, retention: 10 * time.Minute,
+		after: func(delay time.Duration, fn func()) { time.AfterFunc(delay, fn) },
+	}
 }
 
 func (r *Registry) Start(root string, p ExecParams) (*JobSnap, error) {
-	ctx, cancel := context.WithCancel(context.Background())
+	return r.StartContext(context.Background(), root, p)
+}
+
+func (r *Registry) StartContext(parent context.Context, root string, p ExecParams) (*JobSnap, error) {
+	if err := parent.Err(); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithCancel(parent)
 	if p.TimeoutMs > 0 {
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(p.TimeoutMs)*time.Millisecond)
 	}
@@ -133,9 +164,9 @@ func (r *Registry) Start(root string, p ExecParams) (*JobSnap, error) {
 		cancel()
 		return nil, err
 	}
-	j := &Job{ID: newID(), cmd: cmd, cancel: cancel}
-	cmd.Stdout = &j.stdout
-	cmd.Stderr = &j.stderr
+	j := &Job{ID: newID(), cmd: cmd, cancel: cancel, done: make(chan struct{})}
+	cmd.Stdout = jobWriter{job: j, buffer: &j.stdout}
+	cmd.Stderr = jobWriter{job: j, buffer: &j.stderr}
 	if p.Stdin != "" {
 		cmd.Stdin = bytes.NewBufferString(p.Stdin)
 	}
@@ -160,8 +191,20 @@ func (r *Registry) Start(root string, p ExecParams) (*JobSnap, error) {
 		j.exitCode = &code
 		j.mu.Unlock()
 		cancel()
+		close(j.done)
+		r.scheduleEviction(j)
 	}()
 	return j.Snapshot(), nil
+}
+
+func (r *Registry) scheduleEviction(j *Job) {
+	r.after(r.retention, func() {
+		r.mu.Lock()
+		if r.jobs[j.ID] == j {
+			delete(r.jobs, j.ID)
+		}
+		r.mu.Unlock()
+	})
 }
 
 func (r *Registry) Get(id string) *JobSnap {
@@ -184,6 +227,12 @@ func (r *Registry) Kill(id string) *JobSnap {
 	j.cancel()
 	if j.cmd.Process != nil {
 		_ = j.cmd.Process.Kill()
+	}
+	if j.done != nil {
+		select {
+		case <-j.done:
+		case <-time.After(2 * time.Second):
+		}
 	}
 	return j.Snapshot()
 }

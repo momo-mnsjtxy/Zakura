@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
@@ -103,15 +102,8 @@ func PullWithProgress(ctx context.Context, image string, onProgress func(PullEve
 	if err := Require(); err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, dockerBin(), "pull", image)
 	out := &pullOutput{onProgress: onProgress}
-	var err error
-	if onProgress == nil {
-		cmd.Stdout, cmd.Stderr = out, out
-		err = cmd.Run()
-	} else {
-		err = runPullCommand(cmd, out)
-	}
+	err := dockerCommands.Pull(ctx, []string{"pull", image}, out, onProgress != nil)
 	out.emit(out.pending)
 	if err != nil {
 		return fmt.Errorf("docker pull: %s: %w", strings.TrimSpace(pullANSI.ReplaceAllString(string(out.tail), "")), err)

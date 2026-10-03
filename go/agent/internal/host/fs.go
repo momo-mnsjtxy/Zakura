@@ -91,11 +91,56 @@ func WriteFile(root, rel string, data []byte) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(p, data, 0o644); err != nil {
+	if err := atomicWriteFile(p, data, 0o644); err != nil {
 		return "", err
 	}
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:8]), nil
+}
+
+type atomicFileOps interface {
+	CreateTemp(string, string) (*os.File, error)
+	Chmod(string, os.FileMode) error
+	Rename(string, string) error
+	Remove(string) error
+}
+
+type osAtomicFileOps struct{}
+
+func (osAtomicFileOps) CreateTemp(dir, pattern string) (*os.File, error) {
+	return os.CreateTemp(dir, pattern)
+}
+func (osAtomicFileOps) Chmod(path string, mode os.FileMode) error { return os.Chmod(path, mode) }
+func (osAtomicFileOps) Rename(from, to string) error              { return os.Rename(from, to) }
+func (osAtomicFileOps) Remove(path string) error                  { return os.Remove(path) }
+
+var hostFileOps atomicFileOps = osAtomicFileOps{}
+
+func atomicWriteFile(path string, data []byte, mode os.FileMode) (err error) {
+	f, err := hostFileOps.CreateTemp(filepath.Dir(path), ".zakura-write-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer func() {
+		_ = f.Close()
+		if cleanupErr := hostFileOps.Remove(tmp); err == nil && cleanupErr != nil && !os.IsNotExist(cleanupErr) {
+			err = cleanupErr
+		}
+	}()
+	if _, err = f.Write(data); err != nil {
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	if err = hostFileOps.Chmod(tmp, mode); err != nil {
+		return err
+	}
+	return hostFileOps.Rename(tmp, path)
 }
 
 func Mkdir(root, rel string) error {

@@ -793,6 +793,8 @@ describe("identity tenancy lifecycle on PGlite", () => {
     const originalFetch = globalThis.fetch;
     let assertedVerifier = false;
     let assertedEmail = "oidc-user@example.test";
+    let assertedAudience: string | string[] = "client-1";
+    let assertedAzp: string | undefined;
     let expectedNonce = "";
     globalThis.fetch = async (input, init) => {
       const url = String(input);
@@ -803,8 +805,9 @@ describe("identity tenancy lifecycle on PGlite", () => {
         const now = Math.floor(Date.now() / 1000);
         const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT", kid: "test-key" })).toString("base64url");
         const payload = Buffer.from(JSON.stringify({
-          iss: "https://idp.example.test", aud: "client-1", sub: "subject-1", email: assertedEmail,
+          iss: "https://idp.example.test", aud: assertedAudience, sub: "subject-1", email: assertedEmail,
           name: "OIDC User", nonce: expectedNonce, iat: now, exp: now + 300,
+          ...(assertedAzp ? { azp: assertedAzp } : {}),
         })).toString("base64url");
         const signer = createSign("RSA-SHA256");
         signer.update(`${header}.${payload}`);
@@ -862,6 +865,20 @@ describe("identity tenancy lifecycle on PGlite", () => {
       assert.equal(mfaBody.session, undefined);
       assert.equal(mfaBody.mfaRequired, true);
       assert.deepEqual(mfaBody.methods, ["webauthn"]);
+
+      assertedAudience = ["client-1", "another-client"];
+      assertedAzp = undefined;
+      const ambiguousStart = await startOidcSso(db, urls, "acme-a");
+      const ambiguousAuthorize = new URL(ambiguousStart.authorizeUrl);
+      expectedNonce = ambiguousAuthorize.searchParams.get("nonce")!;
+      const ambiguous = await identityApp.request("http://test/api/auth/sso/oidc/callback", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ code: "ambiguous-audience", state: ambiguousAuthorize.searchParams.get("state") }),
+      });
+      assert.equal(ambiguous.status, 400);
+      assert.match(await ambiguous.text(), /azp/);
+      assertedAudience = "client-1";
 
       await upsertTenantSso(db, secret, tenantB, {
         enabled: true,

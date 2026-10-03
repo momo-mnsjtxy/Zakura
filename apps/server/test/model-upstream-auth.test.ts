@@ -31,14 +31,11 @@ registerBuiltinModelAdapters();
 
 describe("default OAuth JSON transport", () => {
   it("bounds stalled requests and propagates caller cancellation", async () => {
-    const restore = stubFetch(async (_url, init) =>
-      new Promise<Response>((_resolve, reject) => {
-        init?.signal?.addEventListener(
-          "abort",
-          () => reject(init.signal?.reason),
-          { once: true },
-        );
-      }));
+    const seenSignals: AbortSignal[] = [];
+    const restore = stubFetch(async (_url, init) => {
+      if (init?.signal) seenSignals.push(init.signal);
+      return new Promise<Response>(() => undefined);
+    });
     try {
       const http = defaultJsonHttp();
       await assert.rejects(
@@ -54,6 +51,8 @@ describe("default OAuth JSON transport", () => {
       );
       controller.abort(new Error("caller cancelled"));
       await assert.rejects(pending, /caller cancelled/);
+      assert.equal(seenSignals.length, 2);
+      assert.ok(seenSignals.every((signal) => signal.aborted));
     } finally {
       restore();
     }

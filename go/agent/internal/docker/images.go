@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"strings"
 )
 
@@ -56,8 +55,7 @@ func imageID(ctx context.Context, name string) (id, digest string, err error) {
 	if err := Require(); err != nil {
 		return "", "", err
 	}
-	cmd := exec.CommandContext(ctx, dockerBin(), "image", "inspect", name, "--format", "{{.Id}}\t{{json .RepoDigests}}")
-	out, err := cmd.CombinedOutput()
+	out, err := dockerCommands.CombinedOutput(ctx, "image", "inspect", name, "--format", "{{.Id}}\t{{json .RepoDigests}}")
 	if err != nil {
 		return "", "", fmt.Errorf("docker image inspect: %s", strings.TrimSpace(string(out)))
 	}
@@ -72,8 +70,7 @@ func imageID(ctx context.Context, name string) (id, digest string, err error) {
 }
 
 func containerImageID(ctx context.Context, idOrName string) (string, error) {
-	cmd := exec.CommandContext(ctx, dockerBin(), "inspect", idOrName, "--format", "{{.Image}}")
-	out, err := cmd.CombinedOutput()
+	out, err := dockerCommands.CombinedOutput(ctx, "inspect", idOrName, "--format", "{{.Image}}")
 	if err != nil {
 		return "", err
 	}

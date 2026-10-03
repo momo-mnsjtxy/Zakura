@@ -11,8 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
-
 	"zakura.dev/agent/internal/rpc"
 	"zakura.dev/agent/internal/sys"
 )
@@ -25,19 +23,21 @@ type Config struct {
 }
 
 func Loop(ctx context.Context, cfg Config) {
+	loopWith(ctx, cfg, defaultDependencies(cfg.Handler))
+}
+
+func loopWith(ctx context.Context, cfg Config, deps dependencies) {
 	backoff := time.Second
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		err := connectOnce(ctx, cfg)
+	for ctx.Err() == nil {
+		connected, err := connectOnceWith(ctx, cfg, deps)
 		if err != nil {
 			log.Printf("zakura-agent: 连接断开: %v，%s 后重试", err, backoff)
 		}
-		select {
-		case <-ctx.Done():
+		if connected {
+			backoff = time.Second
+		}
+		if !deps.wait(ctx, backoff) {
 			return
-		case <-time.After(backoff):
 		}
 		if backoff < 30*time.Second {
 			backoff *= 2
@@ -46,16 +46,22 @@ func Loop(ctx context.Context, cfg Config) {
 }
 
 func connectOnce(ctx context.Context, cfg Config) error {
+	_, err := connectOnceWith(ctx, cfg, defaultDependencies(cfg.Handler))
+	return err
+}
+
+func connectOnceWith(ctx context.Context, cfg Config, deps dependencies) (bool, error) {
 	u, err := hubURL(cfg.ServerURL)
 	if err != nil {
-		return err
+		return false, err
 	}
 	hdr := http.Header{}
 	hdr.Set("Authorization", "Bearer "+cfg.Token)
-	c, _, err := websocket.DefaultDialer.DialContext(ctx, u, hdr)
+	c, err := deps.dial(ctx, u, hdr)
 	if err != nil {
-		return err
+		return false, err
 	}
+	connected := true
 	defer c.Close()
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -67,11 +73,11 @@ func connectOnce(ctx context.Context, cfg Config) error {
 	write := func(m rpc.Msg) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
-		_ = c.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		_ = c.SetWriteDeadline(deps.now().Add(10 * time.Second))
 		return c.WriteJSON(m)
 	}
 	if err := write(rpc.Hello(cfg.Token, sys.Version, cfg.Kind)); err != nil {
-		return err
+		return connected, err
 	}
 
 	send := func(m rpc.Msg) {
@@ -84,10 +90,28 @@ func connectOnce(ctx context.Context, cfg Config) error {
 	}
 
 	c.SetReadLimit(16 << 20)
+	limit := deps.maxInFlight
+	if limit <= 0 {
+		limit = 1
+	}
+	sem := make(chan struct{}, limit)
+	var dispatches sync.WaitGroup
+	drain := func() {
+		done := make(chan struct{})
+		go func() { dispatches.Wait(); close(done) }()
+		timer := time.NewTimer(deps.drainTimeout)
+		defer timer.Stop()
+		select {
+		case <-done:
+		case <-timer.C:
+		}
+	}
+	defer drain()
 	for {
 		_, data, err := c.ReadMessage()
 		if err != nil {
-			return err
+			cancel()
+			return connected, err
 		}
 		var msg rpc.Msg
 		if err := json.Unmarshal(data, &msg); err != nil {
@@ -102,7 +126,17 @@ func connectOnce(ctx context.Context, cfg Config) error {
 		if msg.Type != "req" {
 			continue
 		}
-		go cfg.Handler.Dispatch(connCtx, msg, send)
+		select {
+		case sem <- struct{}{}:
+		case <-connCtx.Done():
+			return connected, connCtx.Err()
+		}
+		dispatches.Add(1)
+		go func(request rpc.Msg) {
+			defer dispatches.Done()
+			defer func() { <-sem }()
+			deps.dispatch.Dispatch(connCtx, request, send)
+		}(msg)
 	}
 }
 

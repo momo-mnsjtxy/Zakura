@@ -169,6 +169,61 @@ describe("model upstream administration lifecycle", () => {
     );
   });
 
+  it("promotes defaults through reconcile and selected sync pruning", async () => {
+    const prunedUpstream = await upstreams.create(tenantA, {
+      name: "Pruned Inventory Provider",
+      protocol: "custom",
+      config: { baseUrl: "https://pruned-inventory.invalid/v1" },
+    });
+    const successorUpstream = await upstreams.create(tenantA, {
+      name: "Successor Inventory Provider",
+      protocol: "custom",
+      config: { baseUrl: "https://successor-inventory.invalid/v1" },
+    });
+    const successor = await inventory.create(tenantA, {
+      upstreamId: successorUpstream.id,
+      nativeModel: "successor-model",
+      canonicalModel: "successor-model",
+      capability: "chat",
+    });
+    await inventory.create(tenantA, {
+      upstreamId: prunedUpstream.id,
+      nativeModel: "stale-default",
+      canonicalModel: "stale-default",
+      capability: "chat",
+      isDefault: true,
+    });
+    globalThis.fetch = (async () =>
+      Response.json({ data: [{ id: "kept-model" }] })) as typeof fetch;
+
+    const reconciled = await inventory.reconcileAfterUpstreamSave(
+      tenantA,
+      prunedUpstream.id,
+    );
+    assert.equal(reconciled.removed, 1);
+    assert.equal((await inventory.get(tenantA, successor.id))?.isDefault, true);
+
+    await inventory.create(tenantA, {
+      upstreamId: prunedUpstream.id,
+      nativeModel: "selected-sync-default",
+      canonicalModel: "selected-sync-default",
+      capability: "chat",
+      isDefault: true,
+    });
+    await inventory.create(tenantA, {
+      upstreamId: prunedUpstream.id,
+      nativeModel: "kept-model",
+      canonicalModel: "kept-model",
+      capability: "embedding",
+    });
+    const synced = await inventory.syncFromUpstream(tenantA, prunedUpstream.id, {
+      modelIds: ["kept-model"],
+      prune: true,
+    });
+    assert.equal(synced.pruned, 2);
+    assert.equal((await inventory.get(tenantA, successor.id))?.isDefault, true);
+  });
+
   it("reports actual upstream deletes and treats a 404 health probe as unhealthy", async () => {
     const own = await upstreams.create(tenantA, {
       name: "Health Provider",
