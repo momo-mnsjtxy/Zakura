@@ -1,4 +1,4 @@
-import { and, desc, eq, ilike, isNotNull, or, sql } from "drizzle-orm";
+import { and, desc, eq, ilike, inArray, isNotNull, or, sql } from "drizzle-orm";
 import type { Db } from "../db/client.js";
 import {
   memories,
@@ -8,52 +8,26 @@ import {
   type MemoryEdge,
 } from "../db/schema.js";
 import { toVectorLiteral } from "../db/vector.js";
-import { contentHash } from "./embedding-client.js";
+import {
+  MEMORY_LAYERS,
+  clampImportance,
+  fusedScore,
+  graphNeighborScore,
+  isMemoryLayer,
+  keywordScore,
+  keywordTokens,
+  memoryContentHash,
+  normalizeEmbedding,
+  normalizeTags,
+  parseJsonArray,
+  parseJsonObject,
+} from "./memory-domain.js";
 
-export const MEMORY_LAYERS = [
-  "identity",
-  "preference",
-  "project",
-  "fact",
-  "episode",
-  "note",
-] as const;
-export type MemoryLayer = (typeof MEMORY_LAYERS)[number];
-
-export function isMemoryLayer(v: string): v is MemoryLayer {
-  return (MEMORY_LAYERS as readonly string[]).includes(v);
-}
+export { MEMORY_LAYERS, isMemoryLayer, keywordTokens } from "./memory-domain.js";
+export type { MemoryLayer } from "./memory-domain.js";
 
 function escapeIlike(s: string): string {
   return s.replace(/[%_]/g, "\\$&");
-}
-
-/** Keyword tokens for ILIKE search — English words + CJK bigrams (no embedding). */
-export function keywordTokens(query: string): string[] {
-  const q = query.trim();
-  if (!q) return [];
-  const out: string[] = [];
-  const seen = new Set<string>();
-  const push = (t: string) => {
-    const s = t.trim();
-    if (s.length < 1) return;
-    if (s.length === 1 && !/[\u4e00-\u9fff]/.test(s)) return;
-    const key = s.toLowerCase();
-    if (seen.has(key)) return;
-    seen.add(key);
-    out.push(s);
-  };
-
-  for (const part of q.split(/[\s,，。、；;!?？！]+/)) {
-    push(part);
-  }
-  const cjk = q.replace(/[^\u4e00-\u9fff]/g, "");
-  if (cjk.length >= 2 && cjk.length <= 32) {
-    for (let i = 0; i < cjk.length - 1 && out.length < 24; i++) {
-      push(cjk.slice(i, i + 2));
-    }
-  }
-  return out.slice(0, 16);
 }
 
 export type MemoryInput = {
@@ -80,36 +54,8 @@ export type MemoryListOpts = {
   offset?: number;
 };
 
-function parseTags(raw: string): string[] {
-  try {
-    const v = JSON.parse(raw) as unknown;
-    return Array.isArray(v) ? v.map(String) : [];
-  } catch {
-    return [];
-  }
-}
-
-function parseMeta(raw: string): Record<string, unknown> {
-  try {
-    return JSON.parse(raw) as Record<string, unknown>;
-  } catch {
-    return {};
-  }
-}
-
-function parseEmbedding(value: number[] | string | null | undefined): number[] | null {
-  if (!value) return null;
-  if (Array.isArray(value)) return value.length ? value.map(Number) : null;
-  if (typeof value === "string") {
-    const inner = value.trim().replace(/^\[/, "").replace(/\]$/, "");
-    if (!inner) return null;
-    return inner.split(",").map((s) => Number(s.trim()));
-  }
-  return null;
-}
-
 export function serializeMemory(row: Memory) {
-  const emb = parseEmbedding(row.embedding ?? null);
+  const emb = normalizeEmbedding(row.embedding ?? null);
   return {
     id: row.id,
     agentId: row.agentId,
@@ -117,11 +63,11 @@ export function serializeMemory(row: Memory) {
     userId: row.userId,
     layer: row.layer,
     content: row.content,
-    tags: parseTags(row.tagsJson),
+    tags: parseJsonArray(row.tagsJson),
     pinned: row.pinned,
-    importance: Number(row.importance) || 3,
+    importance: clampImportance(row.importance),
     source: row.source,
-    metadata: parseMeta(row.metadataJson),
+    metadata: parseJsonObject(row.metadataJson),
     hasEmbedding: Boolean(emb),
     embeddingModel: row.embeddingModel,
     embeddingDim: row.embeddingDim,
@@ -156,9 +102,9 @@ export class MemoryStore {
     if (!content) throw new Error("content required");
     const layer =
       input.layer && isMemoryLayer(input.layer) ? input.layer : "fact";
-    const importance = Math.min(5, Math.max(1, input.importance ?? 3));
+    const importance = clampImportance(input.importance);
     const now = new Date();
-    const emb = input.embedding ?? null;
+    const emb = normalizeEmbedding(input.embedding ?? null);
     const [row] = await this.db
       .insert(memories)
       .values({
@@ -170,7 +116,7 @@ export class MemoryStore {
         userId: input.userId ?? "default",
         layer,
         content,
-        tagsJson: JSON.stringify(input.tags ?? []),
+        tagsJson: JSON.stringify(normalizeTags(input.tags)),
         pinned: Boolean(input.pinned),
         importance: String(importance),
         source: input.source ?? "manual",
@@ -178,7 +124,7 @@ export class MemoryStore {
         embedding: emb ?? null,
         embeddingModel: emb ? (input.embeddingModel ?? null) : null,
         embeddingDim: emb ? emb.length : null,
-        contentHash: emb ? contentHash(content) : null,
+        contentHash: emb ? memoryContentHash(content) : null,
         createdAt: now,
         updatedAt: now,
       })
@@ -208,7 +154,8 @@ export class MemoryStore {
 
     const content =
       patch.content !== undefined ? patch.content.trim() : undefined;
-    const emb = patch.embedding;
+    if (content !== undefined && !content) throw new Error("content required");
+    const emb = patch.embedding === undefined ? undefined : normalizeEmbedding(patch.embedding);
     const clearEmb = emb === null;
     const setEmb = Array.isArray(emb) && emb.length > 0;
 
@@ -220,11 +167,13 @@ export class MemoryStore {
         ...(patch.layer !== undefined && isMemoryLayer(patch.layer)
           ? { layer: patch.layer }
           : {}),
-        ...(patch.tags !== undefined ? { tagsJson: JSON.stringify(patch.tags) } : {}),
+        ...(patch.tags !== undefined
+          ? { tagsJson: JSON.stringify(normalizeTags(patch.tags)) }
+          : {}),
         ...(patch.pinned !== undefined ? { pinned: patch.pinned } : {}),
         ...(patch.importance !== undefined
           ? {
-              importance: String(Math.min(5, Math.max(1, patch.importance))),
+              importance: String(clampImportance(patch.importance)),
             }
           : {}),
         ...(patch.metadata !== undefined
@@ -235,7 +184,7 @@ export class MemoryStore {
               embedding: emb,
               embeddingModel: patch.embeddingModel ?? existing.embeddingModel,
               embeddingDim: emb.length,
-              contentHash: contentHash(content ?? existing.content),
+              contentHash: memoryContentHash(content ?? existing.content),
             }
           : {}),
         ...(clearEmb
@@ -390,14 +339,13 @@ export class MemoryStore {
       .map((r) => {
         const item = serializeMemory(r);
         const lower = r.content.toLowerCase();
-        let keyword = r.pinned ? 0.15 : 0;
-        if (lower.includes(q.toLowerCase())) keyword += 1;
-        for (const t of tokens) {
-          if (lower.includes(t.toLowerCase())) keyword += 0.25;
-        }
-        keyword += (Number(r.importance) || 3) * 0.05;
-        // normalize-ish into 0..1+
-        const score = Math.min(1.5, keyword);
+        const score = keywordScore({
+          content: lower,
+          query: q,
+          tokens,
+          pinned: r.pinned,
+          importance: r.importance,
+        });
         return {
           ...item,
           score,
@@ -422,7 +370,7 @@ export class MemoryStore {
     },
   ) {
     const limit = Math.min(50, Math.max(1, opts?.limit ?? 10));
-    const queryEmb = opts?.queryEmbedding ?? null;
+    const queryEmb = normalizeEmbedding(opts?.queryEmbedding ?? null, "query embedding");
 
     const keywordHits = await this.search(tenantId, agentId, query, Math.max(limit, 20));
     const scoreMap = new Map<
@@ -445,9 +393,6 @@ export class MemoryStore {
     }
 
     if (queryEmb && queryEmb.length > 0) {
-      if (!queryEmb.every((n) => Number.isFinite(n))) {
-        throw new Error("invalid query embedding");
-      }
       const vecSql = sql.raw(`'${toVectorLiteral(queryEmb)}'::vector`);
       // pgvector cosine distance <=> ; similarity = 1 - distance
       const semanticRows = await this.db
@@ -461,6 +406,7 @@ export class MemoryStore {
             eq(memories.tenantId, tenantId),
             eq(memories.agentId, agentId),
             isNotNull(memories.embedding),
+            eq(memories.embeddingDim, queryEmb.length),
           ),
         )
         .orderBy(sql`${memories.embedding} <=> ${vecSql}`)
@@ -477,7 +423,7 @@ export class MemoryStore {
           item = full;
         }
         const keyword = prev?.keyword ?? (item.pinned ? 0.1 : 0);
-        const score = Math.max(keyword, semantic) + (item.pinned ? 0.05 : 0);
+        const score = fusedScore({ keyword, semantic, pinned: item.pinned });
         scoreMap.set(r.id, { item, score, keyword, semantic });
       }
     }
@@ -516,24 +462,37 @@ export class MemoryStore {
       )
       .limit(100);
 
-    const neighborIds = new Set<string>();
+    const neighborScores = new Map<string, number>();
+    const seedScores = new Map(results.map((result) => [result.id, result.score]));
     for (const e of edgeRows) {
-      if (!seedIds.includes(e.fromMemoryId)) neighborIds.add(e.fromMemoryId);
-      if (!seedIds.includes(e.toMemoryId)) neighborIds.add(e.toMemoryId);
-    }
-
-    const extras = [];
-    for (const nid of neighborIds) {
-      if (results.some((r) => r.id === nid)) continue;
-      const item = await this.get(tenantId, agentId, nid);
-      if (item) {
-        extras.push({
-          ...item,
-          score: 0.35,
-          scoreBreakdown: { keyword: 0, semantic: 0 },
-        });
+      if (!seedScores.has(e.fromMemoryId)) {
+        const score = graphNeighborScore(e.weight, seedScores.get(e.toMemoryId) ?? 0.35);
+        neighborScores.set(e.fromMemoryId, Math.max(neighborScores.get(e.fromMemoryId) ?? 0, score));
+      }
+      if (!seedScores.has(e.toMemoryId)) {
+        const score = graphNeighborScore(e.weight, seedScores.get(e.fromMemoryId) ?? 0.35);
+        neighborScores.set(e.toMemoryId, Math.max(neighborScores.get(e.toMemoryId) ?? 0, score));
       }
     }
+
+    const neighborIds = [...neighborScores.keys()];
+    const neighborRows = neighborIds.length
+      ? await this.db
+          .select()
+          .from(memories)
+          .where(and(
+            eq(memories.tenantId, tenantId),
+            eq(memories.agentId, agentId),
+            inArray(memories.id, neighborIds),
+          ))
+      : [];
+    const extras = neighborRows
+      .map((row) => ({
+        ...serializeMemory(row),
+        score: neighborScores.get(row.id) ?? 0.1,
+        scoreBreakdown: { keyword: 0, semantic: 0 },
+      }))
+      .sort((a, b) => b.score - a.score);
 
     return {
       results: [...results, ...extras].slice(0, Math.min(50, limit + extras.length)),
@@ -549,15 +508,17 @@ export class MemoryStore {
     embedding: number[],
     model: string,
   ) {
+    const vector = normalizeEmbedding(embedding);
+    if (!vector) throw new Error("embedding required");
     const existing = await this.get(tenantId, agentId, id);
     if (!existing) throw new Error("Memory not found");
     const [row] = await this.db
       .update(memories)
       .set({
-        embedding,
+        embedding: vector,
         embeddingModel: model,
-        embeddingDim: embedding.length,
-        contentHash: contentHash(existing.content),
+        embeddingDim: vector.length,
+        contentHash: memoryContentHash(existing.content),
         updatedAt: new Date(),
       })
       .where(
@@ -579,7 +540,7 @@ export class MemoryStore {
       .orderBy(desc(memories.updatedAt))
       .limit(limit);
     return rows
-      .filter((r) => !r.embedding || r.contentHash !== contentHash(r.content))
+      .filter((r) => !r.embedding || r.contentHash !== memoryContentHash(r.content))
       .map(serializeMemory);
   }
 
@@ -599,7 +560,7 @@ export class MemoryStore {
     for (const r of rows) {
       if (r.hasEmb) {
         withEmb++;
-        if (r.contentHash !== contentHash(r.content)) stale++;
+        if (r.contentHash !== memoryContentHash(r.content)) stale++;
       }
     }
     return {
@@ -666,11 +627,14 @@ export class MemoryStore {
     const b = await this.get(tenantId, agentId, toId);
     if (!a || !b) throw new Error("Memory not found");
 
+    const normalizedRelation = relation.trim() || "related";
     const existing = await this.db.query.memoryEdges.findFirst({
       where: and(
+        eq(memoryEdges.tenantId, tenantId),
+        eq(memoryEdges.agentId, agentId),
         eq(memoryEdges.fromMemoryId, fromId),
         eq(memoryEdges.toMemoryId, toId),
-        eq(memoryEdges.relation, relation),
+        eq(memoryEdges.relation, normalizedRelation),
       ),
     });
     if (existing) return serializeEdge(existing);
@@ -683,7 +647,7 @@ export class MemoryStore {
         agentId,
         fromMemoryId: fromId,
         toMemoryId: toId,
-        relation: relation.trim() || "related",
+        relation: normalizedRelation,
         weight: "1",
         createdAt: new Date(),
       })

@@ -19,6 +19,24 @@ Status values are checked only when corresponding implementation and tests pass.
 | Operations | PGlite/Postgres migration, Redis event coordination, health/readiness, telemetry, Docker/Caddy deployment, backup/recovery docs | migration/observability/redis + compose checks | Pending |
 | SaaS/admin | Onboarding, users/tenants/runners/defaults/platform, usage, audit, enterprise controls | SaaS typecheck/tests and browser smoke | Pending |
 
+## Rewrite and acceptance status
+
+`Rewritten` means production business logic was materially replaced and its focused tests pass. `Preserved` means the pinned implementation remains the parity floor; presence is not rewrite completion. `Gated` means a real external environment or credential is intentionally unavailable.
+
+| Capability | Rewritten and focused-tested | Preserved business scope still requiring migration | Acceptance state |
+|---|---|---|---|
+| Identity and tenancy | Session validation/revocation/suspension; atomic verification/reset/invite/MFA/recovery claims; auth UI action/recovery state | SSO/OIDC/SCIM provisioning and group sync; full tenant permissions; SaaS admin service internals | Full auth route suite required on each snapshot; real IdP is gated, fake IdP required |
+| Agents and chat | Project reconciliation; local/Redis event subscription lifecycle; run cancellation; client history/reconnect/cancel state | Most cloud run/session/message orchestration, durable queue and provider execution business rules | Full cloud-agent/event/socket/Yjs suites plus authenticated create/send/cancel browser flow remain |
+| Models and gateways | Retry/cancellation/backoff lifecycle; bounded gateway session cache | Provider adapters, routing/catalog/upstream credential refresh, normalized streaming/tool/media business paths | Fake OpenAI/Anthropic upstream matrix remains |
+| MCP and tools | Atomic ask/tool interactions; real route/PGlite races; MCP start/stop coalescing; bounded HTTP cleanup; real fake-stdio/catalog mutation flows | Broader MCP gateway/conformance/capability and skill install/cache/update business logic | Focused real-route tests green; full conformance remains |
+| Runtime/workspace | Go RPC family dispatch, jail, OAuth PKCE/state, process/stream/request recovery, archive integrity/atomic import, runtime factory | Remaining Docker/local/remote orchestration and server integration business branches | Go test/vet and focused core suites green; real Docker/remote is gated |
+| Connectors/channels | Frontend connection/channel state boundaries | Connector provider auth/refresh/webhook/channel command/reaction business services | Per-provider fake servers remain; live credentials gated |
+| Skills/memory | Frontend memory/vector/tool-call state boundaries | Server memory/vector/graph, skill discovery/cache/source/update business services | Real PGlite/fake embedding and skill source tests remain |
+| Spaces/operations | Frontend Spaces/computer/automation state; DB/runtime foundations | Server collaboration, network/tunnel, platform services, usage/observability and deployment operations | Local static/route tests remain; live Docker/Headscale/deploy gated |
+| Web application | HTTP decoder/session/error/recovery; auth/agents/spaces/models/MCP/memory/admin state boundaries | Remaining pages retain pinned rendering/business composition | Typecheck, production build and fixture browser flows green; broader workflow E2E remains |
+
+The canonical file-level counts are maintained in `REWRITE_COVERAGE.md`. Full acceptance requires no unclassified business module and every Stage 9 gate in `MIGRATION_PLAN.md` to be green.
+
 ## Frontend route inventory (92)
 
 - `/chat`

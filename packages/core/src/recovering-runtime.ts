@@ -15,6 +15,7 @@ export class RecoveringContainerRuntime implements ContainerRuntime {
   private readonly cleanupTimeoutMs: number;
   private readonly stopping = new Map<string, Promise<void>>();
   private readonly removing = new Map<string, Promise<void>>();
+  private closing?: Promise<void>;
 
   constructor(private readonly inner: ContainerRuntime, options: RecoveringRuntimeOptions = {}) {
     this.kind = inner.kind;
@@ -76,6 +77,17 @@ export class RecoveringContainerRuntime implements ContainerRuntime {
     return this.inner.buildSpecName(tenantSlug, instanceSlug, containerName);
   }
 
+  close(): Promise<void> {
+    if (!this.inner.close) return Promise.resolve();
+    if (this.closing) return this.closing;
+    const operation = deadline(this.inner.close(), this.operationTimeoutMs, "close runtime")
+      .finally(() => {
+        if (this.closing === operation) this.closing = undefined;
+      });
+    this.closing = operation;
+    return operation;
+  }
+
   private async cleanupLate(containerId: string): Promise<void> {
     await deadline(this.inner.remove(containerId, true), this.cleanupTimeoutMs, "late container cleanup").catch(() => undefined);
   }
@@ -103,4 +115,3 @@ export async function deadline<T>(promise: Promise<T>, timeoutMs: number, operat
 function isTimeout(error: unknown): boolean {
   return error instanceof Error && error.name === "TimeoutError";
 }
-

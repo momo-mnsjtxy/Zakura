@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronRight,
   ExternalLink,
@@ -25,6 +25,7 @@ import {
 import type { ConnectorOauthField } from "@/components/connections/connector-oauth-form";
 import { BrandIcon } from "@/components/brand-icon";
 import { api } from "@/lib/api";
+import { createChannelConnectionController, reconcileChannelBinding, removeChannelBinding } from "@/lib/channel-connection-state";
 import { subscribePlatformEvents } from "@/lib/platform-events";
 import {
   getCloudConfig,
@@ -147,6 +148,7 @@ export function AgentPlatformsPanel({
   const [model, setModel] = useState("");
   const [modelRouteId, setModelRouteId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const requestState = useRef(createChannelConnectionController());
 
   const agentBindings = useMemo(
     () => allBindings.filter((b) => b.agentId === agentId && b.platform !== "email"),
@@ -167,6 +169,7 @@ export function AgentPlatformsPanel({
 
   // Load
   const load = useCallback(async () => {
+    const request = requestState.current.beginLoad();
     setLoading(true);
     setLoadError("");
     setRemoteError("");
@@ -176,6 +179,7 @@ export function AgentPlatformsPanel({
         listChatModels(),
         getCloudConfig(agentId).catch(() => null),
       ]);
+      if (!request.current()) return;
       setChatModels(models);
       setAgentDefaultModel(cloud?.cloud.model?.trim() || null);
       setConnectors(connResult.connectors.filter(isChatSdkConnector));
@@ -188,18 +192,21 @@ export function AgentPlatformsPanel({
         remote = { bindings: [], webhookBaseUrl: "", initialized: false };
         setRemoteError(err instanceof Error ? err.message : String(err));
       }
-      setAllBindings(remote.bindings);
+      if (!request.current()) return;
+      setAllBindings(remote.bindings ?? []);
       setWebhookBaseUrl(remote.webhookBaseUrl);
     } catch (err) {
+      if (!request.current()) return;
       const msg = err instanceof Error ? err.message : String(err);
       setLoadError(msg);
       toast.error(msg);
     } finally {
-      setLoading(false);
+      if (request.current()) setLoading(false);
     }
   }, [agentId]);
 
   useEffect(() => { void load(); }, [load]);
+  useEffect(() => () => requestState.current.invalidate(), []);
 
   useEffect(() => {
     return subscribePlatformEvents((ev) => {
@@ -272,11 +279,11 @@ export function AgentPlatformsPanel({
           ...(model ? { model, modelRouteId } : { model: "", modelRouteId: null }),
         },
       };
-      const res = await api<{ binding: Binding }>(
+      const res = await requestState.current.runOnce(`save:${editingId ?? `${agentId}:${platform}`}`, () => api<{ binding: Binding }>(
         editingId ? `/api/remote-channels/${editingId}` : "/api/remote-channels",
         { method: editingId ? "PATCH" : "POST", json: payload },
-      );
-      setAllBindings((cur) => [...cur.filter((b) => b.id !== res.binding.id), res.binding]);
+      ));
+      setAllBindings((cur) => reconcileChannelBinding(cur, res.binding));
       setEditingId(res.binding.id);
       setProfileDraft({});
       toast.success(editingId ? "已保存" : "已添加");
@@ -293,7 +300,8 @@ export function AgentPlatformsPanel({
     if (!window.confirm("确认删除？凭据与绑定将一并移除。")) return;
     setSaving(true);
     try {
-      await api(`/api/remote-channels/${editingId}`, { method: "DELETE" });
+      await requestState.current.runOnce(`delete:${editingId}`, () => api(`/api/remote-channels/${editingId}`, { method: "DELETE" }));
+      setAllBindings((cur) => removeChannelBinding(cur, editingId));
       closeSheet();
       toast.success("已删除");
       await load();
@@ -308,11 +316,11 @@ export function AgentPlatformsPanel({
     if (!editingId) return;
     setSaving(true);
     try {
-      const res = await api<{ binding: Binding }>(
+      const res = await requestState.current.runOnce(`approve:${editingId}:${userKey}`, () => api<{ binding: Binding }>(
         `/api/remote-channels/${editingId}/access/approve`,
         { method: "POST", json: { userKey } },
-      );
-      setAllBindings((cur) => [...cur.filter((b) => b.id !== res.binding.id), res.binding]);
+      ));
+      setAllBindings((cur) => reconcileChannelBinding(cur, res.binding));
       toast.success(`已批准 ${userKey}`);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
@@ -325,11 +333,11 @@ export function AgentPlatformsPanel({
     if (!editingId) return;
     setSaving(true);
     try {
-      const res = await api<{ binding: Binding }>(
+      const res = await requestState.current.runOnce(`deny:${editingId}:${userKey}`, () => api<{ binding: Binding }>(
         `/api/remote-channels/${editingId}/access/deny`,
         { method: "POST", json: { userKey } },
-      );
-      setAllBindings((cur) => [...cur.filter((b) => b.id !== res.binding.id), res.binding]);
+      ));
+      setAllBindings((cur) => reconcileChannelBinding(cur, res.binding));
       toast.success(`已拒绝 ${userKey}`);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));

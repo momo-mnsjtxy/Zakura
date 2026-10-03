@@ -164,6 +164,7 @@ export * from "./runner-stream.js";
 export * from "./runner-workspace-fs.js";
 export * from "./process-lifecycle.js";
 export * from "./recovering-runtime.js";
+export * from "./runtime-factory.js";
 export * from "./runner-archive.js";
 export * from "./json-rpc-client.js";
 

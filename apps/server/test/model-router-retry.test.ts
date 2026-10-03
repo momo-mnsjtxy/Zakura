@@ -4,6 +4,7 @@ import {
   apiError,
   httpSse,
   isRetryableModelError,
+  ModelCallAbortedError,
   UpstreamHttpError,
   withModelRetries,
 } from "../src/model-router/http.js";
@@ -184,6 +185,22 @@ describe("executeWithFallback", () => {
       },
     );
   });
+
+  it("treats caller cancellation as terminal instead of trying another route", async () => {
+    const calls: string[] = [];
+    await assert.rejects(
+      executeWithFallback(
+        [makeRoute("r1"), makeRoute("r2")],
+        "chat",
+        async (_adapter, route) => {
+          calls.push(route.routeSlug);
+          throw new ModelCallAbortedError();
+        },
+      ),
+      ModelCallAbortedError,
+    );
+    assert.deepEqual(calls, ["r1"]);
+  });
 });
 
 describe("httpSse", () => {
@@ -208,7 +225,9 @@ describe("httpSse", () => {
     }) as typeof fetch;
 
     const payloads: string[] = [];
-    await httpSse("t", "http://x", { method: "POST" }, (p) => payloads.push(p));
+    await httpSse("t", "http://x", { method: "POST" }, (p) => {
+      payloads.push(p);
+    });
     assert.deepEqual(payloads, ['{"a":1}', "[DONE]"]);
   });
 
@@ -274,7 +293,9 @@ describe("httpSse", () => {
         "t",
         "http://x",
         { method: "POST", timeoutMs: 1000, idleTimeoutMs: 30 },
-        (p) => payloads.push(p),
+        (p) => {
+          payloads.push(p);
+        },
       ),
       /空闲超时/,
     );

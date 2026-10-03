@@ -70,4 +70,7 @@ export interface ContainerRuntime {
   logs(containerId: string, tail?: number): Promise<string>;
 
   buildSpecName(tenantSlug: string, instanceSlug: string, containerName: string): string;
+
+  /** Optional provider shutdown hook. Calls may be repeated by lifecycle owners. */
+  close?(): Promise<void>;
 }

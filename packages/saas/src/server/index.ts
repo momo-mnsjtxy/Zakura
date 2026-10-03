@@ -1,6 +1,12 @@
 export { registerSaasRoutes } from "./routes.js";
 export { registerSaasUser, RegisterError, type RegisterSchema } from "./register-user.js";
 export {
+  AdminMembershipService,
+  SaasAdminError,
+  type AdminMembershipRole,
+  type AdminMembershipStatus,
+} from "./admin-memberships.js";
+export {
   LOGIN_OAUTH_PROVIDERS,
   listPublicOauthProviders,
   loadLoginPolicy,

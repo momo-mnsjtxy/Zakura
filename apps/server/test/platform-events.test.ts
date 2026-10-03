@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { after, describe, it } from "node:test";
-import { platformEvents, type PlatformEvent } from "../src/services/platform-events.js";
+import {
+  PlatformEventBus,
+  platformEvents,
+  type PlatformEvent,
+  type PlatformEventTransport,
+} from "../src/services/platform-events.js";
 import { closeRedis } from "../src/services/redis.js";
 import {
   beginAgentProgress,
@@ -8,6 +13,60 @@ import {
   finishAgentProgress,
   logAgentProgress,
 } from "../src/services/space-progress.js";
+
+class MemoryFanoutBroker {
+  private readonly channels = new Map<string, Set<(message: string) => void>>();
+
+  add(channel: string, listener: (message: string) => void): () => void {
+    let listeners = this.channels.get(channel);
+    if (!listeners) this.channels.set(channel, (listeners = new Set()));
+    listeners.add(listener);
+    return () => {
+      listeners!.delete(listener);
+      if (listeners!.size === 0) this.channels.delete(channel);
+    };
+  }
+
+  publish(channel: string, message: string): void {
+    for (const listener of [...(this.channels.get(channel) ?? [])]) listener(message);
+  }
+
+  count(channel: string): number {
+    return this.channels.get(channel)?.size ?? 0;
+  }
+}
+
+class MemoryFanoutTransport implements PlatformEventTransport {
+  private readonly releases = new Set<() => void>();
+
+  constructor(private readonly broker: MemoryFanoutBroker) {}
+
+  async subscribe(channel: string, listener: (message: string) => void) {
+    const remove = this.broker.add(channel, listener);
+    this.releases.add(remove);
+    let active = true;
+    return async () => {
+      if (!active) return;
+      active = false;
+      this.releases.delete(remove);
+      remove();
+    };
+  }
+
+  async publish(channel: string, message: string): Promise<void> {
+    this.broker.publish(channel, message);
+  }
+
+  async close(): Promise<void> {
+    for (const release of this.releases) release();
+    this.releases.clear();
+  }
+}
+
+async function settleFanout(): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
 
 after(async () => {
   // 订阅会惰性建立 Redis 连接，不关会吊住测试进程
@@ -71,6 +130,91 @@ describe("platformEvents bus", () => {
 
     second();
     assert.equal(platformEvents.hasListeners("tenant-duplicate"), false);
+  });
+});
+
+describe("PlatformEventBus transport lifecycle", () => {
+  it("fans out across replicas with tenant isolation and no publisher loopback", async () => {
+    const broker = new MemoryFanoutBroker();
+    const first = new PlatformEventBus({
+      transport: new MemoryFanoutTransport(broker),
+      instanceId: "first",
+      now: () => 123,
+    });
+    const second = new PlatformEventBus({
+      transport: new MemoryFanoutTransport(broker),
+      instanceId: "second",
+      now: () => 456,
+    });
+    const local: PlatformEvent[] = [];
+    const remote: PlatformEvent[] = [];
+    const other: PlatformEvent[] = [];
+    first.subscribe("tenant", (event) => local.push(event));
+    second.subscribe("tenant", (event) => remote.push(event));
+    second.subscribe("other", (event) => other.push(event));
+    await settleFanout();
+
+    first.publish("tenant", { type: "runner_node", nodeId: "node" });
+    await settleFanout();
+
+    assert.equal(local.length, 1);
+    assert.equal(remote.length, 1);
+    assert.equal(other.length, 0);
+    assert.equal(local[0]!.ts, 123);
+    assert.equal(remote[0]!.ts, 123);
+
+    first.publishAll({ type: "runner_node", nodeId: "host-broadcast" });
+    await settleFanout();
+    assert.equal(local.length, 2);
+    assert.equal(remote.length, 2);
+    assert.equal(other.length, 1);
+    assert.equal(other[0]!.ts, 123);
+    await Promise.all([first.close(), second.close()]);
+  });
+
+  it("serializes immediate unsubscribe/reconnect without leaking or losing the new lease", async () => {
+    const broker = new MemoryFanoutBroker();
+    const publisher = new PlatformEventBus({
+      transport: new MemoryFanoutTransport(broker),
+      instanceId: "publisher",
+    });
+    const subscriber = new PlatformEventBus({
+      transport: new MemoryFanoutTransport(broker),
+      instanceId: "subscriber",
+    });
+    const received: PlatformEvent[] = [];
+
+    const releaseFirst = subscriber.subscribe("reconnect", () => {
+      throw new Error("released listener must never fire");
+    });
+    releaseFirst();
+    subscriber.subscribe("reconnect", (event) => received.push(event));
+    await settleFanout();
+
+    assert.equal(broker.count("zakura:platform:evt:reconnect"), 1);
+    publisher.publish("reconnect", { type: "runner_node", nodeId: "after-reconnect" });
+    await settleFanout();
+    assert.equal(received.length, 1);
+    await Promise.all([publisher.close(), subscriber.close()]);
+  });
+
+  it("tears down tenant and host subscriptions on close", async () => {
+    const broker = new MemoryFanoutBroker();
+    const bus = new PlatformEventBus({
+      transport: new MemoryFanoutTransport(broker),
+      instanceId: "closing",
+    });
+    bus.subscribe("a", () => undefined);
+    bus.subscribe("b", () => undefined);
+    await settleFanout();
+    assert.equal(broker.count("zakura:platform:evt:a"), 1);
+    assert.equal(broker.count("zakura:platform:evt:b"), 1);
+    assert.equal(broker.count("zakura:platform:evt:all"), 1);
+
+    await bus.close();
+    assert.equal(broker.count("zakura:platform:evt:a"), 0);
+    assert.equal(broker.count("zakura:platform:evt:b"), 0);
+    assert.equal(broker.count("zakura:platform:evt:all"), 0);
   });
 });
 

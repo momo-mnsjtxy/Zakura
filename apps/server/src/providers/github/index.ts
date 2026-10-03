@@ -1,39 +1,10 @@
-import type { InstanceHandle, ProviderPlugin } from "@zakura/core";
-import { textResult } from "@zakura/core";
-import type { McpToolDef, ProviderConfigSchema } from "@zakura/shared";
-import { eq } from "drizzle-orm";
-import { componentInstances } from "../../db/schema.js";
+import type { ProviderPlugin } from "@zakura/core";
+import type { McpToolDef } from "@zakura/shared";
 import type { AppConfig } from "../../config.js";
-import { McpUpstreamOauthService } from "../../services/mcp-upstream-oauth.js";
-import { applyOauthTokensToConfig } from "../generic-mcp.js";
+import { createOauthRestProvider, restJson } from "../oauth-rest.js";
 
 type GithubProduct = "repos" | "issues" | "pulls" | "search";
 const PRODUCTS: GithubProduct[] = ["repos", "issues", "pulls", "search"];
-
-const configSchema: ProviderConfigSchema = {
-  type: "object",
-  title: "GitHub",
-  required: ["product"],
-  properties: {
-    product: { type: "string", enum: PRODUCTS },
-    oauthAccessToken: { type: "string", format: "password" },
-    oauthRefreshToken: { type: "string", format: "password" },
-    oauthExpiresAt: { type: "number" },
-    oauthClientId: { type: "string" },
-    oauthClientSecret: { type: "string", format: "password" },
-    oauthTokenEndpoint: { type: "string" },
-    authRequired: { type: "boolean" },
-  },
-};
-
-let appConfigRef: AppConfig | null = null;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let dbRef: any = null;
-
-export function injectGithubRuntime(config: AppConfig, db: unknown): void {
-  appConfigRef = config;
-  dbRef = db;
-}
 
 export function githubBuiltinUrl(product: GithubProduct): string {
   return `zakura://github/${product}`;
@@ -46,37 +17,21 @@ export function resolveGithubProduct(value: string): GithubProduct | null {
   return matched ? (matched[1] as GithubProduct) : null;
 }
 
-function parseProduct(config: Record<string, unknown>): GithubProduct {
-  const value =
-    typeof config.product === "string"
-      ? config.product
-      : typeof config.mcpUrl === "string"
-        ? config.mcpUrl
-        : "";
-  const product = resolveGithubProduct(value);
-  if (!product) throw new Error("config.product 须为 repos | issues | pulls | search");
-  return product;
-}
-
 async function ghFetch<T>(
   token: string,
   path: string,
   init?: RequestInit & { json?: unknown },
 ): Promise<T> {
   const headers = new Headers(init?.headers);
-  headers.set("Authorization", `Bearer ${token}`);
   headers.set("Accept", "application/vnd.github+json");
   headers.set("X-GitHub-Api-Version", "2022-11-28");
-  if (init?.json !== undefined) headers.set("Content-Type", "application/json");
-  const response = await fetch(`https://api.github.com${path}`, {
+  return restJson<T>(`https://api.github.com${path}`, token, {
     ...init,
     headers,
-    body: init?.json !== undefined ? JSON.stringify(init.json) : init?.body,
-    signal: init?.signal ?? AbortSignal.timeout(60_000),
+    // GitHub's GET/search calls are safe to retry; mutation calls remain one-shot
+    // unless a future endpoint explicitly supplies an Idempotency-Key.
+    retry: { attempts: 3, baseDelayMs: 200, maxDelayMs: 2_000 },
   });
-  const text = await response.text();
-  if (!response.ok) throw new Error(`GitHub ${response.status}: ${text.slice(0, 400)}`);
-  return text ? (JSON.parse(text) as T) : ({} as T);
 }
 
 const toolDefs: Record<GithubProduct, McpToolDef[]> = {
@@ -189,90 +144,23 @@ async function callGithubTool(
   throw new Error(`Unknown GitHub tool: ${name}`);
 }
 
-async function accessToken(handle: InstanceHandle): Promise<string> {
-  let current = { ...handle.config };
-  const expiresAt = Number(current.oauthExpiresAt ?? 0);
-  if (
-    (!current.oauthAccessToken || expiresAt <= Math.floor(Date.now() / 1000) + 120) &&
-    current.oauthRefreshToken &&
-    current.oauthClientId &&
-    appConfigRef
-  ) {
-    const tokenEndpoint = String(current.oauthTokenEndpoint ?? "").trim();
-    if (!tokenEndpoint) throw new Error("GitHub OAuth 配置缺少 token endpoint");
-    const tokens = await new McpUpstreamOauthService(appConfigRef).refresh({
-      accessToken: String(current.oauthAccessToken ?? ""),
-      refreshToken: String(current.oauthRefreshToken),
-      expiresAt,
-      clientId: String(current.oauthClientId),
-      clientSecret:
-        typeof current.oauthClientSecret === "string" ? current.oauthClientSecret : undefined,
-      tokenEndpoint,
-    });
-    current = applyOauthTokensToConfig(current, tokens);
-    current.authRequired = false;
-    handle.config = current;
-    if (dbRef) {
-      const { encryptJson } = await import("@zakura/core");
-      await dbRef
-        .update(componentInstances)
-        .set({ configEnc: encryptJson(appConfigRef.secret, current), updatedAt: new Date() })
-        .where(eq(componentInstances.id, handle.id));
-    }
-  }
-  const token = String(current.oauthAccessToken ?? "").trim();
-  if (!token) throw new Error("AUTH_REQUIRED: 请先完成 GitHub OAuth 授权");
-  return token;
+const factory = createOauthRestProvider({
+  id: "github",
+  name: "GitHub",
+  description: "平台直接调用 GitHub REST API，提供仓库、Issues、PR 与搜索工具。",
+  products: PRODUCTS,
+  toolDefs,
+  callTool: (product, name, token, args) =>
+    callGithubTool(token, product as GithubProduct, name, args),
+  health: async (token) => {
+    await ghFetch(token, "/user");
+  },
+});
+
+export function injectGithubRuntime(config: AppConfig, db: unknown): void {
+  factory.injectRuntime(config, db);
 }
 
 export function createGithubProvider(): ProviderPlugin {
-  return {
-    id: "github",
-    name: "GitHub",
-    description: "平台直接调用 GitHub REST API，提供仓库、Issues、PR 与搜索工具。",
-    version: "1.0.0",
-    category: "connector",
-    capabilities: ["tools", "builtin"],
-    configSchema,
-    validateConfig(config) {
-      const product = parseProduct(config);
-      return { ...config, product, mcpUrl: githubBuiltinUrl(product) };
-    },
-    createRuntimeSpec(config) {
-      return { containers: [], endpointTemplate: githubBuiltinUrl(parseProduct(config)) };
-    },
-    async healthCheck(handle) {
-      try {
-        const token = await accessToken(handle);
-        await ghFetch(token, "/user");
-        return { status: "healthy", message: `ok (${parseProduct(handle.config)})` };
-      } catch (error) {
-        return {
-          status: "unhealthy",
-          message: error instanceof Error ? error.message : String(error),
-        };
-      }
-    },
-    async listTools(handle) {
-      return toolDefs[parseProduct(handle.config)];
-    },
-    async callTool(handle, name, args) {
-      try {
-        return textResult(
-          JSON.stringify(
-            await callGithubTool(
-              await accessToken(handle),
-              parseProduct(handle.config),
-              name,
-              args,
-            ),
-            null,
-            2,
-          ),
-        );
-      } catch (error) {
-        return textResult(error instanceof Error ? error.message : String(error), true);
-      }
-    },
-  };
+  return factory.createProvider();
 }

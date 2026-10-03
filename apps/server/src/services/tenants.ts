@@ -1,8 +1,7 @@
-import { and, asc, eq, isNull } from "drizzle-orm";
 import bcrypt from "bcryptjs";
+import { and, asc, eq, isNull } from "drizzle-orm";
 import { createHash, randomBytes } from "node:crypto";
 import type { Db } from "../db/client.js";
-import { CredentialLifecycleService } from "./identity/credential-lifecycle.js";
 import {
   newId,
   tenantInvites,
@@ -14,45 +13,64 @@ import {
   type TenantMembership,
   type User,
 } from "../db/schema.js";
+import { CredentialLifecycleService } from "./identity/credential-lifecycle.js";
+import {
+  inviteRole,
+  isTenantRole,
+  roleAtLeast,
+  strongestRole,
+  type MembershipStatus,
+  type TenantRole,
+} from "./identity/tenant-policy.js";
 
-export type TenantRole = "owner" | "admin" | "member";
-export type MembershipStatus = "active" | "suspended";
+export { isTenantAdmin } from "./identity/tenant-policy.js";
+export type { MembershipStatus, TenantRole } from "./identity/tenant-policy.js";
 
 export type TenantOnboardingSteps = {
-  /** 用户已填写称呼并写入记忆 */
   profileNamed?: boolean;
-  /** SaaS：已配置 AI 上游（可跳过） */
   aiProviderConfigured?: boolean;
-  /** 已接入至少一个上游 MCP（可跳过） */
   mcpConnected?: boolean;
-  /** 已查看 Agent MCP 接入说明 */
   connectReady?: boolean;
-  /** 已引导试用内置对话 Agent（有 AI 上游时） */
   agentTried?: boolean;
-
-  /** @deprecated 自动准备不再写入；保留兼容旧数据 */
+  /** @deprecated retained for persisted compatibility */
   agentCreated?: boolean;
-  /** @deprecated */
+  /** @deprecated retained for persisted compatibility */
   computerEnabled?: boolean;
-  /** @deprecated */
+  /** @deprecated retained for persisted compatibility */
   memoryConfigured?: boolean;
 };
 
-const ADMIN_ROLES: TenantRole[] = ["owner", "admin"];
+const ONBOARDING_KEYS = [
+  "profileNamed",
+  "aiProviderConfigured",
+  "mcpConnected",
+  "connectReady",
+  "agentTried",
+  "agentCreated",
+  "computerEnabled",
+  "memoryConfigured",
+] as const satisfies readonly (keyof TenantOnboardingSteps)[];
+
+function normalizeOnboardingSteps(input: Record<string, unknown>): TenantOnboardingSteps {
+  const result: TenantOnboardingSteps = {};
+  for (const key of ONBOARDING_KEYS) {
+    if (typeof input[key] === "boolean") result[key] = input[key];
+  }
+  return result;
+}
 
 export function parseOnboardingSteps(raw: string | null | undefined): TenantOnboardingSteps {
   try {
-    return JSON.parse(raw || "{}") as TenantOnboardingSteps;
+    const value = JSON.parse(raw || "{}") as unknown;
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? normalizeOnboardingSteps(value as Record<string, unknown>)
+      : {};
   } catch {
     return {};
   }
 }
 
-export function isTenantAdmin(role: string): boolean {
-  return ADMIN_ROLES.includes(role as TenantRole);
-}
-
-function slugify(input: string): string {
+export function slugifyTenant(input: string): string {
   return (
     input
       .toLowerCase()
@@ -66,6 +84,22 @@ function hashInviteToken(raw: string): string {
   return createHash("sha256").update(raw).digest("hex");
 }
 
+function isEmail(value: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+
+function isUniqueViolation(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const value = error as { code?: unknown; cause?: unknown };
+  if (value.code === "23505") return true;
+  return value.cause !== error && isUniqueViolation(value.cause);
+}
+
+/**
+ * Tenant aggregate boundary. Every member/invite mutation is tenant-qualified;
+ * multi-row lifecycle transitions use a transaction so tokens cannot be consumed
+ * without their resulting membership being durable.
+ */
 export class TenantService {
   constructor(private readonly db: Db) {}
 
@@ -84,55 +118,51 @@ export class TenantService {
       })
       .from(tenantMemberships)
       .innerJoin(tenants, eq(tenants.id, tenantMemberships.tenantId))
-      .where(
-        and(eq(tenantMemberships.userId, userId), eq(tenantMemberships.status, "active")),
-      )
+      .where(and(eq(tenantMemberships.userId, userId), eq(tenantMemberships.status, "active")))
       .orderBy(asc(tenants.createdAt));
 
-    return rows.map((r) => ({
-      membershipId: r.membershipId,
-      role: r.role as TenantRole,
-      status: r.status as MembershipStatus,
+    return rows.map((row) => ({
+      membershipId: row.membershipId,
+      role: row.role as TenantRole,
+      status: row.status as MembershipStatus,
       tenant: {
-        id: r.tenantId,
-        slug: r.slug,
-        name: r.name,
-        isDefault: r.isDefault,
-        onboardingCompleted: r.onboardingCompleted,
-        onboardingSteps: parseOnboardingSteps(r.onboardingSteps),
+        id: row.tenantId,
+        slug: row.slug,
+        name: row.name,
+        isDefault: row.isDefault,
+        onboardingCompleted: row.onboardingCompleted,
+        onboardingSteps: parseOnboardingSteps(row.onboardingSteps),
       },
     }));
   }
 
-  async getMembership(
-    tenantId: string,
-    userId: string,
-  ): Promise<TenantMembership | null> {
+  private async findMembership(tenantId: string, userId: string, activeOnly: boolean) {
     return (
       (await this.db.query.tenantMemberships.findFirst({
         where: and(
           eq(tenantMemberships.tenantId, tenantId),
           eq(tenantMemberships.userId, userId),
-          eq(tenantMemberships.status, "active"),
+          ...(activeOnly ? [eq(tenantMemberships.status, "active")] : []),
         ),
       })) ?? null
     );
   }
 
+  async getMembership(tenantId: string, userId: string): Promise<TenantMembership | null> {
+    return this.findMembership(tenantId, userId, true);
+  }
+
   async requireMembership(
     tenantId: string,
     userId: string,
-    minRole: "member" | "admin" | "owner" = "member",
+    minRole: TenantRole = "member",
   ): Promise<TenantMembership> {
-    const m = await this.getMembership(tenantId, userId);
-    if (!m) throw new TenantAccessError("Not a member of this tenant", 403);
-    if (minRole === "admin" && !isTenantAdmin(m.role)) {
-      throw new TenantAccessError("Admin only", 403);
+    const membership = await this.getMembership(tenantId, userId);
+    if (!membership) throw new TenantAccessError("Not a member of this tenant", 403);
+    if (!roleAtLeast(membership.role, minRole)) {
+      throw new TenantAccessError(minRole === "owner" ? "Owner only" : "Admin only", 403);
     }
-    if (minRole === "owner" && m.role !== "owner") {
-      throw new TenantAccessError("Owner only", 403);
-    }
-    return m;
+    return membership;
   }
 
   async createTenant(input: {
@@ -143,57 +173,58 @@ export class TenantService {
   }): Promise<{ tenant: Tenant; membership: TenantMembership }> {
     const name = input.name.trim();
     if (!name) throw new TenantAccessError("Tenant name required", 400);
+    const owner = await this.db.query.users.findFirst({ where: eq(users.id, input.ownerUserId) });
+    if (!owner) throw new TenantAccessError("Owner user not found", 404);
 
-    let slug = slugify(input.slug?.trim() || name);
-    for (let i = 0; i < 8; i++) {
-      const clash = await this.db.query.tenants.findFirst({
-        where: eq(tenants.slug, slug),
-      });
-      if (!clash) break;
-      slug = `${slugify(name)}-${randomBytes(2).toString("hex")}`;
+    const requestedSlug = slugifyTenant(input.slug?.trim() || name);
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const slug =
+        attempt === 0
+          ? requestedSlug
+          : `${slugifyTenant(name).slice(0, 43)}-${randomBytes(2).toString("hex")}`;
+      try {
+        return await this.db.transaction(async (tx) => {
+          const database = tx as Db;
+          const now = new Date();
+          const [tenant] = await database
+            .insert(tenants)
+            .values({
+              id: newId(),
+              slug,
+              name,
+              isDefault: input.isDefault === true,
+              onboardingCompleted: false,
+              onboardingSteps: "{}",
+              createdAt: now,
+              updatedAt: now,
+            })
+            .returning();
+          const [membership] = await database
+            .insert(tenantMemberships)
+            .values({
+              id: newId(),
+              tenantId: tenant.id,
+              userId: input.ownerUserId,
+              role: "owner",
+              status: "active",
+              createdAt: now,
+              updatedAt: now,
+            })
+            .returning();
+          return { tenant, membership };
+        });
+      } catch (error) {
+        if (!isUniqueViolation(error)) throw error;
+        if (attempt === 7) throw new TenantAccessError("Tenant slug already exists", 409);
+      }
     }
-
-    const now = new Date();
-    const [tenant] = await this.db
-      .insert(tenants)
-      .values({
-        id: newId(),
-        slug,
-        name,
-        isDefault: input.isDefault === true,
-        onboardingCompleted: false,
-        onboardingSteps: "{}",
-        createdAt: now,
-        updatedAt: now,
-      })
-      .returning();
-
-    const [membership] = await this.db
-      .insert(tenantMemberships)
-      .values({
-        id: newId(),
-        tenantId: tenant.id,
-        userId: input.ownerUserId,
-        role: "owner",
-        status: "active",
-        createdAt: now,
-        updatedAt: now,
-      })
-      .returning();
-
-    return { tenant, membership };
+    throw new TenantAccessError("Could not allocate tenant slug", 409);
   }
 
-  async updateTenant(
-    tenantId: string,
-    patch: { name?: string },
-  ): Promise<Tenant> {
+  async updateTenant(tenantId: string, patch: { name?: string }): Promise<Tenant> {
     const [row] = await this.db
       .update(tenants)
-      .set({
-        ...(patch.name?.trim() ? { name: patch.name.trim() } : {}),
-        updatedAt: new Date(),
-      })
+      .set({ ...(patch.name?.trim() ? { name: patch.name.trim() } : {}), updatedAt: new Date() })
       .where(eq(tenants.id, tenantId))
       .returning();
     if (!row) throw new TenantAccessError("Tenant not found", 404);
@@ -202,13 +233,9 @@ export class TenantService {
 
   async deleteTenant(tenantId: string, actorUserId: string) {
     await this.requireMembership(tenantId, actorUserId, "owner");
-    const tenant = await this.db.query.tenants.findFirst({
-      where: eq(tenants.id, tenantId),
-    });
+    const tenant = await this.db.query.tenants.findFirst({ where: eq(tenants.id, tenantId) });
     if (!tenant) throw new TenantAccessError("Team not found", 404);
-    if (tenant.isDefault) {
-      throw new TenantAccessError("The default team cannot be deleted", 400);
-    }
+    if (tenant.isDefault) throw new TenantAccessError("The default team cannot be deleted", 400);
     await this.db.delete(tenants).where(eq(tenants.id, tenantId));
     return { ok: true as const };
   }
@@ -228,13 +255,12 @@ export class TenantService {
       .innerJoin(users, eq(users.id, tenantMemberships.userId))
       .where(eq(tenantMemberships.tenantId, tenantId))
       .orderBy(asc(tenantMemberships.createdAt));
-
-    return rows.map((r) => ({
-      id: r.id,
-      role: r.role as TenantRole,
-      status: r.status as MembershipStatus,
-      createdAt: r.createdAt,
-      user: { id: r.userId, email: r.email, name: r.name },
+    return rows.map((row) => ({
+      id: row.id,
+      role: row.role as TenantRole,
+      status: row.status as MembershipStatus,
+      createdAt: row.createdAt,
+      user: { id: row.userId, email: row.email, name: row.name },
     }));
   }
 
@@ -244,56 +270,48 @@ export class TenantService {
     role: TenantRole,
     actorUserId: string,
   ) {
-    if (role === "owner") {
-      throw new TenantAccessError("Cannot assign owner via role update", 400);
-    }
+    if (!isTenantRole(role)) throw new TenantAccessError("Invalid member role", 400);
+    if (role === "owner") throw new TenantAccessError("Cannot assign owner via role update", 400);
     await this.requireMembership(tenantId, actorUserId, "admin");
     const target = await this.db.query.tenantMemberships.findFirst({
-      where: and(
-        eq(tenantMemberships.id, membershipId),
-        eq(tenantMemberships.tenantId, tenantId),
-      ),
+      where: and(eq(tenantMemberships.id, membershipId), eq(tenantMemberships.tenantId, tenantId)),
     });
     if (!target) throw new TenantAccessError("Member not found", 404);
-    if (target.role === "owner") {
-      throw new TenantAccessError("Cannot change owner role", 400);
-    }
+    if (target.role === "owner") throw new TenantAccessError("Cannot change owner role", 400);
     const [row] = await this.db
       .update(tenantMemberships)
       .set({ role, updatedAt: new Date() })
-      .where(eq(tenantMemberships.id, membershipId))
+      .where(and(eq(tenantMemberships.id, membershipId), eq(tenantMemberships.tenantId, tenantId)))
       .returning();
+    if (!row) throw new TenantAccessError("Member not found", 404);
     return row;
   }
 
   async removeMember(tenantId: string, membershipId: string, actorUserId: string) {
     await this.requireMembership(tenantId, actorUserId, "admin");
     const target = await this.db.query.tenantMemberships.findFirst({
-      where: and(
-        eq(tenantMemberships.id, membershipId),
-        eq(tenantMemberships.tenantId, tenantId),
-      ),
+      where: and(eq(tenantMemberships.id, membershipId), eq(tenantMemberships.tenantId, tenantId)),
     });
     if (!target) throw new TenantAccessError("Member not found", 404);
-    if (target.role === "owner") {
-      throw new TenantAccessError("Cannot remove owner", 400);
-    }
+    if (target.role === "owner") throw new TenantAccessError("Cannot remove owner", 400);
     if (target.userId === actorUserId) {
       throw new TenantAccessError("Cannot remove yourself; leave the tenant instead", 400);
     }
     await this.db
       .delete(tenantMemberships)
-      .where(eq(tenantMemberships.id, membershipId));
+      .where(and(eq(tenantMemberships.id, membershipId), eq(tenantMemberships.tenantId, tenantId)));
     return { ok: true as const };
   }
 
   async leaveTenant(tenantId: string, userId: string) {
-    const m = await this.getMembership(tenantId, userId);
-    if (!m) throw new TenantAccessError("Not a member", 404);
-    if (m.role === "owner") {
+    const membership = await this.getMembership(tenantId, userId);
+    if (!membership) throw new TenantAccessError("Not a member", 404);
+    if (membership.role === "owner") {
       throw new TenantAccessError("Owner cannot leave; transfer ownership first", 400);
     }
-    await this.db.delete(tenantMemberships).where(eq(tenantMemberships.id, m.id));
+    await this.db
+      .delete(tenantMemberships)
+      .where(and(eq(tenantMemberships.id, membership.id), eq(tenantMemberships.tenantId, tenantId)));
     return { ok: true as const };
   }
 
@@ -304,48 +322,48 @@ export class TenantService {
     invitedByUserId: string;
     ttlHours?: number;
   }): Promise<{ invite: TenantInvite; token: string }> {
-    await this.requireMembership(input.tenantId, input.invitedByUserId, "admin");
     const email = input.email.trim().toLowerCase();
-    if (!email) throw new TenantAccessError("Email required", 400);
-
-    const existingUser = await this.db.query.users.findFirst({
-      where: eq(users.email, email),
-    });
-    if (existingUser) {
-      const already = await this.getMembership(input.tenantId, existingUser.id);
-      if (already) throw new TenantAccessError("User is already a member", 400);
+    if (!isEmail(email)) throw new TenantAccessError("Valid email required", 400);
+    const ttlHours = input.ttlHours ?? 72;
+    // Non-positive lifetimes are retained for administrative immediate-expiry
+    // workflows and compatibility; only unbounded/far-future links are rejected.
+    if (!Number.isFinite(ttlHours) || ttlHours > 24 * 30) {
+      throw new TenantAccessError("Invite lifetime must not exceed 720 hours", 400);
+    }
+    await this.requireMembership(input.tenantId, input.invitedByUserId, "admin");
+    const existingUser = await this.db.query.users.findFirst({ where: eq(users.email, email) });
+    if (existingUser && (await this.findMembership(input.tenantId, existingUser.id, false))) {
+      throw new TenantAccessError("User is already a member", 400);
     }
 
     const token = `inv_${randomBytes(24).toString("base64url")}`;
-    const now = new Date();
-    const expiresAt = new Date(now.getTime() + (input.ttlHours ?? 72) * 3600 * 1000);
-
-    // Replace pending invite for same email
-    await this.db
-      .delete(tenantInvites)
-      .where(
-        and(
-          eq(tenantInvites.tenantId, input.tenantId),
-          eq(tenantInvites.email, email),
-          isNull(tenantInvites.acceptedAt),
-        ),
-      );
-
-    const [invite] = await this.db
-      .insert(tenantInvites)
-      .values({
-        id: newId(),
-        tenantId: input.tenantId,
-        email,
-        role: input.role,
-        tokenHash: hashInviteToken(token),
-        invitedByUserId: input.invitedByUserId,
-        expiresAt,
-        createdAt: now,
-      })
-      .returning();
-
-    return { invite, token };
+    return this.db.transaction(async (tx) => {
+      const database = tx as Db;
+      const now = new Date();
+      await database
+        .delete(tenantInvites)
+        .where(
+          and(
+            eq(tenantInvites.tenantId, input.tenantId),
+            eq(tenantInvites.email, email),
+            isNull(tenantInvites.acceptedAt),
+          ),
+        );
+      const [invite] = await database
+        .insert(tenantInvites)
+        .values({
+          id: newId(),
+          tenantId: input.tenantId,
+          email,
+          role: inviteRole(input.role),
+          tokenHash: hashInviteToken(token),
+          invitedByUserId: input.invitedByUserId,
+          expiresAt: new Date(now.getTime() + ttlHours * 3_600_000),
+          createdAt: now,
+        })
+        .returning();
+      return { invite, token };
+    });
   }
 
   async listInvites(tenantId: string) {
@@ -357,14 +375,11 @@ export class TenantService {
   }
 
   async getInviteByToken(rawToken: string) {
-    const hash = hashInviteToken(rawToken);
     const invite = await this.db.query.tenantInvites.findFirst({
-      where: eq(tenantInvites.tokenHash, hash),
+      where: eq(tenantInvites.tokenHash, hashInviteToken(rawToken)),
     });
     if (!invite) return null;
-    const tenant = await this.db.query.tenants.findFirst({
-      where: eq(tenants.id, invite.tenantId),
-    });
+    const tenant = await this.db.query.tenants.findFirst({ where: eq(tenants.id, invite.tenantId) });
     return { invite, tenant };
   }
 
@@ -376,94 +391,109 @@ export class TenantService {
     name?: string;
   }): Promise<{ user: User; tenant: Tenant; membership: TenantMembership }> {
     const found = await this.getInviteByToken(input.token);
-    if (!found?.invite || !found.tenant) {
-      throw new TenantAccessError("Invalid invite", 404);
-    }
-    const { invite, tenant } = found;
-    if (invite.acceptedAt) throw new TenantAccessError("Invite already used", 400);
-    if (invite.expiresAt < new Date()) throw new TenantAccessError("Invite expired", 400);
-    if (tenant.suspendedAt) throw new TenantAccessError("该团队已被封禁", 403);
+    if (!found?.invite || !found.tenant) throw new TenantAccessError("Invalid invite", 404);
+    if (found.invite.acceptedAt) throw new TenantAccessError("Invite already used", 400);
+    if (found.invite.expiresAt <= new Date()) throw new TenantAccessError("Invite expired", 400);
+    if (found.tenant.suspendedAt) throw new TenantAccessError("该团队已被封禁", 403);
 
     let user: User | undefined;
+    let passwordHash: string | undefined;
     if (input.userId) {
       user = await this.db.query.users.findFirst({ where: eq(users.id, input.userId) });
       if (!user) throw new TenantAccessError("User not found", 404);
-      if (user.email.toLowerCase() !== invite.email.toLowerCase()) {
+      if (user.email.toLowerCase() !== found.invite.email.toLowerCase()) {
         throw new TenantAccessError("Invite email does not match signed-in user", 403);
       }
     } else {
-      const email = (input.email ?? invite.email).trim().toLowerCase();
-      if (email !== invite.email.toLowerCase()) {
+      const email = (input.email ?? found.invite.email).trim().toLowerCase();
+      if (email !== found.invite.email.toLowerCase()) {
         throw new TenantAccessError("Email must match invite", 400);
       }
       user = await this.db.query.users.findFirst({ where: eq(users.email, email) });
       if (!user) {
         if (!input.password || input.password.length < 8) {
           throw new TenantAccessError("Password required (min 8 chars) to create account", 400);
-        }        const now = new Date();
-        const [created] = await this.db
+        }
+        passwordHash = await bcrypt.hash(input.password, 10);
+      } else if (input.password) {
+        if (!user.passwordHash || !(await bcrypt.compare(input.password, user.passwordHash))) {
+          throw new TenantAccessError("Invalid credentials", 401);
+        }
+      }
+    }
+    if (user?.suspendedAt) throw new TenantAccessError("账号已被封禁", 403);
+
+    return this.db.transaction(async (tx) => {
+      const database = tx as Db;
+      if (!(await new CredentialLifecycleService(database).claimInvite(found.invite.id))) {
+        throw new TenantAccessError("Invite already used", 400);
+      }
+      const tenant = await database.query.tenants.findFirst({ where: eq(tenants.id, found.tenant.id) });
+      if (!tenant) throw new TenantAccessError("Invalid invite", 404);
+      if (tenant.suspendedAt) throw new TenantAccessError("该团队已被封禁", 403);
+
+      const now = new Date();
+      let claimedUser = user;
+      if (!claimedUser) {
+        const [created] = await database
           .insert(users)
           .values({
             id: newId(),
-            email,
-            name: input.name?.trim() || email.split("@")[0],
-            passwordHash: await bcrypt.hash(input.password, 10),
+            email: found.invite.email,
+            name: input.name?.trim() || found.invite.email.split("@")[0],
+            passwordHash: passwordHash!,
             isPlatformAdmin: false,
             createdAt: now,
             updatedAt: now,
           })
           .returning();
-        user = created;
-      } else if (input.password) {
-        if (!user.passwordHash) {
-          throw new TenantAccessError("Invalid credentials", 401);
-        }
-        const ok = await bcrypt.compare(input.password, user.passwordHash);
-        if (!ok) throw new TenantAccessError("Invalid credentials", 401);
+        claimedUser = created;
       }
-    }
 
-    if (user.suspendedAt) throw new TenantAccessError("账号已被封禁", 403);
-
-    // Claim only after identity and suspension checks; the conditional update is the
-    // concurrency boundary, so exactly one redemption can create/activate membership.
-    if (!(await new CredentialLifecycleService(this.db).claimInvite(invite.id))) {
-      throw new TenantAccessError("Invite already used", 400);
-    }
-    const existing = await this.getMembership(tenant.id, user.id);
-    if (existing) {
-      return { user, tenant, membership: existing };
-    }
-
-    const now = new Date();
-    const [membership] = await this.db
-      .insert(tenantMemberships)
-      .values({
-        id: newId(),
-        tenantId: tenant.id,
-        userId: user.id,
-        role: invite.role === "admin" ? "admin" : "member",
-        status: "active",
-        createdAt: now,
-        updatedAt: now,
-      })
-      .returning();
-
-    return { user, tenant, membership };
+      const existing = await new TenantService(database).findMembership(tenant.id, claimedUser.id, false);
+      let membership: TenantMembership;
+      if (existing) {
+        const [updated] = await database
+          .update(tenantMemberships)
+          .set({
+            role: strongestRole(existing.role, found.invite.role),
+            status: "active",
+            updatedAt: now,
+          })
+          .where(and(eq(tenantMemberships.id, existing.id), eq(tenantMemberships.tenantId, tenant.id)))
+          .returning();
+        membership = updated;
+      } else {
+        const [created] = await database
+          .insert(tenantMemberships)
+          .values({
+            id: newId(),
+            tenantId: tenant.id,
+            userId: claimedUser.id,
+            role: inviteRole(found.invite.role),
+            status: "active",
+            createdAt: now,
+            updatedAt: now,
+          })
+          .returning();
+        membership = created;
+      }
+      return { user: claimedUser, tenant, membership };
+    });
   }
 
   async revokeInvite(tenantId: string, inviteId: string, actorUserId: string) {
     await this.requireMembership(tenantId, actorUserId, "admin");
-    await this.db
+    const deleted = await this.db
       .delete(tenantInvites)
-      .where(and(eq(tenantInvites.id, inviteId), eq(tenantInvites.tenantId, tenantId)));
+      .where(and(eq(tenantInvites.id, inviteId), eq(tenantInvites.tenantId, tenantId)))
+      .returning({ id: tenantInvites.id });
+    if (!deleted.length) throw new TenantAccessError("Invite not found", 404);
     return { ok: true as const };
   }
 
   async getOnboarding(tenantId: string) {
-    const tenant = await this.db.query.tenants.findFirst({
-      where: eq(tenants.id, tenantId),
-    });
+    const tenant = await this.db.query.tenants.findFirst({ where: eq(tenants.id, tenantId) });
     if (!tenant) throw new TenantAccessError("Tenant not found", 404);
     return {
       completed: tenant.onboardingCompleted,
@@ -475,34 +505,22 @@ export class TenantService {
     tenantId: string,
     patch: { steps?: TenantOnboardingSteps; complete?: boolean },
   ) {
-    const tenant = await this.db.query.tenants.findFirst({
-      where: eq(tenants.id, tenantId),
-    });
+    const tenant = await this.db.query.tenants.findFirst({ where: eq(tenants.id, tenantId) });
     if (!tenant) throw new TenantAccessError("Tenant not found", 404);
-    const current = parseOnboardingSteps(tenant.onboardingSteps);
-    const next = { ...current, ...(patch.steps ?? {}) };
+    const steps = {
+      ...parseOnboardingSteps(tenant.onboardingSteps),
+      ...normalizeOnboardingSteps((patch.steps ?? {}) as Record<string, unknown>),
+    };
     const completed =
-      patch.complete === true
-        ? true
-        : patch.complete === false
-          ? false
-          : tenant.onboardingCompleted;
+      typeof patch.complete === "boolean" ? patch.complete : tenant.onboardingCompleted;
     const [row] = await this.db
       .update(tenants)
-      .set({
-        onboardingSteps: JSON.stringify(next),
-        onboardingCompleted: completed,
-        updatedAt: new Date(),
-      })
+      .set({ onboardingSteps: JSON.stringify(steps), onboardingCompleted: completed, updatedAt: new Date() })
       .where(eq(tenants.id, tenantId))
       .returning();
-    return {
-      completed: row.onboardingCompleted,
-      steps: parseOnboardingSteps(row.onboardingSteps),
-    };
+    return { completed: row.onboardingCompleted, steps: parseOnboardingSteps(row.onboardingSteps) };
   }
 
-  /** Platform admin: list all tenants */
   async listAll() {
     return this.db.select().from(tenants).orderBy(asc(tenants.createdAt));
   }

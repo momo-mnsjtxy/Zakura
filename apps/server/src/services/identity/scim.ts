@@ -1,14 +1,15 @@
-import { and, eq, isNull } from "drizzle-orm";
-import bcrypt from "bcryptjs";
+import { and, asc, eq, isNull, sql } from "drizzle-orm";
 import type { Db } from "../../db/client.js";
 import {
   newId,
   scimUserMappings,
   tenantMemberships,
   tenantScimTokens,
+  tenants,
   users,
 } from "../../db/schema.js";
 import { hashToken, newSecretToken, parseJsonObject } from "./util.js";
+import { inviteRole } from "./tenant-policy.js";
 
 const USER_SCHEMA = "urn:ietf:params:scim:schemas:core:2.0:User";
 const GROUP_SCHEMA = "urn:ietf:params:scim:schemas:core:2.0:Group";
@@ -42,8 +43,20 @@ export async function authenticateScim(db: Db, bearer: string | null) {
     where: and(eq(tenantScimTokens.tokenHash, tokenHash), isNull(tenantScimTokens.revokedAt)),
   });
   if (!row) throw new ScimError("Unauthorized", 401);
+  const tenant = await db.query.tenants.findFirst({ where: eq(tenants.id, row.tenantId) });
+  if (!tenant || tenant.suspendedAt) throw new ScimError("Tenant unavailable", 403);
   await db.update(tenantScimTokens).set({ lastUsedAt: new Date() }).where(eq(tenantScimTokens.id, row.id));
   return row;
+}
+
+export function normalizeGroupRoleMap(input: Record<string, unknown>): Record<string, "admin" | "member"> {
+  const normalized: Record<string, "admin" | "member"> = {};
+  for (const [rawName, rawRole] of Object.entries(input)) {
+    const name = rawName.trim();
+    if (!name || name.length > 120) continue;
+    normalized[name] = inviteRole(rawRole);
+  }
+  return normalized;
 }
 
 export async function listScimTokens(db: Db, tenantId: string) {
@@ -66,6 +79,7 @@ export async function createScimToken(
   input?: { name?: string; groupRoleMap?: Record<string, string> },
 ) {
   const raw = newSecretToken("scim");
+  const groupRoleMap = normalizeGroupRoleMap(input?.groupRoleMap ?? { Admins: "admin" });
   const [row] = await db
     .insert(tenantScimTokens)
     .values({
@@ -74,7 +88,7 @@ export async function createScimToken(
       name: input?.name?.trim() || "SCIM",
       tokenHash: hashToken(raw),
       tokenPrefix: raw.slice(0, 12),
-      groupRoleMap: JSON.stringify(input?.groupRoleMap ?? { Admins: "admin" }),
+      groupRoleMap: JSON.stringify(groupRoleMap),
       createdAt: new Date(),
     })
     .returning();
@@ -82,10 +96,18 @@ export async function createScimToken(
 }
 
 export async function revokeScimToken(db: Db, tenantId: string, tokenId: string) {
-  await db
+  const rows = await db
     .update(tenantScimTokens)
     .set({ revokedAt: new Date() })
-    .where(and(eq(tenantScimTokens.id, tokenId), eq(tenantScimTokens.tenantId, tenantId)));
+    .where(
+      and(
+        eq(tenantScimTokens.id, tokenId),
+        eq(tenantScimTokens.tenantId, tenantId),
+        isNull(tenantScimTokens.revokedAt),
+      ),
+    )
+    .returning({ id: tenantScimTokens.id });
+  if (!rows.length) throw new ScimError("SCIM token not found", 404);
 }
 
 export async function patchScimTokenMap(
@@ -94,10 +116,18 @@ export async function patchScimTokenMap(
   tokenId: string,
   groupRoleMap: Record<string, string>,
 ) {
-  await db
+  const rows = await db
     .update(tenantScimTokens)
-    .set({ groupRoleMap: JSON.stringify(groupRoleMap) })
-    .where(and(eq(tenantScimTokens.id, tokenId), eq(tenantScimTokens.tenantId, tenantId)));
+    .set({ groupRoleMap: JSON.stringify(normalizeGroupRoleMap(groupRoleMap)) })
+    .where(
+      and(
+        eq(tenantScimTokens.id, tokenId),
+        eq(tenantScimTokens.tenantId, tenantId),
+        isNull(tenantScimTokens.revokedAt),
+      ),
+    )
+    .returning({ id: tenantScimTokens.id });
+  if (!rows.length) throw new ScimError("SCIM token not found", 404);
 }
 
 type ScimUser = {
@@ -168,36 +198,60 @@ export async function scimListUsers(
   query: { filter?: string; startIndex?: number; count?: number },
 ) {
   const parsed = parseScimFilter(query.filter);
-  const startIndex = Math.max(query.startIndex ?? 1, 1);
-  const count = Math.min(Math.max(query.count ?? 100, 1), 200);
-  const mappings = await db.query.scimUserMappings.findMany({
-    where: eq(scimUserMappings.tenantId, tenantId),
-  });
-  const resources: ScimUser[] = [];
-  for (const mapping of mappings) {
-    const user = await db.query.users.findFirst({ where: eq(users.id, mapping.userId) });
-    if (!user) continue;
-    if (parsed.email && user.email !== parsed.email) continue;
-    const membership = await db.query.tenantMemberships.findFirst({
-      where: and(eq(tenantMemberships.tenantId, tenantId), eq(tenantMemberships.userId, user.id)),
-    });
-    resources.push(
-      toScimUser({
-        mappingId: mapping.id,
-        externalId: mapping.externalId,
-        email: user.email,
-        name: user.name,
-        active: membership?.status === "active" && !user.suspendedAt,
-      }),
-    );
-  }
-  const slice = resources.slice(startIndex - 1, startIndex - 1 + count);
+  const requestedStart = Number(query.startIndex ?? 1);
+  const requestedCount = Number(query.count ?? 100);
+  const startIndex = Number.isFinite(requestedStart) ? Math.max(Math.floor(requestedStart), 1) : 1;
+  const count = Number.isFinite(requestedCount)
+    ? Math.min(Math.max(Math.floor(requestedCount), 1), 200)
+    : 100;
+  const where = and(
+    eq(scimUserMappings.tenantId, tenantId),
+    ...(parsed.email ? [eq(users.email, parsed.email)] : []),
+  );
+  const [[total], rows] = await Promise.all([
+    db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(scimUserMappings)
+      .innerJoin(users, eq(users.id, scimUserMappings.userId))
+      .where(where),
+    db
+      .select({
+        mappingId: scimUserMappings.id,
+        externalId: scimUserMappings.externalId,
+        email: users.email,
+        name: users.name,
+        userSuspendedAt: users.suspendedAt,
+        membershipStatus: tenantMemberships.status,
+      })
+      .from(scimUserMappings)
+      .innerJoin(users, eq(users.id, scimUserMappings.userId))
+      .leftJoin(
+        tenantMemberships,
+        and(
+          eq(tenantMemberships.tenantId, tenantId),
+          eq(tenantMemberships.userId, users.id),
+        ),
+      )
+      .where(where)
+      .orderBy(asc(scimUserMappings.createdAt), asc(scimUserMappings.id))
+      .limit(count)
+      .offset(startIndex - 1),
+  ]);
+  const resources = rows.map((row) =>
+    toScimUser({
+      mappingId: row.mappingId,
+      externalId: row.externalId,
+      email: row.email,
+      name: row.name,
+      active: row.membershipStatus === "active" && !row.userSuspendedAt,
+    }),
+  );
   return {
     schemas: [LIST_SCHEMA],
-    totalResults: resources.length,
+    totalResults: Number(total?.count ?? 0),
     startIndex,
-    itemsPerPage: slice.length,
-    Resources: slice,
+    itemsPerPage: resources.length,
+    Resources: resources,
   };
 }
 
@@ -223,73 +277,111 @@ export function readScimUserPayload(body: Record<string, unknown>) {
 
 export async function scimCreateUser(db: Db, tenantId: string, body: Record<string, unknown>, defaultRole = "member") {
   const payload = readScimUserPayload(body);
-  const existingMap = await db.query.scimUserMappings.findFirst({
-    where: and(eq(scimUserMappings.tenantId, tenantId), eq(scimUserMappings.externalId, payload.externalId)),
-  });
-  if (existingMap) throw new ScimError("User already exists", 409, "uniqueness");
+  try {
+    return await db.transaction(async (tx) => {
+      const database = tx as Db;
+      const existingMap = await database.query.scimUserMappings.findFirst({
+        where: and(
+          eq(scimUserMappings.tenantId, tenantId),
+          eq(scimUserMappings.externalId, payload.externalId),
+        ),
+      });
+      if (existingMap) throw new ScimError("User already exists", 409, "uniqueness");
 
-  let user = await db.query.users.findFirst({ where: eq(users.email, payload.email) });
-  const now = new Date();
-  if (!user) {
-    const [created] = await db
-      .insert(users)
-      .values({
-        id: newId(),
-        email: payload.email,
-        name: payload.name,
-        passwordHash: await bcrypt.hash(newSecretToken("tmp", 18), 10),
-        emailVerifiedAt: now,
-        createdAt: now,
-        updatedAt: now,
-      })
-      .returning();
-    user = created;
+      const now = new Date();
+      let user = await database.query.users.findFirst({ where: eq(users.email, payload.email) });
+      if (!user) {
+        const [created] = await database
+          .insert(users)
+          .values({
+            id: newId(),
+            email: payload.email,
+            name: payload.name,
+            // Provisioned identities have no password until an explicit reset flow.
+            passwordHash: null,
+            emailVerifiedAt: now,
+            createdAt: now,
+            updatedAt: now,
+          })
+          .returning();
+        user = created;
+      }
+
+      const existingUserMap = await database.query.scimUserMappings.findFirst({
+        where: and(
+          eq(scimUserMappings.tenantId, tenantId),
+          eq(scimUserMappings.userId, user.id),
+        ),
+      });
+      if (existingUserMap) {
+        throw new ScimError("User already provisioned with another externalId", 409, "uniqueness");
+      }
+
+      let membership = await database.query.tenantMemberships.findFirst({
+        where: and(eq(tenantMemberships.tenantId, tenantId), eq(tenantMemberships.userId, user.id)),
+      });
+      if (membership?.role === "owner" && !payload.active) {
+        throw new ScimError("SCIM cannot deactivate a tenant owner", 409, "mutability");
+      }
+      if (!membership) {
+        [membership] = await database
+          .insert(tenantMemberships)
+          .values({
+            id: newId(),
+            tenantId,
+            userId: user.id,
+            role: inviteRole(defaultRole),
+            status: membershipStatusFromScimActive(payload.active),
+            createdAt: now,
+            updatedAt: now,
+          })
+          .returning();
+      } else if (membership.status !== membershipStatusFromScimActive(payload.active)) {
+        [membership] = await database
+          .update(tenantMemberships)
+          .set({ status: membershipStatusFromScimActive(payload.active), updatedAt: now })
+          .where(
+            and(
+              eq(tenantMemberships.id, membership.id),
+              eq(tenantMemberships.tenantId, tenantId),
+            ),
+          )
+          .returning();
+      }
+
+      const [mapping] = await database
+        .insert(scimUserMappings)
+        .values({
+          id: newId(),
+          tenantId,
+          userId: user.id,
+          externalId: payload.externalId,
+          createdAt: now,
+        })
+        .returning();
+      return toScimUser({
+        mappingId: mapping.id,
+        externalId: mapping.externalId,
+        email: user.email,
+        name: user.name,
+        active: membership.status === "active" && !user.suspendedAt,
+      });
+    });
+  } catch (error) {
+    if (error instanceof ScimError) throw error;
+    if (isUniqueViolation(error)) {
+      throw new ScimError("User already exists", 409, "uniqueness");
+    }
+    throw error;
   }
-  let membership = await db.query.tenantMemberships.findFirst({
-    where: and(eq(tenantMemberships.tenantId, tenantId), eq(tenantMemberships.userId, user.id)),
-  });
-  if (!membership) {
-    const [created] = await db
-      .insert(tenantMemberships)
-      .values({
-        id: newId(),
-        tenantId,
-        userId: user.id,
-        role: defaultRole === "admin" ? "admin" : "member",
-        status: membershipStatusFromScimActive(payload.active),
-        createdAt: now,
-        updatedAt: now,
-      })
-      .returning();
-    membership = created;
-  } else if (!payload.active && membership.status === "active") {
-    await db
-      .update(tenantMemberships)
-      .set({ status: membershipStatusFromScimActive(false), updatedAt: now })
-      .where(eq(tenantMemberships.id, membership.id));
-  }
-  const [mapping] = await db
-    .insert(scimUserMappings)
-    .values({
-      id: newId(),
-      tenantId,
-      userId: user.id,
-      externalId: payload.externalId,
-      createdAt: now,
-    })
-    .returning();
-  return toScimUser({
-    mappingId: mapping.id,
-    externalId: mapping.externalId,
-    email: user.email,
-    name: user.name,
-    active: payload.active,
-  });
 }
 
 export async function scimReplaceUser(db: Db, tenantId: string, id: string, body: Record<string, unknown>) {
   const { mapping, user, membership } = await loadMappedUser(db, tenantId, id);
   const payload = readScimUserPayload(body);
+  if (membership?.role === "owner" && !payload.active) {
+    throw new ScimError("SCIM cannot deactivate a tenant owner", 409, "mutability");
+  }
   await db
     .update(users)
     .set({ name: payload.name, email: payload.email, updatedAt: new Date() })
@@ -323,8 +415,9 @@ export async function scimPatchUser(db: Db, tenantId: string, id: string, body: 
   let name = user.name;
   let email = user.email;
   for (const op of ops) {
+    const operation = (op.op ?? "replace").toLowerCase();
     const path = (op.path ?? "").toLowerCase();
-    if ((op.op ?? "").toLowerCase() === "replace" && (path === "active" || !path)) {
+    if ((operation === "replace" || operation === "add") && (path === "active" || !path)) {
       if (path === "active") active = Boolean(op.value);
       else if (op.value && typeof op.value === "object") {
         const value = op.value as Record<string, unknown>;
@@ -332,7 +425,15 @@ export async function scimPatchUser(db: Db, tenantId: string, id: string, body: 
         if (typeof value.displayName === "string") name = value.displayName;
         if (typeof value.userName === "string") email = value.userName.toLowerCase();
       }
+    } else if ((operation === "replace" || operation === "add") && path === "displayname") {
+      name = typeof op.value === "string" ? op.value : name;
+    } else if ((operation === "replace" || operation === "add") && path === "username") {
+      email = typeof op.value === "string" ? op.value.trim().toLowerCase() : email;
     }
+  }
+  if (!email.includes("@")) throw new ScimError("Valid userName required", 400, "invalidValue");
+  if (membership?.role === "owner" && !active) {
+    throw new ScimError("SCIM cannot deactivate a tenant owner", 409, "mutability");
   }
   await db.update(users).set({ name, email, updatedAt: new Date() }).where(eq(users.id, user.id));
   if (membership) {
@@ -353,11 +454,21 @@ export async function scimPatchUser(db: Db, tenantId: string, id: string, body: 
 export async function scimDeleteUser(db: Db, tenantId: string, id: string) {
   const { membership } = await loadMappedUser(db, tenantId, id);
   if (membership) {
+    if (membership.role === "owner") {
+      throw new ScimError("SCIM cannot deactivate a tenant owner", 409, "mutability");
+    }
     await db
       .update(tenantMemberships)
       .set({ status: membershipStatusFromScimActive(false), updatedAt: new Date() })
-      .where(eq(tenantMemberships.id, membership.id));
+      .where(and(eq(tenantMemberships.id, membership.id), eq(tenantMemberships.tenantId, tenantId)));
   }
+}
+
+function isUniqueViolation(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const value = error as { code?: unknown; cause?: unknown };
+  if (value.code === "23505") return true;
+  return value.cause !== error && isUniqueViolation(value.cause);
 }
 
 function groupId(name: string): string {
@@ -365,7 +476,7 @@ function groupId(name: string): string {
 }
 
 export function listScimGroups(groupRoleMap: Record<string, unknown>) {
-  const resources = Object.keys(groupRoleMap).map((displayName) => ({
+  const resources = Object.keys(normalizeGroupRoleMap(groupRoleMap)).map((displayName) => ({
     schemas: [GROUP_SCHEMA],
     id: groupId(displayName),
     displayName,
@@ -387,26 +498,91 @@ export async function scimPatchGroup(
   groupRoleMap: Record<string, unknown>,
   body: Record<string, unknown>,
 ) {
-  const entry = Object.entries(groupRoleMap).find(([name]) => groupId(name) === id);
+  const normalizedMap = normalizeGroupRoleMap(groupRoleMap);
+  const entry = Object.entries(normalizedMap).find(([name]) => groupId(name) === id);
   if (!entry) throw new ScimError("Group not found", 404);
-  const role = entry[1] === "admin" ? "admin" : "member";
+  const role = entry[1];
   const ops = (body.Operations ?? body.operations) as Array<{ op?: string; path?: string; value?: unknown }> | undefined;
-  const members: Array<{ value?: string }> = [];
-  for (const op of ops ?? []) {
-    if ((op.path ?? "").toLowerCase() === "members" && Array.isArray(op.value)) {
-      members.push(...(op.value as Array<{ value?: string }>));
+  if (!Array.isArray(ops)) throw new ScimError("Operations required", 400, "invalidSyntax");
+
+  const mappingIds = new Set<string>();
+  for (const op of ops) {
+    const operation = (op.op ?? "replace").toLowerCase();
+    const path = (op.path ?? "").toLowerCase();
+    const values = Array.isArray(op.value)
+      ? (op.value as Array<{ value?: string }>).map((value) => value.value).filter(Boolean) as string[]
+      : [];
+    const pathValue = /members\s*\[\s*value\s+eq\s+"([^"]+)"\s*\]/i.exec(path)?.[1];
+    if (pathValue) values.push(pathValue);
+    if (path !== "members" && !pathValue) continue;
+
+    if (operation === "replace" && role === "admin") {
+      const mappedUsers = await db
+        .select({ userId: scimUserMappings.userId, mappingId: scimUserMappings.id })
+        .from(scimUserMappings)
+        .where(eq(scimUserMappings.tenantId, tenantId));
+      const retained = new Set(values);
+      const demoteUserIds = mappedUsers
+        .filter((mapping) => !retained.has(mapping.mappingId))
+        .map((mapping) => mapping.userId);
+      for (const userId of demoteUserIds) {
+        await db
+          .update(tenantMemberships)
+          .set({ role: "member", updatedAt: new Date() })
+          .where(
+            and(
+              eq(tenantMemberships.tenantId, tenantId),
+              eq(tenantMemberships.userId, userId),
+              eq(tenantMemberships.role, "admin"),
+            ),
+          );
+      }
     }
+
+    if (operation === "remove") {
+      if (role === "admin") {
+        for (const mappingId of values) {
+          const mapping = await db.query.scimUserMappings.findFirst({
+            where: and(
+              eq(scimUserMappings.tenantId, tenantId),
+              eq(scimUserMappings.id, mappingId),
+            ),
+          });
+          if (mapping) {
+            await db
+              .update(tenantMemberships)
+              .set({ role: "member", updatedAt: new Date() })
+              .where(
+                and(
+                  eq(tenantMemberships.tenantId, tenantId),
+                  eq(tenantMemberships.userId, mapping.userId),
+                  eq(tenantMemberships.role, "admin"),
+                ),
+              );
+          }
+        }
+      }
+      continue;
+    }
+    values.forEach((value) => mappingIds.add(value));
   }
-  for (const member of members) {
-    if (!member.value) continue;
+
+  for (const mappingId of mappingIds) {
     const mapping = await db.query.scimUserMappings.findFirst({
-      where: and(eq(scimUserMappings.tenantId, tenantId), eq(scimUserMappings.id, member.value)),
+      where: and(eq(scimUserMappings.tenantId, tenantId), eq(scimUserMappings.id, mappingId)),
     });
     if (!mapping) continue;
     await db
       .update(tenantMemberships)
       .set({ role, updatedAt: new Date() })
-      .where(and(eq(tenantMemberships.tenantId, tenantId), eq(tenantMemberships.userId, mapping.userId)));
+      .where(
+        and(
+          eq(tenantMemberships.tenantId, tenantId),
+          eq(tenantMemberships.userId, mapping.userId),
+          // Directory group sync never changes the protected owner role.
+          sql`${tenantMemberships.role} <> 'owner'`,
+        ),
+      );
   }
   return { schemas: [GROUP_SCHEMA], id, displayName: entry[0], meta: { resourceType: "Group" } };
 }

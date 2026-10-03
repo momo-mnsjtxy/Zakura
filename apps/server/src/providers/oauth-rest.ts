@@ -11,6 +11,11 @@ import type { AppConfig } from "../config.js";
 import { McpUpstreamOauthService } from "../services/mcp-upstream-oauth.js";
 import { applyOauthTokensToConfig } from "./generic-mcp.js";
 import { readInstanceToken } from "./credential-config.js";
+import {
+  connectorJson,
+  type ConnectorAuthScheme,
+  type ConnectorRequestInit,
+} from "./connector-http.js";
 
 export type OauthRestCallTool = (
   product: string,
@@ -36,6 +41,7 @@ type RuntimeSlot = { config: AppConfig | null; db: unknown };
 export function createOauthRestProvider(spec: OauthRestProviderSpec) {
   const runtime: RuntimeSlot = { config: null, db: null };
   const productSet = new Set(spec.products);
+  const refreshes = new Map<string, Promise<Record<string, unknown>>>();
 
   function builtinUrl(product: string): string {
     return `zakura://${spec.id}/${product}`;
@@ -79,8 +85,48 @@ export function createOauthRestProvider(spec: OauthRestProviderSpec) {
     },
   };
 
+  async function refreshAndPersist(
+    handle: InstanceHandle,
+    current: Record<string, unknown>,
+    appConfig: AppConfig,
+  ): Promise<Record<string, unknown>> {
+    const existing = refreshes.get(handle.id);
+    if (existing) return existing;
+    const operation = (async () => {
+      const tokenEndpoint = String(current.oauthTokenEndpoint ?? "").trim();
+      if (!tokenEndpoint) throw new Error(`${spec.name} OAuth 配置缺少 token endpoint`);
+      const tokens = await new McpUpstreamOauthService(appConfig).refresh({
+        accessToken: String(current.oauthAccessToken ?? ""),
+        refreshToken: String(current.oauthRefreshToken),
+        expiresAt: Number(current.oauthExpiresAt ?? 0),
+        clientId: String(current.oauthClientId),
+        clientSecret:
+          typeof current.oauthClientSecret === "string" ? current.oauthClientSecret : undefined,
+        tokenEndpoint,
+      });
+      const next = applyOauthTokensToConfig(current, tokens);
+      next.authRequired = false;
+      if (runtime.db) {
+        const { encryptJson } = await import("@zakura/core");
+        // Persist before publishing the refreshed value to concurrent tool calls. A
+        // failed write therefore cannot create an in-memory-only credential state.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        await (runtime.db as any)
+          .update(componentInstances)
+          .set({ configEnc: encryptJson(appConfig.secret, next), updatedAt: new Date() })
+          .where(eq(componentInstances.id, handle.id));
+      }
+      handle.config = next;
+      return next;
+    })().finally(() => {
+      if (refreshes.get(handle.id) === operation) refreshes.delete(handle.id);
+    });
+    refreshes.set(handle.id, operation);
+    return operation;
+  }
+
   async function accessToken(handle: InstanceHandle): Promise<string> {
-    let current = { ...handle.config };
+    let current: Record<string, unknown> = { ...handle.config };
     const expiresAt = Number(current.oauthExpiresAt ?? 0);
     const appConfig = runtime.config;
     if (
@@ -89,28 +135,7 @@ export function createOauthRestProvider(spec: OauthRestProviderSpec) {
       current.oauthClientId &&
       appConfig
     ) {
-      const tokenEndpoint = String(current.oauthTokenEndpoint ?? "").trim();
-      if (!tokenEndpoint) throw new Error(`${spec.name} OAuth 配置缺少 token endpoint`);
-      const tokens = await new McpUpstreamOauthService(appConfig).refresh({
-        accessToken: String(current.oauthAccessToken ?? ""),
-        refreshToken: String(current.oauthRefreshToken),
-        expiresAt,
-        clientId: String(current.oauthClientId),
-        clientSecret:
-          typeof current.oauthClientSecret === "string" ? current.oauthClientSecret : undefined,
-        tokenEndpoint,
-      });
-      current = applyOauthTokensToConfig(current, tokens);
-      current.authRequired = false;
-      handle.config = current;
-      if (runtime.db) {
-        const { encryptJson } = await import("@zakura/core");
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        await (runtime.db as any)
-          .update(componentInstances)
-          .set({ configEnc: encryptJson(appConfig.secret, current), updatedAt: new Date() })
-          .where(eq(componentInstances.id, handle.id));
-      }
+      current = await refreshAndPersist(handle, current, appConfig);
     }
     const token = readInstanceToken(current);
     if (!token) throw new Error(`AUTH_REQUIRED: 请先完成 ${spec.name} OAuth 授权`);
@@ -171,23 +196,15 @@ export function createOauthRestProvider(spec: OauthRestProviderSpec) {
 export async function restJson<T>(
   url: string,
   token: string,
-  init?: RequestInit & { json?: unknown; authScheme?: "bearer" | "token" | "private-token" },
+  init?: RequestInit & {
+    json?: unknown;
+    authScheme?: ConnectorAuthScheme;
+    timeoutMs?: number;
+    retry?: ConnectorRequestInit["retry"];
+    dedupe?: boolean;
+  },
 ): Promise<T> {
-  const headers = new Headers(init?.headers);
-  const scheme = init?.authScheme ?? "bearer";
-  if (scheme === "private-token") headers.set("PRIVATE-TOKEN", token);
-  else if (scheme === "token") headers.set("Authorization", `Token ${token}`);
-  else headers.set("Authorization", `Bearer ${token}`);
-  if (init?.json !== undefined) headers.set("Content-Type", "application/json");
-  const response = await fetch(url, {
-    ...init,
-    headers,
-    body: init?.json !== undefined ? JSON.stringify(init.json) : init?.body,
-    signal: init?.signal ?? AbortSignal.timeout(60_000),
-  });
-  const text = await response.text();
-  if (!response.ok) throw new Error(`${response.status}: ${text.slice(0, 400)}`);
-  return text ? (JSON.parse(text) as T) : ({} as T);
+  return connectorJson<T>(url, token, init as ConnectorRequestInit);
 }
 
 export function str(args: Record<string, unknown>, key: string): string {

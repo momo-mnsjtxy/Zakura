@@ -25,20 +25,27 @@ import {
   type ChatStreamCallbacks,
   type RouteResolveQuery,
 } from "../model-router/index.js";
+import {
+  ModelRouteChainError,
+  type RouteFailure,
+} from "../model-router/executor.js";
+import type { ResolvedRoute } from "../model-router/types.js";
 
 export type RouteResolveInput = RouteResolveQuery;
 
 /**
- * 流式 chat 在「已向调用方输出增量后」失败时抛出：
- * 不能原地重试/换路由（会产生重复文本），由上层决定是否回滚重来。
+ * The stream reached the caller before its provider failed. Replaying it here
+ * would duplicate visible text/tool state, so rollback/restart belongs to the
+ * run layer that owns the published deltas.
  */
 export class ChatStreamPartialError extends Error {
   readonly emitted = true;
-  readonly retryable = true;
+  readonly retryable: boolean;
+
   constructor(message: string, cause?: unknown) {
-    super(message);
+    super(message, cause === undefined ? undefined : { cause });
     this.name = "ChatStreamPartialError";
-    if (cause !== undefined) this.cause = cause;
+    this.retryable = isRetryableModelError(cause);
   }
 }
 
@@ -49,97 +56,109 @@ type RoutedResult<T> = T & {
   upstreamId: string;
 };
 
-export class ModelRouterService {
-  private readonly resolver: RouteResolver;
+type ModelRouteResolver = Pick<RouteResolver, "resolveChain" | "invalidateTenant">;
 
-  constructor(db: Db) {
-    this.resolver = new RouteResolver(db);
+function withRouteIdentity<T extends object>(
+  result: T,
+  route: ResolvedRoute,
+): RoutedResult<T> {
+  return {
+    ...result,
+    routeId: route.routeId,
+    routeSlug: route.routeSlug,
+    alias: route.alias,
+    upstreamId: route.upstream.id,
+  };
+}
+
+/** Tenant-aware model business service with provider retry/fallback semantics. */
+export class ModelRouterService {
+  private readonly resolver: ModelRouteResolver;
+
+  constructor(db: Db, resolver?: ModelRouteResolver) {
+    this.resolver = resolver ?? new RouteResolver(db);
   }
 
   invalidateCache(tenantId: string): void {
     this.resolver.invalidateTenant(tenantId);
   }
 
-  async resolveRoute(tenantId: string, input: RouteResolveInput) {
-    const chain = await this.resolver.resolveChain(tenantId, input);
-    return chain[0] ?? null;
+  async resolveRoute(
+    tenantId: string,
+    input: RouteResolveInput,
+  ): Promise<ResolvedRoute | null> {
+    return (await this.resolver.resolveChain(tenantId, input))[0] ?? null;
   }
 
-  private async invoke<T>(
+  private resolveChain(
     tenantId: string,
-    capability: ModelCapability,
     input: RouteResolveInput,
-    executor: (route: import("../model-router/types.js").ResolvedRoute) => Promise<T>,
-  ): Promise<RoutedResult<T>> {
-    const chain = await this.resolver.resolveChain(tenantId, {
+  ): Promise<ResolvedRoute[]> {
+    return this.resolver.resolveChain(tenantId, {
       strategy: "weighted",
       ...input,
     });
+  }
+
+  private async invokeBuffered<T extends object>(
+    tenantId: string,
+    capability: ModelCapability,
+    query: RouteResolveInput,
+    invoke: (route: ResolvedRoute) => Promise<T>,
+  ): Promise<RoutedResult<T>> {
+    const routes = await this.resolveChain(tenantId, query);
     const { result, route } = await executeWithFallback(
-      chain,
+      routes,
       capability,
-      async (_adapter, r) => executor(r),
+      (_adapter, candidate) => invoke(candidate),
     );
-    return {
-      ...result,
-      routeId: route.routeId,
-      routeSlug: route.routeSlug,
-      alias: route.alias,
-      upstreamId: route.upstream.id,
-    };
+    return withRouteIdentity(result, route);
   }
 
   chat(
     tenantId: string,
     messages: ModelChatMessage[],
-    input: RouteResolveInput,
+    query: RouteResolveInput,
     options?: ModelChatInvokeOptions,
   ): Promise<RoutedResult<ModelChatResult>> {
-    return this.invoke(tenantId, "chat", input, (route) =>
+    return this.invokeBuffered(tenantId, "chat", query, (route) =>
       executeChat(route, messages, options),
     );
   }
 
-  /**
-   * System One 结构化评估（TypeSafe JEV 等 evaluation 路由）。
-   * input.questions 的键即答案键；路由按 evaluation 能力解析。
-   */
   evaluate(
     tenantId: string,
     input: ModelEvaluationInput,
-    routeQuery?: { alias?: string; routeId?: string },
+    query?: { alias?: string; routeId?: string },
   ): Promise<RoutedResult<ModelEvaluationResult>> {
-    return this.invoke(
+    return this.invokeBuffered(
       tenantId,
       "evaluation",
-      { capability: "evaluation", ...routeQuery },
+      { capability: "evaluation", ...query },
       (route) => executeEvaluation(route, input),
     );
   }
 
   /**
-   * 流式 chat：onDelta 边生成边回调（协议不支持流式时完成后整块回调一次）。
-   * 瞬时错误在「尚未输出任何增量」时先在原路由重试、再故障转移下一路由；
-   * 流已开始后失败抛 ChatStreamPartialError（重试会导致重复文本，由上层
-   * 决定是否回滚已发布的增量后整体重来）。
+   * Stream with two replay barriers:
+   * - before output: retry the current provider, then fail over
+   * - after output: stop immediately and surface ChatStreamPartialError
    */
   async chatStream(
     tenantId: string,
     messages: ModelChatMessage[],
-    input: RouteResolveInput,
+    query: RouteResolveInput,
     options: ModelChatInvokeOptions | undefined,
     callbacks: ChatStreamCallbacks,
   ): Promise<RoutedResult<ModelChatResult>> {
-    const chain = await this.resolver.resolveChain(tenantId, {
-      strategy: "weighted",
-      ...input,
-    });
-    if (chain.length === 0) throw new Error("未配置 chat 模型路由");
-    const errors: string[] = [];
-    let anyRetryable = false;
-    for (const route of chain) {
+    const routes = await this.resolveChain(tenantId, query);
+    if (routes.length === 0) throw new Error("未配置 chat 模型路由");
+    const failures: RouteFailure[] = [];
+
+    for (const route of routes) {
       let emitted = false;
-      const gated: ChatStreamCallbacks = {
+      const outputGate: ChatStreamCallbacks = {
+        signal: callbacks.signal,
         onDelta: (text) => {
           if (text) emitted = true;
           callbacks.onDelta?.(text);
@@ -148,67 +167,68 @@ export class ModelRouterService {
           if (text) emitted = true;
           callbacks.onReasoningDelta?.(text);
         },
-        signal: callbacks.signal,
       };
+
       try {
         const result = await withModelRetries(
-          () => executeChatStream(route, messages, options, gated),
+          () => executeChatStream(route, messages, options, outputGate),
           {
             attempts: 2,
-            shouldRetry: (err) => !emitted && isRetryableModelError(err),
+            signal: callbacks.signal,
+            shouldRetry: (error) => !emitted && isRetryableModelError(error),
           },
         );
-        return {
-          ...result,
-          routeId: route.routeId,
-          routeSlug: route.routeSlug,
-          alias: route.alias,
-          upstreamId: route.upstream.id,
-        };
-      } catch (err) {
-        // 调用方取消：不重试、不故障转移，原样抛给上层走取消收尾
-        if (isAbortError(err)) throw err;
+        return withRouteIdentity(result, route);
+      } catch (error) {
+        if (isAbortError(error) || callbacks.signal?.aborted) throw error;
         if (emitted) {
           throw new ChatStreamPartialError(
-            `${route.routeSlug}: 流式输出中断（${err instanceof Error ? err.message : String(err)}）`,
-            err,
+            `${route.routeSlug}: 流式输出中断（${
+              error instanceof Error ? error.message : String(error)
+            }）`,
+            error,
           );
         }
-        if (isRetryableModelError(err)) anyRetryable = true;
-        errors.push(
-          `${route.routeSlug}: ${err instanceof Error ? err.message : String(err)}`,
-        );
+        failures.push({
+          routeId: route.routeId,
+          routeSlug: route.routeSlug,
+          upstreamId: route.upstream.id,
+          retryable: isRetryableModelError(error),
+          error,
+        });
       }
     }
-    const aggregate = new Error(`所有 chat 路由均失败:\n${errors.join("\n")}`);
-    (aggregate as { retryable?: boolean }).retryable = anyRetryable;
-    throw aggregate;
+    throw new ModelRouteChainError("chat", failures);
   }
 
   embed(
     tenantId: string,
     texts: string[],
-    input: RouteResolveInput,
+    query: RouteResolveInput,
   ): Promise<RoutedResult<ModelEmbeddingResult>> {
-    return this.invoke(tenantId, "embedding", input, (route) => executeEmbed(route, texts));
+    return this.invokeBuffered(tenantId, "embedding", query, (route) =>
+      executeEmbed(route, texts),
+    );
   }
 
   rerank(
     tenantId: string,
-    query: string,
+    search: string,
     documents: string[],
-    input: RouteResolveInput,
+    query: RouteResolveInput,
   ): Promise<RoutedResult<ModelRerankResult>> {
-    return this.invoke(tenantId, "rerank", input, (route) =>
-      executeRerank(route, query, documents),
+    return this.invokeBuffered(tenantId, "rerank", query, (route) =>
+      executeRerank(route, search, documents),
     );
   }
 
   generateImage(
     tenantId: string,
     prompt: string,
-    input: RouteResolveInput,
+    query: RouteResolveInput,
   ): Promise<RoutedResult<ModelImageResult>> {
-    return this.invoke(tenantId, "image", input, (route) => executeImage(route, prompt));
+    return this.invokeBuffered(tenantId, "image", query, (route) =>
+      executeImage(route, prompt),
+    );
   }
 }

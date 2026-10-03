@@ -30,6 +30,7 @@ import {
   markdownHints,
   type FallbackCandidate,
 } from "./discover.js";
+import { fetchSkillSource } from "./http.js";
 
 const FETCH_TIMEOUT_MS = 20_000;
 const USER_AGENT = "Zakura-Skills/1.0";
@@ -221,21 +222,12 @@ async function fetchWithTimeout(
   init: RequestInit,
   external?: AbortSignal,
 ): Promise<Response> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  const onAbort = () => controller.abort();
-  external?.addEventListener("abort", onAbort);
-  try {
-    return await fetch(url, { ...init, signal: controller.signal });
-  } catch (err) {
-    if (controller.signal.aborted) throw new SkillSourceError(`请求超时：${url}`);
-    throw new SkillSourceError(
-      `网络错误：${err instanceof Error ? err.message : String(err)}`,
-    );
-  } finally {
-    clearTimeout(timer);
-    external?.removeEventListener("abort", onAbort);
-  }
+  return fetchSkillSource(url, init, {
+    signal: external,
+    timeoutMs: FETCH_TIMEOUT_MS,
+    attempts: 3,
+    baseDelayMs: 150,
+  });
 }
 
 function isTextFile(path: string): boolean {

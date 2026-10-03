@@ -116,6 +116,28 @@ describe("平台技能缓存", () => {
     assert.equal(read?.row.version, "def456");
   });
 
+  it("并发写入同一 repoKey 原子合并且保持可读", async () => {
+    const source: SkillSource = { kind: "github", owner: "acme", repo: "race", ref: "HEAD" };
+    const key = mod.repoKeyOf(source)!;
+    await Promise.all(
+      Array.from({ length: 8 }, (_, index) =>
+        cache.write({
+          repoKey: key,
+          source,
+          packages: [pkg(`race-${index}`, `skills/race-${index}`, `v${index}`)],
+          warnings: [],
+          etag: `tag-${index}`,
+          partial: false,
+        }),
+      ),
+    );
+    const rows = (await cache.list()).filter((row) => row.repoKey === key);
+    assert.equal(rows.length, 1);
+    const read = await cache.read(key);
+    assert.equal(read?.packages.length, 1);
+    assert.match(read?.packages[0]?.name ?? "", /^race-\d$/);
+  });
+
   it("touch 只推进 checkedAt，内容保持不变", async () => {
     const key = "github:acme/kit@HEAD";
     const before = await cache.read(key);

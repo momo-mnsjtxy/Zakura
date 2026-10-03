@@ -6,6 +6,7 @@
  * 离线也能复制到新 AgentWithSpace。
  */
 import { and, asc, eq, inArray } from "drizzle-orm";
+import { randomUUID } from "node:crypto";
 import type { WorkspaceFs } from "@zakura/core";
 import {
   AGENT_SKILLS_DIR,
@@ -212,6 +213,8 @@ export class SkillsService {
   private readonly builtinBackfilled = new Map<string, number>();
   /** 正在抓取的仓库，防止同一仓库被并发重复拉 */
   private readonly inflight = new Map<string, Promise<CachedRepo | null>>();
+  /** Concurrent installs of the same package into the same workspace share one commit. */
+  private readonly installInflight = new Map<string, Promise<AgentSkillRecord>>();
   /** 正在后台补齐捆绑文件的仓库 */
   private readonly hydrating = new Set<string>();
   /** 一轮后台维护还没跑完时不叠加下一轮 */
@@ -1169,17 +1172,34 @@ export class SkillsService {
   ): Promise<AgentWithSpace[]> {
     if (all) return this.agentService.list(tenantId);
     if (!agentIds?.length) return [];
+    const requested = [...new Set(agentIds.map((id) => id.trim()).filter(Boolean))];
     const found: AgentWithSpace[] = [];
-    for (const id of agentIds) {
+    const missing: string[] = [];
+    for (const id of requested) {
       const agent = await this.agentService.get(tenantId, id);
       if (agent) found.push(agent);
+      else missing.push(id);
     }
-    if (!found.length) throw new SkillSourceError("未找到目标 AgentWithSpace");
+    if (missing.length) throw new SkillSourceError(`未找到目标 AgentWithSpace：${missing.join(", ")}`);
     return found;
   }
 
   /** 写入工作区并登记安装记录 */
   private async installToAgent(agent: AgentWithSpace, row: SkillRow): Promise<AgentSkillRecord> {
+    const key = `${agent.tenantId}:${agent.id}:${row.name}:${row.version ?? ""}`;
+    const pending = this.installInflight.get(key);
+    if (pending) return pending;
+    const operation = this.doInstallToAgent(agent, row).finally(() => {
+      if (this.installInflight.get(key) === operation) this.installInflight.delete(key);
+    });
+    this.installInflight.set(key, operation);
+    return operation;
+  }
+
+  private async doInstallToAgent(
+    agent: AgentWithSpace,
+    row: SkillRow,
+  ): Promise<AgentSkillRecord> {
     const files = parseFiles(row.filesJson);
     if (!files.length) throw new Error("技能内容为空");
     const fs = await this.fsForAgent(agent);
@@ -1204,27 +1224,55 @@ export class SkillsService {
     files: SkillFile[],
   ): Promise<void> {
     const dest = root.replace(/\/+/g, "/");
+    const suffix = randomUUID().replace(/-/g, "").slice(0, 12);
+    const staging = `${dest}.install-${suffix}`;
+    const backup = `${dest}.backup-${suffix}`;
+    let backedUp = false;
     try {
-      if (await fs.exists(dest)) await fs.delete(dest, true);
-    } catch {
-      /* 目录不存在或无法删除时继续写入 */
-    }
-    await fs.mkdir(dest);
-    for (const file of files) {
-      const target = `${dest}/${file.path}`.replace(/\/+/g, "/");
-      const dir = target.slice(0, target.lastIndexOf("/"));
-      if (dir && dir !== dest) {
-        try {
-          await fs.mkdir(dir);
-        } catch {
-          /* 已存在 */
+      await fs.mkdir(staging);
+      for (const file of files) {
+        const target = `${staging}/${file.path}`.replace(/\/+/g, "/");
+        const dir = target.slice(0, target.lastIndexOf("/"));
+        if (dir && dir !== staging) {
+          try {
+            await fs.mkdir(dir);
+          } catch {
+            /* already exists */
+          }
+        }
+        if (file.encoding === "base64") {
+          await fs.writeBytes(target, Buffer.from(file.content, "base64"));
+        } else {
+          await fs.write(target, file.content);
         }
       }
-      if (file.encoding === "base64") {
-        await fs.writeBytes(target, Buffer.from(file.content, "base64"));
-      } else {
-        await fs.write(target, file.content);
+
+      if (await fs.exists(dest)) {
+        await fs.move(dest, backup);
+        backedUp = true;
       }
+      try {
+        await fs.move(staging, dest);
+      } catch (error) {
+        if (backedUp) await fs.move(backup, dest).catch(() => undefined);
+        throw error;
+      }
+      if (backedUp) await fs.delete(backup, true).catch(() => undefined);
+    } catch (error) {
+      // A partial staging tree is never made visible as an installed skill.
+      try {
+        if (await fs.exists(staging)) await fs.delete(staging, true);
+      } catch {
+        /* best-effort cleanup; original install remains intact */
+      }
+      if (backedUp) {
+        try {
+          if (!(await fs.exists(dest)) && await fs.exists(backup)) await fs.move(backup, dest);
+        } catch {
+          /* preserve the original write error */
+        }
+      }
+      throw error;
     }
     platformEvents.publish(agent.tenantId, {
       type: "agent_fs_changed",
@@ -1309,7 +1357,11 @@ export class SkillsService {
   ): Promise<AgentSkillRecord> {
     const now = new Date();
     const existing = await this.db.query.agentSkills.findFirst({
-      where: and(eq(agentSkills.agentId, agent.id), eq(agentSkills.name, row.name)),
+      where: and(
+        eq(agentSkills.tenantId, agent.tenantId),
+        eq(agentSkills.agentId, agent.id),
+        eq(agentSkills.name, row.name),
+      ),
     });
     const values = {
       tenantId: agent.tenantId,

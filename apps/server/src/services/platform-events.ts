@@ -1,11 +1,9 @@
 /**
- * 平台事件总线：租户级 pub/sub，经实时网关（Socket.IO room `tenant:<id>`）推给前端。
- * 用于把长任务进度（MCP 安装/启动、Agent 工作区拉起）与状态变化实时推给前端，
- * 取代前端轮询。事件是瞬态信号，不落库：断线重连后前端应重新拉一次快照接口对齐状态。
+ * Tenant-scoped realtime platform events.
  *
- * 跨实例：经 Redis Pub/Sub 扇出（频道见 REDIS_KEYS.platformChannel），机制与
- * cloud-agent-session 一致 —— 信封带实例 ID 自过滤，订阅按租户引用计数。
- * REDIS_URL=off 或 Redis 不可用时自动降级为纯进程内投递。
+ * Events are intentionally transient. Clients reconnect by loading the durable
+ * resource snapshot and then subscribing again. Redis only fans live events
+ * between API replicas; local delivery remains available when Redis is off.
  */
 import { recordPlatformFault } from "@zakura/core";
 import { newId } from "../db/schema.js";
@@ -17,7 +15,6 @@ import {
   type ZakuraRedis,
 } from "./redis.js";
 import type { AgentProgressSnapshot } from "./space-progress.js";
-
 import type { PlatformServiceProgressSnapshot } from "./platform-service-progress.js";
 
 export type PlatformEvent =
@@ -46,7 +43,6 @@ export type PlatformEvent =
       level: "info" | "warn" | "error" | "ok";
     }
   | {
-      /** Host-level platform service deploy/stop progress (all tenants receive). */
       type: "platform_service_progress";
       ts: number;
       serviceKey: string;
@@ -56,7 +52,6 @@ export type PlatformEvent =
   | { type: "agent_fs_changed"; ts: number; agentId: string; path: string }
   | { type: "agent_config_changed"; ts: number; agentId: string }
   | {
-      /** Cloud Agent / Gateway 会话列表变化（新建或有实质消息） */
       type: "cloud_session_changed";
       ts: number;
       agentId: string;
@@ -64,7 +59,6 @@ export type PlatformEvent =
       reason?: "created" | "updated";
     }
   | {
-      /** 连接器 / 远程通道入站（用于浏览器通知） */
       type: "connector_inbound";
       ts: number;
       agentId: string;
@@ -74,7 +68,6 @@ export type PlatformEvent =
       preview?: string;
     }
   | {
-      /** Agent 主动调用浏览器通知工具 */
       type: "browser_notify";
       ts: number;
       agentId: string;
@@ -83,7 +76,6 @@ export type PlatformEvent =
       url?: string;
     }
   | {
-      /** 租户连接器/远程通道的用户可见提示（不要打 stdout） */
       type: "connector_notice";
       ts: number;
       agentId: string;
@@ -93,290 +85,310 @@ export type PlatformEvent =
       message: string;
     };
 
-type PlatformEventInput =
-  | Omit<Extract<PlatformEvent, { type: "agent_progress" }>, "ts">
-  | Omit<Extract<PlatformEvent, { type: "mcp_instance" }>, "ts">
-  | Omit<Extract<PlatformEvent, { type: "mcp_progress" }>, "ts">
-  | Omit<Extract<PlatformEvent, { type: "platform_service_progress" }>, "ts">
-  | Omit<Extract<PlatformEvent, { type: "runner_node" }>, "ts">
-  | Omit<Extract<PlatformEvent, { type: "agent_fs_changed" }>, "ts">
-  | Omit<Extract<PlatformEvent, { type: "agent_config_changed" }>, "ts">
-  | Omit<Extract<PlatformEvent, { type: "cloud_session_changed" }>, "ts">
-  | Omit<Extract<PlatformEvent, { type: "connector_inbound" }>, "ts">
-  | Omit<Extract<PlatformEvent, { type: "browser_notify" }>, "ts">
-  | Omit<Extract<PlatformEvent, { type: "connector_notice" }>, "ts">;
+export type PlatformEventInput = PlatformEvent extends infer Event
+  ? Event extends { ts: number }
+    ? Omit<Event, "ts">
+    : never
+  : never;
 
 type Listener = (event: PlatformEvent) => void;
+type RemoteUnsubscribe = (() => Promise<void>) | null;
 
-/** 退订回调；订阅失败或已关闭时为 null */
-type Unsub = (() => Promise<void>) | null;
-
-type RedisFanoutMessage = {
+type FanoutEnvelope = {
   from: string;
-  /** 事件本身不带租户，跨实例投递时必须随信封带上 */
   tenantId: string;
   event: PlatformEvent;
 };
 
+/** Small transport boundary used for deterministic fan-out lifecycle tests. */
+export interface PlatformEventTransport {
+  subscribe(
+    channel: string,
+    listener: (message: string) => void,
+  ): Promise<RemoteUnsubscribe>;
+  publish(channel: string, message: string): Promise<void>;
+  close(): Promise<void>;
+}
+
+class RedisPlatformEventTransport implements PlatformEventTransport {
+  private subscriber: ZakuraRedis | null = null;
+  private connecting: Promise<ZakuraRedis | null> | null = null;
+  private closed = false;
+
+  private async getSubscriber(): Promise<ZakuraRedis | null> {
+    if (this.closed || !isRedisEnabled()) return null;
+    if (this.subscriber?.isOpen) return this.subscriber;
+    if (!this.connecting) {
+      this.connecting = createRedisSubscriber()
+        .then(async (subscriber) => {
+          if (this.closed && subscriber?.isOpen) {
+            await subscriber.quit().catch(() => undefined);
+            return null;
+          }
+          this.subscriber = subscriber;
+          return subscriber;
+        })
+        .finally(() => {
+          this.connecting = null;
+        });
+    }
+    return this.connecting;
+  }
+
+  async subscribe(
+    channel: string,
+    listener: (message: string) => void,
+  ): Promise<RemoteUnsubscribe> {
+    const subscriber = await this.getSubscriber();
+    if (!subscriber || this.closed) return null;
+    await subscriber.subscribe(channel, listener);
+    let active = true;
+    return async () => {
+      if (!active) return;
+      active = false;
+      await subscriber.unsubscribe(channel).catch(() => undefined);
+    };
+  }
+
+  async publish(channel: string, message: string): Promise<void> {
+    if (this.closed || !isRedisEnabled()) return;
+    const redis = await getRedis();
+    if (redis) await redis.publish(channel, message);
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    const subscriber = await (this.connecting ?? Promise.resolve(this.subscriber)).catch(
+      () => null,
+    );
+    this.subscriber = null;
+    this.connecting = null;
+    if (subscriber?.isOpen) await subscriber.quit().catch(() => undefined);
+  }
+}
+
+type ChannelLease = {
+  release(): Promise<void>;
+};
+
+export type PlatformEventBusOptions = {
+  transport?: PlatformEventTransport;
+  now?: () => number;
+  instanceId?: string;
+};
+
+/**
+ * Local tenant bus plus Redis fan-out.
+ *
+ * A tenant has one remote subscription regardless of its local listener count.
+ * Channel transitions are serialized so unsubscribe/reconnect races cannot tear
+ * down the newly-established subscription.
+ */
 export class PlatformEventBus {
-  /**
-   * 区分本实例 PUBLISH，避免本地 emit + Redis 回环双推。
-   * 按实例（而非模块）分配：生产环境每进程一个 bus，行为不变；
-   * 同进程构造多个 bus（测试模拟多副本）时也能正确互相投递。
-   */
-  private readonly instanceId = newId();
-  /** tenantId → listeners */
-  private readonly listeners = new Map<string, Set<Listener>>();
-  /**
-   * 跨实例 fan-out：按租户频道引用计数。
-   * ready 存「订阅完成后得到的退订函数」的 promise —— 订阅是异步的，
-   * 而退订可能先于它完成（快速切页），必须 await 后再退，否则订阅会泄漏。
-   */
-  private readonly remoteRef = new Map<string, { count: number; ready: Promise<Unsub> }>();
-  /** host 级广播频道（publishAll）的引用计数 */
-  private allRef = 0;
-  private allReady: Promise<Unsub> | null = null;
-  private subClient: ZakuraRedis | null = null;
-  private subReady: Promise<ZakuraRedis | null> | null = null;
+  private readonly instanceId: string;
+  private readonly now: () => number;
+  private readonly transport: PlatformEventTransport;
+  private readonly listeners = new Map<string, Map<symbol, Listener>>();
+  private readonly tenantLeases = new Map<string, ChannelLease>();
+  private readonly channelTransitions = new Map<string, Promise<void>>();
+  private allLease: ChannelLease | null = null;
   private warnedPublish = false;
   private closed = false;
 
-  private async ensureSubClient(): Promise<ZakuraRedis | null> {
-    if (this.closed) return null;
-    if (this.subClient?.isOpen) return this.subClient;
-    if (!this.subReady) {
-      this.subReady = createRedisSubscriber()
-        .then((c) => {
-          // close() 可能在建连期间发生：别把连接留下
-          if (this.closed && c?.isOpen) {
-            void c.quit().catch(() => {});
-            return null;
-          }
-          this.subClient = c;
-          return c;
-        })
-        .catch((err) => {
-          recordPlatformFault("platform_events.subscriber", err, {
-            subsystem: "platform_events",
-            dep: "redis",
-          });
-          return null;
-        });
-    }
-    return this.subReady;
-  }
-
-  /** 订阅一个频道，返回退订函数（失败或已关闭时返回 null） */
-  private async subscribeChannel(
-    channel: string,
-    handler: (message: string) => void,
-  ): Promise<Unsub> {
-    const sub = await this.ensureSubClient();
-    if (!sub || this.closed) return null;
-    try {
-      await sub.subscribe(channel, handler);
-      return async () => {
-        try {
-          await sub.unsubscribe(channel);
-        } catch {
-          /* ignore */
-        }
-      };
-    } catch (err) {
-      recordPlatformFault("platform_events.subscribe", err, {
-        subsystem: "platform_events",
-        dep: "redis",
-      });
-      return null;
-    }
-  }
-
-  /** 解析并本地投递来自其它实例的事件 */
-  private onRemoteMessage = (message: string) => {
-    try {
-      const msg = JSON.parse(message) as RedisFanoutMessage;
-      if (msg.from === this.instanceId) return;
-      this.emitLocal(msg.tenantId, msg.event);
-    } catch (err) {
-      recordPlatformFault("platform_events.parse", err, {
-        subsystem: "platform_events",
-        dep: "redis",
-      });
-    }
-  };
-
-  /** 收到 host 级广播：投递给本实例所有租户的监听者 */
-  private onRemoteAllMessage = (message: string) => {
-    try {
-      const msg = JSON.parse(message) as RedisFanoutMessage;
-      if (msg.from === this.instanceId) return;
-      this.emitLocalAll(msg.event);
-    } catch (err) {
-      recordPlatformFault("platform_events.broadcast_parse", err, {
-        subsystem: "platform_events",
-        dep: "redis",
-      });
-    }
-  };
-
-  private async ensureRemote(tenantId: string): Promise<void> {
-    const existing = this.remoteRef.get(tenantId);
-    if (existing) {
-      existing.count += 1;
-    } else {
-      // 同步登记 ready promise，后续 release 可 await 它再退订
-      const ready = this.subscribeChannel(
-        REDIS_KEYS.platformChannel(tenantId),
-        this.onRemoteMessage,
-      );
-      this.remoteRef.set(tenantId, { count: 1, ready });
-      await ready;
-    }
-
-    // host 级广播频道：只要本实例有任何监听者就得订上
-    this.allRef += 1;
-    if (this.allRef === 1 && !this.allReady) {
-      this.allReady = this.subscribeChannel(
-        REDIS_KEYS.platformChannelAll,
-        this.onRemoteAllMessage,
-      );
-      await this.allReady;
-    }
-  }
-
-  private async releaseRemote(tenantId: string): Promise<void> {
-    const entry = this.remoteRef.get(tenantId);
-    if (entry) {
-      entry.count -= 1;
-      if (entry.count <= 0) {
-        this.remoteRef.delete(tenantId);
-        // 订阅可能还在建立中：必须等它完成才知道要退什么
-        const unsub = await entry.ready;
-        await unsub?.();
-      }
-    }
-
-    this.allRef = Math.max(0, this.allRef - 1);
-    if (this.allRef === 0 && this.allReady) {
-      const ready = this.allReady;
-      this.allReady = null;
-      const unsub = await ready;
-      await unsub?.();
-    }
-  }
-
-  /** 发布到 Redis；失败只告警一次并降级为本实例内投递 */
-  private publishRemote(channel: string, tenantId: string, event: PlatformEvent): void {
-    if (!isRedisEnabled()) return;
-    const msg: RedisFanoutMessage = { from: this.instanceId, tenantId, event };
-    void getRedis()
-      .then((redis) => redis?.publish(channel, JSON.stringify(msg)))
-      .catch((err) => {
-        if (this.warnedPublish) return;
-        this.warnedPublish = true;
-        recordPlatformFault("platform_events.publish", err, {
-          subsystem: "platform_events",
-          dep: "redis",
-        });
-      });
-  }
-
-  private emitLocal(tenantId: string, event: PlatformEvent): void {
-    const set = this.listeners.get(tenantId);
-    if (!set || set.size === 0) return;
-    for (const fn of set) {
-      try {
-        fn(event);
-      } catch (err) {
-        recordPlatformFault("platform_events.listener", err, {
-          subsystem: "platform_events",
-        });
-      }
-    }
-  }
-
-  private emitLocalAll(event: PlatformEvent): void {
-    for (const set of this.listeners.values()) {
-      for (const fn of set) {
-        try {
-          fn(event);
-        } catch (err) {
-          recordPlatformFault("platform_events.listener", err, {
-          subsystem: "platform_events",
-        });
-        }
-      }
-    }
+  constructor(options: PlatformEventBusOptions = {}) {
+    this.instanceId = options.instanceId ?? newId();
+    this.now = options.now ?? Date.now;
+    this.transport = options.transport ?? new RedisPlatformEventTransport();
   }
 
   subscribe(tenantId: string, listener: Listener): () => void {
-    let set = this.listeners.get(tenantId);
-    if (!set) {
-      set = new Set();
-      this.listeners.set(tenantId, set);
+    if (this.closed) return () => undefined;
+    let tenant = this.listeners.get(tenantId);
+    const firstForTenant = !tenant;
+    if (!tenant) {
+      tenant = new Map();
+      this.listeners.set(tenantId, tenant);
     }
-    // One logical subscription gets one unique entry even when a caller reuses
-    // the same callback. This keeps local delivery and Redis ref-counts aligned.
-    const subscription: Listener = (event) => listener(event);
-    set.add(subscription);
-    void this.ensureRemote(tenantId);
+    const subscriptionId = Symbol(tenantId);
+    tenant.set(subscriptionId, listener);
+    if (firstForTenant) this.acquireTenant(tenantId);
+
     let active = true;
     return () => {
       if (!active) return;
       active = false;
-      set!.delete(subscription);
-      if (set!.size === 0) this.listeners.delete(tenantId);
-      void this.releaseRemote(tenantId);
+      const current = this.listeners.get(tenantId);
+      current?.delete(subscriptionId);
+      if (current && current.size === 0) {
+        this.listeners.delete(tenantId);
+        this.releaseTenant(tenantId);
+      }
     };
   }
 
   publish(tenantId: string, event: PlatformEventInput): void {
-    const full = { ...event, ts: Date.now() } as PlatformEvent;
-    // 本地先投递，再广播到其它实例。注意这里**不能**因本地无监听者就早退：
-    // 产生事件的副本未必是浏览器连着的那个副本。
-    this.emitLocal(tenantId, full);
+    if (this.closed) return;
+    const full = { ...event, ts: this.now() } as PlatformEvent;
+    this.emitTenant(tenantId, full);
     this.publishRemote(REDIS_KEYS.platformChannel(tenantId), tenantId, full);
   }
 
-  /** Broadcast to every subscribed tenant (host-level services). */
   publishAll(event: PlatformEventInput): void {
-    const full = { ...event, ts: Date.now() } as PlatformEvent;
-    this.emitLocalAll(full);
+    if (this.closed) return;
+    const full = { ...event, ts: this.now() } as PlatformEvent;
+    for (const tenantId of this.listeners.keys()) this.emitTenant(tenantId, full);
     this.publishRemote(REDIS_KEYS.platformChannelAll, "*", full);
   }
 
-  /**
-   * 当前**本副本**是否有订阅者（发布方可据此跳过昂贵的负载构造）。
-   * 多副本下这只是本地提示，不代表全局无人订阅。
-   */
   hasListeners(tenantId: string): boolean {
     return (this.listeners.get(tenantId)?.size ?? 0) > 0;
   }
 
-  /** 释放 Redis 订阅连接（进程退出 / 测试收尾） */
   async close(): Promise<void> {
+    if (this.closed) return;
     this.closed = true;
-    // 等所有挂起的订阅落定，避免 close 之后又冒出一条连接
-    const pending = [...this.remoteRef.values()].map((e) => e.ready);
-    if (this.allReady) pending.push(this.allReady);
-    this.remoteRef.clear();
-    this.allRef = 0;
-    this.allReady = null;
-    for (const ready of pending) {
-      const unsub = await ready.catch(() => null);
-      await unsub?.().catch(() => {});
-    }
+    this.listeners.clear();
+    const leases = [...this.tenantLeases.values()];
+    this.tenantLeases.clear();
+    if (this.allLease) leases.push(this.allLease);
+    this.allLease = null;
+    await Promise.all(leases.map((lease) => lease.release().catch(() => undefined)));
+    await Promise.all(
+      [...this.channelTransitions.values()].map((transition) =>
+        transition.catch(() => undefined),
+      ),
+    );
+    this.channelTransitions.clear();
+    await this.transport.close().catch((error) =>
+      this.fault("platform_events.close", error, { dep: "redis" }),
+    );
+  }
 
-    const client = await (this.subReady ?? Promise.resolve(this.subClient)).catch(() => null);
-    this.subClient = null;
-    this.subReady = null;
-    if (client?.isOpen) {
+  private acquireTenant(tenantId: string): void {
+    if (this.closed || this.tenantLeases.has(tenantId)) return;
+    const channel = REDIS_KEYS.platformChannel(tenantId);
+    this.tenantLeases.set(
+      tenantId,
+      this.createLease(channel, (message) => this.receiveTenant(message)),
+    );
+    if (!this.allLease) {
+      this.allLease = this.createLease(REDIS_KEYS.platformChannelAll, (message) =>
+        this.receiveAll(message),
+      );
+    }
+  }
+
+  private releaseTenant(tenantId: string): void {
+    const lease = this.tenantLeases.get(tenantId);
+    if (!lease) return;
+    this.tenantLeases.delete(tenantId);
+    void lease.release();
+    if (this.tenantLeases.size === 0 && this.allLease) {
+      const all = this.allLease;
+      this.allLease = null;
+      void all.release();
+    }
+  }
+
+  private createLease(
+    channel: string,
+    listener: (message: string) => void,
+  ): ChannelLease {
+    const previous = this.channelTransitions.get(channel) ?? Promise.resolve();
+    let released = false;
+    let releasePromise: Promise<void> | null = null;
+    const ready = previous
+      .catch(() => undefined)
+      .then(async (): Promise<RemoteUnsubscribe> => {
+        if (this.closed || released) return null;
+        try {
+          return await this.transport.subscribe(channel, listener);
+        } catch (error) {
+          this.fault("platform_events.subscribe", error, { dep: "redis" });
+          return null;
+        }
+      });
+
+    return {
+      release: () => {
+        if (releasePromise) return releasePromise;
+        released = true;
+        releasePromise = ready
+          .then(async (unsubscribe) => {
+            await unsubscribe?.();
+          })
+          .catch((error) =>
+            this.fault("platform_events.unsubscribe", error, { dep: "redis" }),
+          );
+        this.channelTransitions.set(channel, releasePromise);
+        void releasePromise.finally(() => {
+          if (this.channelTransitions.get(channel) === releasePromise) {
+            this.channelTransitions.delete(channel);
+          }
+        });
+        return releasePromise;
+      },
+    };
+  }
+
+  private receiveTenant(message: string): void {
+    const envelope = this.parseEnvelope(message, "platform_events.parse");
+    if (!envelope || envelope.from === this.instanceId) return;
+    this.emitTenant(envelope.tenantId, envelope.event);
+  }
+
+  private receiveAll(message: string): void {
+    const envelope = this.parseEnvelope(message, "platform_events.broadcast_parse");
+    if (!envelope || envelope.from === this.instanceId) return;
+    for (const tenantId of this.listeners.keys()) this.emitTenant(tenantId, envelope.event);
+  }
+
+  private parseEnvelope(message: string, faultKind: string): FanoutEnvelope | null {
+    try {
+      const parsed = JSON.parse(message) as Partial<FanoutEnvelope>;
+      if (
+        typeof parsed.from !== "string" ||
+        typeof parsed.tenantId !== "string" ||
+        !parsed.event ||
+        typeof parsed.event !== "object" ||
+        typeof (parsed.event as { type?: unknown }).type !== "string"
+      ) {
+        throw new Error("invalid platform event envelope");
+      }
+      return parsed as FanoutEnvelope;
+    } catch (error) {
+      this.fault(faultKind, error, { dep: "redis" });
+      return null;
+    }
+  }
+
+  private publishRemote(channel: string, tenantId: string, event: PlatformEvent): void {
+    const envelope: FanoutEnvelope = { from: this.instanceId, tenantId, event };
+    void this.transport.publish(channel, JSON.stringify(envelope)).catch((error) => {
+      if (this.warnedPublish) return;
+      this.warnedPublish = true;
+      this.fault("platform_events.publish", error, { dep: "redis" });
+    });
+  }
+
+  private emitTenant(tenantId: string, event: PlatformEvent): void {
+    const tenant = this.listeners.get(tenantId);
+    if (!tenant) return;
+    for (const listener of tenant.values()) {
       try {
-        await client.quit();
-      } catch {
-        /* ignore */
+        listener(event);
+      } catch (error) {
+        this.fault("platform_events.listener", error);
       }
     }
+  }
+
+  private fault(kind: string, error: unknown, fields: { dep?: string } = {}): void {
+    recordPlatformFault(kind, error, {
+      subsystem: "platform_events",
+      ...fields,
+    });
   }
 }
 

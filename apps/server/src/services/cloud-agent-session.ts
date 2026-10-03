@@ -29,6 +29,7 @@ import { platformEvents } from "./platform-events.js";
 import { RunCancellationRegistry } from "./run-cancellation.js";
 import { recordUserUsage } from "./user-usage.js";
 import { sliceEventsPreferringUserMessage, slimToolEventsForUi } from "./cloud-agent/ui-history.js";
+import { SessionMessageQueue } from "./cloud-agent/session-message-queue.js";
 import {
   REDIS_KEYS,
   createRedisSubscriber,
@@ -152,21 +153,6 @@ function kindCondition(kinds: SessionKindFilter | undefined) {
   return [inArray(cloudAgentSessions.kind, list)];
 }
 
-/** 队列快照的 Redis 存活时长：足够跨天续用，又不会永久漏存 */
-const QUEUE_TTL_SECONDS = 7 * 24 * 60 * 60;
-
-function normalizeQueuedMessage(item: CloudAgentQueuedMessage): CloudAgentQueuedMessage {
-  return {
-    messageId: item.messageId,
-    content: item.content ?? "",
-    attachments: item.attachments ?? [],
-    mode: item.mode === "queue" ? "queue" : "steer",
-    ...(item.interrupt ? { interrupt: true } : {}),
-    createdAt: item.createdAt || new Date().toISOString(),
-    ...(item.userId ? { userId: item.userId, ...(item.userName ? { userName: item.userName } : {}) } : {}),
-  };
-}
-
 type CancelFanoutMessage = {
   from: string;
   runId: string;
@@ -190,12 +176,8 @@ export class CloudAgentSessionStore {
     string,
     { tenantId: string; agentId: string; lastSeq: number; seqSeeded: boolean }
   >();
-  /** REDIS_URL=off 时的进程内会话队列 */
-  private readonly memQueues = new Map<string, CloudAgentQueuedMessage[]>();
-  /** REDIS_URL=off：立即发送待开跑的下一条 */
-  private readonly memQueueNext = new Map<string, CloudAgentQueuedMessage>();
-  /** sessionId → 队列读改写串行链（本实例内避免并发丢更新） */
-  private readonly queueChains = new Map<string, Promise<unknown>>();
+  /** Durable queue state machine shared by Chat and ACP sessions. */
+  private readonly messageQueue = new SessionMessageQueue();
   private readonly cancellations = new RunCancellationRegistry((err) =>
     recordPlatformFault("cloud_agent.cancel_listener", err, { subsystem: "cloud_agent", dep: "redis" }),
   );
@@ -868,9 +850,7 @@ export class CloudAgentSessionStore {
     await this.db.delete(cloudAgentSessions).where(eq(cloudAgentSessions.id, sessionId));
     this.listeners.delete(sessionId);
     this.sessionMeta.delete(sessionId);
-    this.memQueues.delete(sessionId);
-    this.memQueueNext.delete(sessionId);
-    this.queueChains.delete(sessionId);
+    await this.messageQueue.clear(sessionId);
     void this.releaseRedisSubscription(sessionId);
     const redis = await getRedis();
     if (redis) {
@@ -1933,83 +1913,18 @@ export class CloudAgentSessionStore {
     }
   }
 
-  // —— 会话级后续消息队列（服务端权威，跨设备同步） ——
-  // 对齐 Codex：mode=steer 项由 loop 在下一工具批后注入当前 Run；
-  // Run 结束后由 runtime 按 FIFO 一次取一条开新回合。每次变更广播 queue_update 快照。
-
-  private async readQueueItems(sessionId: string): Promise<CloudAgentQueuedMessage[]> {
-    if (isRedisEnabled()) {
-      const redis = await getRedis();
-      if (redis) {
-        try {
-          const raw = await redis.get(REDIS_KEYS.queue(sessionId));
-          if (!raw) return [];
-          const parsed = JSON.parse(raw) as unknown;
-          if (!Array.isArray(parsed)) return [];
-          return (parsed as CloudAgentQueuedMessage[])
-            .filter((i) => i && typeof i.messageId === "string")
-            .map(normalizeQueuedMessage);
-        } catch {
-          return [];
-        }
-      }
-    }
-    return this.memQueues.get(sessionId) ?? [];
-  }
-
-  private async writeQueueItems(
-    sessionId: string,
-    items: CloudAgentQueuedMessage[],
-  ): Promise<void> {
-    if (isRedisEnabled()) {
-      const redis = await getRedis();
-      if (redis) {
-        try {
-          if (items.length === 0) await redis.del(REDIS_KEYS.queue(sessionId));
-          else {
-            await redis.set(REDIS_KEYS.queue(sessionId), JSON.stringify(items), {
-              EX: QUEUE_TTL_SECONDS,
-            });
-          }
-          return;
-        } catch (err) {
-          recordPlatformFault("cloud_agent.queue_write", err, {
-            subsystem: "cloud_agent",
-            dep: "redis",
-          });
-        }
-      }
-    }
-    if (items.length === 0) this.memQueues.delete(sessionId);
-    else this.memQueues.set(sessionId, items);
-  }
-
-  /** 串行化同会话的队列读改写；跨实例的罕见交错由快照广播收敛 */
-  private mutateQueue<T>(
-    sessionId: string,
-    fn: (items: CloudAgentQueuedMessage[]) => { items: CloudAgentQueuedMessage[]; result: T },
-  ): Promise<T> {
-    const prev = this.queueChains.get(sessionId) ?? Promise.resolve();
-    const next = prev
-      .catch(() => {})
-      .then(async () => {
-        const current = await this.readQueueItems(sessionId);
-        const { items, result } = fn([...current]);
-        await this.writeQueueItems(sessionId, items);
-        return result;
-      });
-    this.queueChains.set(sessionId, next);
-    return next;
-  }
+  // —— Session-level follow-up queue (server authoritative, cross-device) ——
+  // `SessionMessageQueue` owns ordering and durable CAS. This store remains
+  // responsible for publishing queue snapshots into the session event stream.
 
   async listQueued(sessionId: string): Promise<CloudAgentQueuedMessage[]> {
-    return this.readQueueItems(sessionId);
+    return this.messageQueue.list(sessionId);
   }
 
-  /** 全量快照广播（持久事件，SSE/断点续传天然覆盖多设备） */
+  /** Broadcast a durable full snapshot so reconnecting clients converge. */
   async publishQueueSnapshot(sessionId: string): Promise<void> {
     try {
-      const items = await this.readQueueItems(sessionId);
+      const items = await this.messageQueue.list(sessionId);
       await this.appendEvent({
         sessionId,
         type: "queue_update",
@@ -2019,7 +1934,7 @@ export class CloudAgentSessionStore {
     } catch (err) {
       recordPlatformFault("cloud_agent.queue_snapshot", err, {
         subsystem: "cloud_agent",
-        dep: "redis",
+        dep: isRedisEnabled() ? "redis" : undefined,
       });
     }
   }
@@ -2028,10 +1943,7 @@ export class CloudAgentSessionStore {
     sessionId: string,
     item: CloudAgentQueuedMessage,
   ): Promise<CloudAgentQueuedMessage[]> {
-    const snapshot = await this.mutateQueue(sessionId, (items) => {
-      const next = [...items.filter((i) => i.messageId !== item.messageId), normalizeQueuedMessage(item)];
-      return { items: next, result: next };
-    });
+    const snapshot = await this.messageQueue.enqueue(sessionId, item);
     await this.publishQueueSnapshot(sessionId);
     return snapshot;
   }
@@ -2041,147 +1953,64 @@ export class CloudAgentSessionStore {
     messageId: string,
     patch: { content?: string },
   ): Promise<CloudAgentQueuedMessage | null> {
-    const hit = await this.mutateQueue(sessionId, (items) => {
-      let found: CloudAgentQueuedMessage | null = null;
-      const next = items.map((i) => {
-        if (i.messageId !== messageId) return i;
-        found = { ...i, ...(patch.content !== undefined ? { content: patch.content } : {}) };
-        return found;
-      });
-      return { items: next, result: found };
-    });
-    if (hit) await this.publishQueueSnapshot(sessionId);
-    return hit;
+    const item = await this.messageQueue.update(sessionId, messageId, patch);
+    if (item) await this.publishQueueSnapshot(sessionId);
+    return item;
   }
 
   async removeQueued(
     sessionId: string,
     messageId: string,
   ): Promise<CloudAgentQueuedMessage | null> {
-    const hit = await this.mutateQueue(sessionId, (items) => {
-      const found = items.find((i) => i.messageId === messageId) ?? null;
-      return { items: items.filter((i) => i.messageId !== messageId), result: found };
-    });
-    if (hit) await this.publishQueueSnapshot(sessionId);
-    return hit;
+    const item = await this.messageQueue.remove(sessionId, messageId);
+    if (item) await this.publishQueueSnapshot(sessionId);
+    return item;
   }
 
-  /** 引导：标记 interrupt 并移到队头（随后由调用方取消当前 Run / 触发出队） */
+  /** Mark an item as interrupting and move it to the FIFO head. */
   async promoteQueued(
     sessionId: string,
     messageId: string,
   ): Promise<CloudAgentQueuedMessage | null> {
-    const hit = await this.mutateQueue(sessionId, (items) => {
-      const found = items.find((i) => i.messageId === messageId);
-      if (!found) return { items, result: null };
-      const promoted: CloudAgentQueuedMessage = { ...found, interrupt: true };
-      return {
-        items: [promoted, ...items.filter((i) => i.messageId !== messageId)],
-        result: promoted,
-      };
-    });
-    if (hit) await this.publishQueueSnapshot(sessionId);
-    return hit;
+    const item = await this.messageQueue.promote(sessionId, messageId);
+    if (item) await this.publishQueueSnapshot(sessionId);
+    return item;
   }
 
   /**
-   * 立即发送：从队列摘出该条，写入 queue-next（取消收尾后优先开跑）。
-   * 其它排队消息不动；队列快照立刻不含该条，UI 可马上消失。
+   * Atomically remove an item from the queue and reserve it as the next turn.
+   * The reservation survives cancellation cleanup and is consumed only once.
    */
   async claimQueuedForImmediate(
     sessionId: string,
     messageId: string,
   ): Promise<CloudAgentQueuedMessage | null> {
-    const hit = await this.mutateQueue(sessionId, (items) => {
-      const found = items.find((i) => i.messageId === messageId);
-      if (!found) return { items, result: null };
-      return {
-        items: items.filter((i) => i.messageId !== messageId),
-        result: { ...found, interrupt: true },
-      };
-    });
-    if (!hit) return null;
-    await this.writeQueueNext(sessionId, hit);
-    await this.publishQueueSnapshot(sessionId);
-    return hit;
+    const item = await this.messageQueue.claimImmediate(sessionId, messageId);
+    if (item) await this.publishQueueSnapshot(sessionId);
+    return item;
   }
 
-  /** 取出立即发送待办（一次性）；没有则 null */
   async takeQueueNext(sessionId: string): Promise<CloudAgentQueuedMessage | null> {
-    if (isRedisEnabled()) {
-      const redis = await getRedis();
-      if (redis) {
-        try {
-          const key = REDIS_KEYS.queueNext(sessionId);
-          const raw = await redis.get(key);
-          if (!raw) return null;
-          await redis.del(key);
-          const parsed = JSON.parse(raw) as CloudAgentQueuedMessage;
-          if (!parsed?.messageId) return null;
-          return normalizeQueuedMessage(parsed);
-        } catch (err) {
-          recordPlatformFault("cloud_agent.queue_next_read", err, {
-            subsystem: "cloud_agent",
-            dep: "redis",
-          });
-          return null;
-        }
-      }
-    }
-    const hit = this.memQueueNext.get(sessionId) ?? null;
-    if (hit) this.memQueueNext.delete(sessionId);
-    return hit;
+    return this.messageQueue.takeImmediate(sessionId);
   }
 
-  private async writeQueueNext(
-    sessionId: string,
-    item: CloudAgentQueuedMessage,
-  ): Promise<void> {
-    if (isRedisEnabled()) {
-      const redis = await getRedis();
-      if (redis) {
-        try {
-          await redis.set(REDIS_KEYS.queueNext(sessionId), JSON.stringify(item), {
-            EX: QUEUE_TTL_SECONDS,
-          });
-          return;
-        } catch (err) {
-          recordPlatformFault("cloud_agent.queue_next_write", err, {
-            subsystem: "cloud_agent",
-            dep: "redis",
-          });
-        }
-      }
-    }
-    this.memQueueNext.set(sessionId, item);
-  }
-
-  /** FIFO 取队头（Run 结束后由服务端开下一回合） */
+  /** Consume the FIFO head after a run ends. */
   async takeNextQueued(sessionId: string): Promise<CloudAgentQueuedMessage | null> {
-    const hit = await this.mutateQueue(sessionId, (items) => {
-      const [head, ...rest] = items;
-      return { items: head ? rest : items, result: head ?? null };
-    });
-    if (hit) await this.publishQueueSnapshot(sessionId);
-    return hit;
+    const item = await this.messageQueue.takeHead(sessionId);
+    if (item) await this.publishQueueSnapshot(sessionId);
+    return item;
   }
 
-  /** 出队后 startTurn 竞争失败时放回队头（不丢消息） */
+  /** Restore an item when the next-run claim loses a race. */
   async requeueFront(sessionId: string, item: CloudAgentQueuedMessage): Promise<void> {
-    await this.mutateQueue(sessionId, (items) => ({
-      items: [normalizeQueuedMessage(item), ...items.filter((i) => i.messageId !== item.messageId)],
-      result: null,
-    }));
+    await this.messageQueue.requeueFront(sessionId, item);
     await this.publishQueueSnapshot(sessionId);
   }
 
-  /** 取出全部 mode=steer 项（loop 在工具批后注入当前 Run），FIFO */
+  /** Drain all steer messages in FIFO order while retaining queued turns. */
   async drainSteerQueued(sessionId: string): Promise<CloudAgentQueuedMessage[]> {
-    const drained = await this.mutateQueue(sessionId, (items) => ({
-      items: items.filter((i) => i.mode !== "steer"),
-      result: items.filter((i) => i.mode === "steer"),
-    }));
-    if (drained.length > 0) await this.publishQueueSnapshot(sessionId);
-    return drained;
+    const items = await this.messageQueue.drainSteer(sessionId);
+    if (items.length > 0) await this.publishQueueSnapshot(sessionId);
+    return items;
   }
 }

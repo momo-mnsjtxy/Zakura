@@ -5,38 +5,46 @@ import type {
   OpenAIChatCompletion,
 } from "@zakura/shared";
 
-/** 构造统一的 OpenAI Chat Completions 响应（各协议适配器最终输出此形状） */
+type NormalizedUsage = {
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+};
+
+function hasUsage(usage: NormalizedUsage | undefined): usage is NormalizedUsage {
+  return Boolean(
+    usage &&
+      (usage.promptTokens != null ||
+        usage.completionTokens != null ||
+        usage.totalTokens != null),
+  );
+}
+
+/** Build the stable Chat Completions envelope returned by every model adapter. */
 export function buildOpenAIChatCompletion(input: {
   model: string;
   content: string | null;
   toolCalls?: ModelToolCall[];
   finishReason?: string | null;
-  usage?: {
-    promptTokens?: number;
-    completionTokens?: number;
-    totalTokens?: number;
-  };
+  usage?: NormalizedUsage;
   id?: string;
   created?: number;
 }): OpenAIChatCompletion {
-  const usage =
-    input.usage &&
-    (input.usage.promptTokens != null ||
-      input.usage.completionTokens != null ||
-      input.usage.totalTokens != null)
-      ? {
-          prompt_tokens: input.usage.promptTokens ?? 0,
-          completion_tokens: input.usage.completionTokens ?? 0,
-          total_tokens:
-            input.usage.totalTokens ??
-            (input.usage.promptTokens ?? 0) + (input.usage.completionTokens ?? 0),
-        }
-      : undefined;
+  const toolCalls = input.toolCalls?.length ? input.toolCalls : undefined;
+  const usage = hasUsage(input.usage)
+    ? {
+        prompt_tokens: input.usage.promptTokens ?? 0,
+        completion_tokens: input.usage.completionTokens ?? 0,
+        total_tokens:
+          input.usage.totalTokens ??
+          (input.usage.promptTokens ?? 0) + (input.usage.completionTokens ?? 0),
+      }
+    : undefined;
 
   return {
     id: input.id ?? `chatcmpl-${createId()}`,
     object: "chat.completion",
-    created: input.created ?? Math.floor(Date.now() / 1000),
+    created: input.created ?? Math.floor(Date.now() / 1_000),
     model: input.model,
     choices: [
       {
@@ -44,120 +52,154 @@ export function buildOpenAIChatCompletion(input: {
         message: {
           role: "assistant",
           content: input.content,
-          ...(input.toolCalls?.length ? { tool_calls: input.toolCalls } : {}),
+          ...(toolCalls ? { tool_calls: toolCalls } : {}),
         },
-        finish_reason: input.finishReason ?? (input.toolCalls?.length ? "tool_calls" : "stop"),
+        finish_reason:
+          input.finishReason ?? (toolCalls ? "tool_calls" : "stop"),
       },
     ],
     usage,
   };
 }
 
-/** OpenAI 流式 chunk 中 choices[0].delta 的累积状态 */
 export type ChatStreamState = {
   content: string;
   reasoning: string;
   toolCalls: Array<{ id: string; name: string; arguments: string }>;
   finishReason: string | null;
   model: string | null;
-  usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number };
+  usage?: NormalizedUsage;
 };
 
 export function createChatStreamState(): ChatStreamState {
-  return { content: "", reasoning: "", toolCalls: [], finishReason: null, model: null };
+  return {
+    content: "",
+    reasoning: "",
+    toolCalls: [],
+    finishReason: null,
+    model: null,
+  };
 }
 
-/**
- * 吸收一个已解析的流式 chunk（chat.completion.chunk）。
- * 返回本 chunk 新增的文本增量（无则空串）。
- */
+type StreamToolDelta = {
+  index?: number;
+  id?: string;
+  function?: { name?: string; arguments?: string };
+};
+
+function toolSlot(state: ChatStreamState, delta: StreamToolDelta) {
+  let index = delta.index;
+  if (index == null && delta.id) {
+    const existing = state.toolCalls.findIndex((call) => call.id === delta.id);
+    if (existing >= 0) index = existing;
+  }
+  // Some compatible gateways omit index after the opening fragment. Attach
+  // those fragments to the most recent call rather than inventing extra calls.
+  if (index == null) index = Math.max(0, state.toolCalls.length - 1);
+  while (state.toolCalls.length <= index) {
+    state.toolCalls.push({ id: "", name: "", arguments: "" });
+  }
+  return state.toolCalls[index]!;
+}
+
+/** Consume one Chat Completions chunk and return only its visible deltas. */
 export function absorbChatStreamChunk(
   state: ChatStreamState,
   chunk: unknown,
 ): { content: string; reasoning: string } {
-  const empty = { content: "", reasoning: "" };
-  if (!chunk || typeof chunk !== "object") return empty;
-  const o = chunk as {
-    model?: string;
+  if (!chunk || typeof chunk !== "object") return { content: "", reasoning: "" };
+  const envelope = chunk as {
+    model?: unknown;
     choices?: Array<{
       delta?: {
-        content?: string | null;
-        reasoning?: string | null;
-        reasoning_content?: string | null;
-        reasoning_text?: string | null;
-        thinking?: string | null;
-        tool_calls?: Array<{
-          index?: number;
-          id?: string;
-          function?: { name?: string; arguments?: string };
-        }>;
+        content?: unknown;
+        reasoning?: unknown;
+        reasoning_content?: unknown;
+        reasoning_text?: unknown;
+        thinking?: unknown;
+        tool_calls?: StreamToolDelta[];
       };
-      finish_reason?: string | null;
+      finish_reason?: unknown;
     }>;
-    usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+    usage?: {
+      prompt_tokens?: unknown;
+      completion_tokens?: unknown;
+      total_tokens?: unknown;
+    };
   };
-  if (typeof o.model === "string" && o.model) state.model = o.model;
-  if (o.usage) {
+
+  if (typeof envelope.model === "string" && envelope.model) {
+    state.model = envelope.model;
+  }
+  if (envelope.usage) {
+    const number = (value: unknown) =>
+      typeof value === "number" && Number.isFinite(value) ? value : undefined;
     state.usage = {
-      promptTokens: o.usage.prompt_tokens,
-      completionTokens: o.usage.completion_tokens,
-      totalTokens: o.usage.total_tokens,
+      promptTokens:
+        number(envelope.usage.prompt_tokens) ?? state.usage?.promptTokens,
+      completionTokens:
+        number(envelope.usage.completion_tokens) ?? state.usage?.completionTokens,
+      totalTokens: number(envelope.usage.total_tokens) ?? state.usage?.totalTokens,
     };
   }
-  const choice = o.choices?.[0];
-  if (!choice) return empty;
-  if (choice.finish_reason) state.finishReason = choice.finish_reason;
-  const delta = choice.delta;
-  if (!delta) return empty;
-  for (const tc of delta.tool_calls ?? []) {
-    const idx = tc.index ?? state.toolCalls.length;
-    while (state.toolCalls.length <= idx) {
-      state.toolCalls.push({ id: "", name: "", arguments: "" });
-    }
-    const slot = state.toolCalls[idx]!;
-    if (tc.id) slot.id = tc.id;
-    if (tc.function?.name) slot.name += tc.function.name;
-    if (tc.function?.arguments) slot.arguments += tc.function.arguments;
+
+  const choice = envelope.choices?.[0];
+  if (!choice) return { content: "", reasoning: "" };
+  if (typeof choice.finish_reason === "string") {
+    state.finishReason = choice.finish_reason;
   }
-  const reasoning =
+  const delta = choice.delta;
+  if (!delta) return { content: "", reasoning: "" };
+
+  for (const fragment of delta.tool_calls ?? []) {
+    const slot = toolSlot(state, fragment);
+    if (fragment.id) slot.id = fragment.id;
+    if (fragment.function?.name) slot.name += fragment.function.name;
+    if (fragment.function?.arguments) {
+      slot.arguments += fragment.function.arguments;
+    }
+  }
+
+  const candidateReasoning =
     delta.reasoning_content ??
     delta.reasoning ??
     delta.reasoning_text ??
     delta.thinking;
-  if (typeof reasoning === "string" && reasoning) {
-    state.reasoning += reasoning;
-  }
-  if (typeof delta.content === "string" && delta.content) {
-    state.content += delta.content;
-    return { content: delta.content, reasoning: reasoning ?? "" };
-  }
-  return { content: "", reasoning: reasoning ?? "" };
+  const reasoning =
+    typeof candidateReasoning === "string" ? candidateReasoning : "";
+  const content = typeof delta.content === "string" ? delta.content : "";
+  if (reasoning) state.reasoning += reasoning;
+  if (content) state.content += content;
+  return { content, reasoning };
 }
 
-/** 将累积状态封为统一 ModelChatResult */
 export function chatStreamStateToResult(
   state: ChatStreamState,
   fallbackModel: string,
 ): ModelChatResult {
-  const completeToolCalls = state.toolCalls.filter((t) => t.name.trim());
-  const includeToolCalls =
-    state.finishReason === "tool_calls" ||
-    (state.finishReason !== "stop" && !state.content && completeToolCalls.length > 0);
-  const toolCalls: ModelToolCall[] | undefined = includeToolCalls
-    ? completeToolCalls.map((t, i) => ({
-        id: t.id || `call_${i}`,
-        type: "function" as const,
-        function: { name: t.name, arguments: t.arguments || "{}" },
+  const completeCalls = state.toolCalls.filter((call) => call.name.trim());
+  // `stop` is the only explicit declaration that tools are not actionable.
+  // Several compatible gateways end at EOF or send finish_reason=null.
+  const includeCalls = state.finishReason !== "stop" && completeCalls.length > 0;
+  const toolCalls: ModelToolCall[] | undefined = includeCalls
+    ? completeCalls.map((call, index) => ({
+        id: call.id || `call_${index}`,
+        type: "function",
+        function: {
+          name: call.name,
+          arguments: call.arguments || "{}",
+        },
       }))
     : undefined;
-  const openai = buildOpenAIChatCompletion({
-    model: state.model ?? fallbackModel,
-    content: state.content || null,
-    toolCalls,
-    finishReason: state.finishReason,
-    usage: state.usage,
-  });
-  return toModelChatResult(openai);
+  return toModelChatResult(
+    buildOpenAIChatCompletion({
+      model: state.model ?? fallbackModel,
+      content: state.content || null,
+      toolCalls,
+      finishReason: state.finishReason,
+      usage: state.usage,
+    }),
+  );
 }
 
 export function toModelChatResult(
@@ -165,12 +207,11 @@ export function toModelChatResult(
   raw?: unknown,
 ): ModelChatResult {
   const choice = openai.choices[0];
-  const message = choice?.message;
   return {
-    content: message?.content ?? null,
+    content: choice?.message.content ?? null,
     model: openai.model,
     finishReason: choice?.finish_reason ?? null,
-    toolCalls: message?.tool_calls,
+    toolCalls: choice?.message.tool_calls,
     usage: openai.usage
       ? {
           promptTokens: openai.usage.prompt_tokens,

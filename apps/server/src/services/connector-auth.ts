@@ -24,6 +24,7 @@ import type { AppConfig } from "../config.js";
 import type { Db } from "../db/client.js";
 import {
   agentConnectorInstallations,
+  agents,
   connectorAuthProfiles,
   connectorSettings,
   newId,
@@ -103,6 +104,32 @@ function decrypt(secret: string, enc: string): Record<string, unknown> {
   }
 }
 
+function decryptForMutation(secret: string, enc: string): Record<string, unknown> {
+  if (!enc) return {};
+  try {
+    return decryptJson<Record<string, unknown>>(secret, enc);
+  } catch {
+    // Never replace an unreadable credential blob with a partial update. Operators
+    // can restore the secret/config rather than silently losing every saved field.
+    throw new Error("凭据无法解密，已拒绝覆盖；请检查 ZAKURA_SECRET 或重新创建档案");
+  }
+}
+
+class KeyedMutationQueue {
+  private readonly tails = new Map<string, Promise<unknown>>();
+
+  run<T>(key: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.tails.get(key) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(operation);
+    const settled = current.then(() => undefined, () => undefined);
+    const tail = settled.finally(() => {
+      if (this.tails.get(key) === tail) this.tails.delete(key);
+    });
+    this.tails.set(key, tail);
+    return current;
+  }
+}
+
 function configuredKeys(values: Record<string, unknown>): string[] {
   return Object.keys(values).filter(
     (key) => values[key] != null && String(values[key]).trim() !== "",
@@ -114,6 +141,8 @@ function hasUsableOauth(values: Record<string, unknown>): boolean {
 }
 
 export class ConnectorAuthService {
+  private readonly mutations = new KeyedMutationQueue();
+
   constructor(
     private readonly db: Db,
     private readonly appConfig: AppConfig,
@@ -195,21 +224,23 @@ export class ConnectorAuthService {
     profileKey: string,
     values: Record<string, unknown>,
   ): Promise<void> {
-    const row = await this.db.query.connectorAuthProfiles.findFirst({
-      where: and(
-        eq(connectorAuthProfiles.scopeKey, scopeKey),
-        eq(connectorAuthProfiles.profileKey, profileKey),
-      ),
+    await this.mutations.run(`profile:${scopeKey}:${profileKey}`, async () => {
+      const row = await this.db.query.connectorAuthProfiles.findFirst({
+        where: and(
+          eq(connectorAuthProfiles.scopeKey, scopeKey),
+          eq(connectorAuthProfiles.profileKey, profileKey),
+        ),
+      });
+      if (!row) throw new Error("凭据档案不存在");
+      const current = decryptForMutation(this.appConfig.secret, row.configEnc);
+      await this.db
+        .update(connectorAuthProfiles)
+        .set({
+          configEnc: encryptJson(this.appConfig.secret, { ...current, ...values }),
+          updatedAt: new Date(),
+        })
+        .where(eq(connectorAuthProfiles.id, row.id));
     });
-    if (!row) throw new Error("凭据档案不存在");
-    const current = decrypt(this.appConfig.secret, row.configEnc);
-    await this.db
-      .update(connectorAuthProfiles)
-      .set({
-        configEnc: encryptJson(this.appConfig.secret, { ...current, ...values }),
-        updatedAt: new Date(),
-      })
-      .where(eq(connectorAuthProfiles.id, row.id));
   }
 
   /** 哪些档案被整站预配并启用（团队侧据此锁定） */
@@ -245,6 +276,7 @@ export class ConnectorAuthService {
       throw new Error("档案名称只能包含字母、数字、点、下划线和连字符，且不超过 64 个字符");
     }
 
+    return this.mutations.run(`profile:${scopeKey}:${key}`, async () => {
     const existing = await this.db.query.connectorAuthProfiles.findFirst({
       where: and(
         eq(connectorAuthProfiles.scopeKey, scopeKey),
@@ -275,7 +307,7 @@ export class ConnectorAuthService {
       ? declared.fields
       : defaultFieldsForKind(kind);
 
-    const current = existing ? decrypt(this.appConfig.secret, existing.configEnc) : {};
+    const current = existing ? decryptForMutation(this.appConfig.secret, existing.configEnc) : {};
     for (const [field, value] of Object.entries(input.values ?? {})) {
       // custom 档案允许管理员自定义键；有声明的档案严格按 schema 校验
       if (fields.length && !fields.some((item) => item.key === field)) {
@@ -323,6 +355,7 @@ export class ConnectorAuthService {
           updatedAt: now,
         },
       });
+    });
   }
 
   async deleteProfile(scopeKey: string, profileKey: string): Promise<void> {
@@ -393,13 +426,15 @@ export class ConnectorAuthService {
       expiresAt?: number;
     },
   ): Promise<void> {
+    if (!values.accessToken.trim()) throw new Error("accessToken 不能为空");
+    await this.mutations.run(`settings:${scopeKey}:${connectorRef}`, async () => {
     const existing = await this.db.query.connectorSettings.findFirst({
       where: and(
         eq(connectorSettings.scopeKey, scopeKey),
         eq(connectorSettings.connectorRef, connectorRef),
       ),
     });
-    const current = existing ? decrypt(this.appConfig.secret, existing.configEnc) : {};
+    const current = existing ? decryptForMutation(this.appConfig.secret, existing.configEnc) : {};
     current.oauthAccessToken = values.accessToken;
     if (values.refreshToken) current.oauthRefreshToken = values.refreshToken;
     if (values.expiresAt !== undefined) current.oauthExpiresAt = values.expiresAt;
@@ -418,6 +453,7 @@ export class ConnectorAuthService {
         target: [connectorSettings.scopeKey, connectorSettings.connectorRef],
         set: { configEnc: encryptJson(this.appConfig.secret, current), updatedAt: now },
       });
+    });
   }
 
   async saveSettings(
@@ -426,13 +462,14 @@ export class ConnectorAuthService {
     values: Record<string, unknown>,
     fields: ConnectorField[],
   ): Promise<Record<string, unknown>> {
+    return this.mutations.run(`settings:${scopeKey}:${connectorRef}`, async () => {
     const existing = await this.db.query.connectorSettings.findFirst({
       where: and(
         eq(connectorSettings.scopeKey, scopeKey),
         eq(connectorSettings.connectorRef, connectorRef),
       ),
     });
-    const current = existing ? decrypt(this.appConfig.secret, existing.configEnc) : {};
+    const current = existing ? decryptForMutation(this.appConfig.secret, existing.configEnc) : {};
     for (const [key, value] of Object.entries(values)) {
       const field = fields.find((item) => item.key === key);
       if (!field) throw new Error(`未知设置字段: ${key}`);
@@ -460,6 +497,7 @@ export class ConnectorAuthService {
         set: { configEnc: encryptJson(this.appConfig.secret, current), updatedAt: now },
       });
     return current;
+    });
   }
 
   // ── Agent 安装（认证资源）──────────────────────────────────────────────
@@ -512,37 +550,36 @@ export class ConnectorAuthService {
     connectorRef: string,
     agentIds: string[],
   ): Promise<void> {
+    const ref = connectorRef.trim();
+    if (!ref) throw new Error("connectorRef 不能为空");
     const unique = [...new Set(agentIds.map((id) => id.trim()).filter(Boolean))];
     if (!unique.length) throw new Error("请至少选择一个 Agent");
+    const owned = await this.db
+      .select({ id: agents.id })
+      .from(agents)
+      .where(and(eq(agents.tenantId, tenantId), inArray(agents.id, unique)));
+    const ownedIds = new Set(owned.map((agent) => agent.id));
+    const foreignOrMissing = unique.filter((id) => !ownedIds.has(id));
+    if (foreignOrMissing.length) {
+      throw new Error(`Agent 不存在或不属于当前租户: ${foreignOrMissing.join(", ")}`);
+    }
     const now = new Date();
-    for (const agentId of unique) {
-      const existing = await this.db.query.agentConnectorInstallations.findFirst({
-        where: and(
-          eq(agentConnectorInstallations.tenantId, tenantId),
-          eq(agentConnectorInstallations.agentId, agentId),
-          eq(agentConnectorInstallations.connectorRef, connectorRef),
-        ),
-      });
-      if (existing) {
-        if (!existing.enabled) {
-          await this.db
-            .update(agentConnectorInstallations)
-            .set({ enabled: true, updatedAt: now })
-            .where(eq(agentConnectorInstallations.id, existing.id));
-        }
-        continue;
-      }
-      await this.db.insert(agentConnectorInstallations).values({
+    await this.db
+      .insert(agentConnectorInstallations)
+      .values(unique.map((agentId) => ({
         id: newId(),
         tenantId,
         agentId,
-        connectorRef,
+        connectorRef: ref,
         enabled: true,
         configEnc: encryptJson(this.appConfig.secret, {}),
         createdAt: now,
         updatedAt: now,
+      })))
+      .onConflictDoUpdate({
+        target: [agentConnectorInstallations.agentId, agentConnectorInstallations.connectorRef],
+        set: { enabled: true, updatedAt: now },
       });
-    }
   }
 
   async removeInstallation(
@@ -574,6 +611,8 @@ export class ConnectorAuthService {
       expiresAt?: number;
     },
   ): Promise<void> {
+    if (!values.accessToken.trim()) throw new Error("accessToken 不能为空");
+    await this.mutations.run(`install:${tenantId}:${agentId}:${connectorRef}`, async () => {
     let row = await this.db.query.agentConnectorInstallations.findFirst({
       where: and(
         eq(agentConnectorInstallations.tenantId, tenantId),
@@ -592,7 +631,7 @@ export class ConnectorAuthService {
       });
       if (!row) throw new Error("安装连接器失败");
     }
-    const current = decrypt(this.appConfig.secret, row.configEnc);
+    const current = decryptForMutation(this.appConfig.secret, row.configEnc);
     current.oauthAccessToken = values.accessToken;
     if (values.refreshToken) current.oauthRefreshToken = values.refreshToken;
     if (values.expiresAt !== undefined) current.oauthExpiresAt = values.expiresAt;
@@ -604,5 +643,6 @@ export class ConnectorAuthService {
         updatedAt: new Date(),
       })
       .where(eq(agentConnectorInstallations.id, row.id));
+    });
   }
 }

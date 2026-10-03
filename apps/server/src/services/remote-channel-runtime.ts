@@ -199,6 +199,8 @@ function permalinkOf(message: any): string | undefined {
 
 export class RemoteChannelRuntime {
   private readonly bots = new Map<string, Bot>();
+  /** Binding startup can be triggered by boot, UI enable and a webhook concurrently. */
+  private readonly botStarts = new Map<string, Promise<Bot>>();
   private readonly states = new Map<string, PostgresStateAdapter | MemoryStateAdapter>();
   readonly sessions: RemoteChannelToolPort = new RemoteChannelSessionRegistry();
 
@@ -229,6 +231,8 @@ export class RemoteChannelRuntime {
   }
 
   async invalidate(bindingId: string): Promise<void> {
+    const starting = this.botStarts.get(bindingId);
+    if (starting) await starting.catch(() => undefined);
     const bot = this.bots.get(bindingId);
     if (bot) {
       this.bots.delete(bindingId);
@@ -262,8 +266,10 @@ export class RemoteChannelRuntime {
   }
 
   async stop(): Promise<void> {
+    await Promise.allSettled(this.botStarts.values());
     for (const bot of this.bots.values()) await bot.shutdown().catch(() => undefined);
     this.bots.clear();
+    this.botStarts.clear();
     for (const state of this.states.values()) await state.disconnect().catch(() => undefined);
     this.states.clear();
   }
@@ -403,6 +409,23 @@ export class RemoteChannelRuntime {
     tenantId: string,
     binding: { id: string; platform: string; profileKey: string; agentId?: string },
   ): Promise<Bot> {
+    const existing = this.bots.get(binding.id);
+    if (existing) return existing;
+    const starting = this.botStarts.get(binding.id);
+    if (starting) return starting;
+    const operation = this.createBot(tenantId, binding).finally(() => {
+      if (this.botStarts.get(binding.id) === operation) this.botStarts.delete(binding.id);
+    });
+    this.botStarts.set(binding.id, operation);
+    return operation;
+  }
+
+  private async createBot(
+    tenantId: string,
+    binding: { id: string; platform: string; profileKey: string; agentId?: string },
+  ): Promise<Bot> {
+    // Recheck after entering the serialized startup path. This also makes a
+    // recovered start safe if a prior initialization completed just before it.
     const existing = this.bots.get(binding.id);
     if (existing) return existing;
     if (!isChatSdkPlatform(binding.platform)) throw new Error(`不支持远程平台: ${binding.platform}`);

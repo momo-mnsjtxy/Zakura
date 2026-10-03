@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Loader2 } from "lucide-react";
@@ -15,6 +15,7 @@ import { SearchField } from "@/components/ui/search-field";
 import { PageLoading } from "@/components/ui/progress-linear";
 import { api } from "@/lib/api";
 import { shouldLetBrowserHandleClick } from "@/lib/nav";
+import { connectorOauthResult, createChannelConnectionController } from "@/lib/channel-connection-state";
 
 type IntegrationPackage = {
   slug: string;
@@ -70,21 +71,25 @@ export default function ConnectorsHub() {
   const [q, setQ] = useState("");
   const [view, setView] = useState<ViewMode>("all");
   const [redirectUri, setRedirectUri] = useState("");
+  const requestState = useRef(createChannelConnectionController());
 
   const load = useCallback(async () => {
+    const request = requestState.current.beginLoad();
     setLoading(true);
     try {
       const [pkgs, creds] = await Promise.all([
         api<{ packages: IntegrationPackage[] }>("/api/integrations/packages"),
         api<{ connectors: ConnectorRow[]; redirectUri?: string }>("/api/connectors?scope=tenant"),
       ]);
-      setPackages(pkgs.packages);
-      setConnectors(creds.connectors);
+      if (!request.current()) return;
+      setPackages(pkgs.packages ?? []);
+      setConnectors(creds.connectors ?? []);
       setRedirectUri(creds.redirectUri ?? "");
     } catch (err) {
+      if (!request.current()) return;
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      if (request.current()) setLoading(false);
     }
   }, []);
 
@@ -135,10 +140,12 @@ export default function ConnectorsHub() {
   }, [bySlug, connectors, selectedSlug]);
 
   useEffect(() => {
-    if (searchParams.get("oauth") === "1") {
-      toast.success("已为该 Agent 完成授权");
-    }
+    const result = connectorOauthResult(searchParams.toString());
+    if (result?.ok) toast.success(result.message);
+    else if (result) toast.error(result.message);
   }, [searchParams]);
+
+  useEffect(() => () => requestState.current.invalidate(), []);
 
   useEffect(() => {
     if (selectedSlug === "agent-remote") router.replace("/dashboard/agents");

@@ -1,4 +1,4 @@
-import { and, eq, lt } from "drizzle-orm";
+import { and, eq, gt, lt } from "drizzle-orm";
 import { createHash, randomBytes } from "node:crypto";
 import { SAML } from "@node-saml/node-saml";
 import { encryptJson, decryptJson } from "@zakura/core";
@@ -248,9 +248,7 @@ export async function completeOidcSso(
   urls: { webPublicUrl: string; publicBaseUrl: string },
   input: { code: string; state: string },
 ) {
-  const state = await db.query.ssoLoginStates.findFirst({ where: eq(ssoLoginStates.id, input.state) });
-  if (!state || state.expiresAt.getTime() < Date.now()) throw new Error("SSO 状态已过期");
-  await db.delete(ssoLoginStates).where(eq(ssoLoginStates.id, state.id));
+  const state = await claimSsoState(db, input.state, "oidc");
   const sso = await getTenantSso(db, state.tenantId);
   if (!sso?.enabled || sso.protocol !== "oidc") throw new Error("SSO 未启用");
   await discoverOidcIfNeeded(sso);
@@ -349,10 +347,9 @@ export async function completeSamlSso(
 ) {
   const { tenant, sso } = await loadTenantBySlug(db, slug);
   if (sso.protocol !== "saml") throw new Error("该团队 SSO 不是 SAML");
-  if (body.RelayState) {
-    const state = await db.query.ssoLoginStates.findFirst({ where: eq(ssoLoginStates.id, body.RelayState) });
-    if (state) await db.delete(ssoLoginStates).where(eq(ssoLoginStates.id, state.id));
-  }
+  if (!body.RelayState) throw new Error("SSO 状态缺失");
+  const state = await claimSsoState(db, body.RelayState, "saml");
+  if (state.tenantId !== tenant.id) throw new Error("SSO 状态与团队不匹配");
   const client = samlClient(sso, secret, ssoUrls(urls, tenant.slug));
   const result = await client.validatePostResponseAsync({
     SAMLResponse: body.SAMLResponse ?? "",
@@ -404,74 +401,117 @@ async function provisionSsoUser(
   },
 ) {
   if (input.tenant.suspendedAt) throw new Error("所在团队已被封禁");
-  let user = await db.query.users.findFirst({ where: eq(users.email, input.email) });
-  if (!user) {
-    if (!input.sso.jitEnabled) throw new Error("账号不存在，且未开启自动开通");
+  const result = await db.transaction(async (tx) => {
+    const database = tx as Db;
     const now = new Date();
-    const [created] = await db
-      .insert(users)
-      .values({
+    const identity = await database.query.oauthIdentities.findFirst({
+      where: and(
+        eq(oauthIdentities.provider, input.provider),
+        eq(oauthIdentities.providerUserId, input.subject),
+      ),
+    });
+
+    // Once linked, the stable IdP subject is authoritative. A changed email claim
+    // must not silently move that identity to another global account.
+    let user = identity
+      ? await database.query.users.findFirst({ where: eq(users.id, identity.userId) })
+      : await database.query.users.findFirst({ where: eq(users.email, input.email) });
+    if (!user) {
+      if (!input.sso.jitEnabled) throw new Error("账号不存在，且未开启自动开通");
+      [user] = await database
+        .insert(users)
+        .values({
+          id: newId(),
+          email: input.email,
+          name: input.name || input.email.split("@")[0],
+          passwordHash: null,
+          emailVerifiedAt: now,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning();
+    } else if (!user.emailVerifiedAt) {
+      [user] = await database
+        .update(users)
+        .set({ emailVerifiedAt: now, updatedAt: now })
+        .where(eq(users.id, user.id))
+        .returning();
+    }
+    if (user.suspendedAt) throw new Error("账号已被封禁");
+
+    if (identity) {
+      await database
+        .update(oauthIdentities)
+        .set({ profileJson: JSON.stringify({ email: input.email, name: input.name }), updatedAt: now })
+        .where(eq(oauthIdentities.id, identity.id));
+    } else {
+      await database.insert(oauthIdentities).values({
         id: newId(),
-        email: input.email,
-        name: input.name || input.email.split("@")[0],
-        passwordHash: null,
-        emailVerifiedAt: now,
+        provider: input.provider,
+        providerUserId: input.subject,
+        userId: user.id,
+        profileJson: JSON.stringify({ email: input.email, name: input.name }),
         createdAt: now,
         updatedAt: now,
-      })
-      .returning();
-    user = created;
-  } else if (!user.emailVerifiedAt) {
-    await db.update(users).set({ emailVerifiedAt: new Date(), updatedAt: new Date() }).where(eq(users.id, user.id));
-  }
-  if (user.suspendedAt) throw new Error("账号已被封禁");
+      });
+    }
 
-  const existingId = await db.query.oauthIdentities.findFirst({
-    where: and(eq(oauthIdentities.provider, input.provider), eq(oauthIdentities.providerUserId, input.subject)),
-  });
-  if (!existingId) {
-    await db.insert(oauthIdentities).values({
-      id: newId(),
-      provider: input.provider,
-      providerUserId: input.subject,
-      userId: user.id,
-      profileJson: JSON.stringify({ email: input.email, name: input.name }),
-      createdAt: new Date(),
-      updatedAt: new Date(),
+    let membership = await database.query.tenantMemberships.findFirst({
+      where: and(
+        eq(tenantMemberships.tenantId, input.tenant.id),
+        eq(tenantMemberships.userId, user.id),
+      ),
     });
-  }
-
-  let membership = await db.query.tenantMemberships.findFirst({
-    where: and(eq(tenantMemberships.tenantId, input.tenant.id), eq(tenantMemberships.userId, user.id)),
+    if (!membership) {
+      if (!input.sso.jitEnabled) throw new Error("成员不存在，且未开启自动开通");
+      [membership] = await database
+        .insert(tenantMemberships)
+        .values({
+          id: newId(),
+          tenantId: input.tenant.id,
+          userId: user.id,
+          role: input.sso.defaultRole === "admin" ? "admin" : "member",
+          status: "active",
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning();
+    }
+    if (membership.status !== "active") throw new Error("成员资格已被停用");
+    return { user, membership };
   });
-  if (!membership) {
-    const role = input.sso.defaultRole === "admin" ? "admin" : "member";
-    const [created] = await db
-      .insert(tenantMemberships)
-      .values({
-        id: newId(),
-        tenantId: input.tenant.id,
-        userId: user.id,
-        role,
-        status: "active",
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      })
-      .returning();
-    membership = created;
-  }
-  if (membership.status !== "active") throw new Error("成员资格已被停用");
+
   await maybeAutoJoinTenant(db, {
-    userId: user.id,
+    userId: result.user.id,
     email: input.email,
     emailVerified: true,
     fromSso: true,
   });
   return {
-    user,
+    user: result.user,
     tenant: input.tenant,
-    membership,
+    membership: result.membership,
   };
+}
+
+export async function claimSsoState(
+  db: Db,
+  id: string,
+  protocol: "oidc" | "saml",
+  now = new Date(),
+) {
+  const [state] = await db
+    .delete(ssoLoginStates)
+    .where(
+      and(
+        eq(ssoLoginStates.id, id),
+        eq(ssoLoginStates.protocol, protocol),
+        gt(ssoLoginStates.expiresAt, now),
+      ),
+    )
+    .returning();
+  if (!state) throw new Error("SSO 状态已过期");
+  return state;
 }
 
 export async function purgeExpiredSsoStates(db: Db) {

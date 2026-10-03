@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronRight, ExternalLink, Loader2, ShieldCheck, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { BrandIcon } from "@/components/brand-icon";
@@ -25,6 +25,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { api } from "@/lib/api";
+import { createChannelConnectionController } from "@/lib/channel-connection-state";
 import { fetchAgents, type AgentListItem } from "@/lib/agents";
 import {
   BROWSER_NOTIFICATIONS_REF,
@@ -151,6 +152,9 @@ export function ConnectorConfigSheet({
   >("default");
   const [browserPref, setBrowserPref] = useState(true);
   const [browserAuthorizing, setBrowserAuthorizing] = useState(false);
+  const requestState = useRef(createChannelConnectionController());
+
+  useEffect(() => () => requestState.current.invalidate(), []);
 
   const connector = useMemo(
     () => connectors.find((item) => item.ref === activeRef) ?? connectors[0] ?? null,
@@ -241,9 +245,11 @@ export function ConnectorConfigSheet({
 
   useEffect(() => {
     if (!open) return;
+    const request = requestState.current.beginLoad("agents");
     void fetchAgents()
-      .then(setAgents)
-      .catch((err) => toast.error(err instanceof Error ? err.message : String(err)));
+      .then((items) => { if (request.current()) setAgents(items); })
+      .catch((err) => { if (request.current()) toast.error(err instanceof Error ? err.message : String(err)); });
+    return () => requestState.current.invalidate("agents");
   }, [open]);
 
   const supportsInboundWebhook = useMemo(
@@ -260,22 +266,24 @@ export function ConnectorConfigSheet({
       setEmailWebhookUrl("");
       return;
     }
+    const request = requestState.current.beginLoad("webhook");
     void api<{ emailWebhookUrl?: string }>("/api/remote-channels")
-      .then((result) => setEmailWebhookUrl(result.emailWebhookUrl ?? ""))
-      .catch(() => setEmailWebhookUrl(""));
+      .then((result) => { if (request.current()) setEmailWebhookUrl(result.emailWebhookUrl ?? ""); })
+      .catch(() => { if (request.current()) setEmailWebhookUrl(""); });
+    return () => requestState.current.invalidate("webhook");
   }, [open, supportsInboundWebhook]);
 
   async function save() {
     if (!connector) return;
     setSaving(true);
     try {
-      const result = await api<{ connector: ConnectorView }>(
+      const result = await requestState.current.runOnce(`credentials:${connector.id}`, () => api<{ connector: ConnectorView }>(
         `/api/connectors/${encodeURIComponent(connector.id)}/credentials?scope=tenant`,
         {
           method: "PUT",
           json: { enabled, values: draft, settings: settingsDraft },
         },
-      );
+      ));
       setDraft({});
       setSettingsDraft({});
       setEnabled(result.connector.enabled);
@@ -331,10 +339,10 @@ export function ConnectorConfigSheet({
     }
     setInstalling(true);
     try {
-      await api(`/api/connectors/${encodeURIComponent(connector.ref)}/install`, {
+      await requestState.current.runOnce(`install:${connector.ref}`, () => api(`/api/connectors/${encodeURIComponent(connector.ref)}/install`, {
         method: "POST",
         json: agentTarget.all ? { all: true } : { agentIds },
-      });
+      }));
       toast.success(`已为 ${agentIds.length} 个 Agent 安装`);
       setAgentTarget({ all: false, agentIds: [] });
       onChanged();
@@ -353,10 +361,10 @@ export function ConnectorConfigSheet({
     }
     setAuthorizingAgentId(agentId);
     try {
-      const result = await api<{ authorizeUrl: string }>(
+      const result = await requestState.current.runOnce(`oauth:${connector.ref}:${agentId}`, () => api<{ authorizeUrl: string }>(
         `/api/connectors/${encodeURIComponent(connector.ref)}/oauth/start`,
         { method: "POST", json: { agentId } },
-      );
+      ));
       window.location.assign(result.authorizeUrl);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
@@ -368,10 +376,10 @@ export function ConnectorConfigSheet({
     if (!connector) return;
     setRemovingAgentId(agentId);
     try {
-      await api(
+      await requestState.current.runOnce(`revoke:${connector.ref}:${agentId}`, () => api(
         `/api/connectors/${encodeURIComponent(connector.ref)}/installations/${encodeURIComponent(agentId)}`,
         { method: "DELETE" },
-      );
+      ));
       toast.success("已卸载该 Agent 的连接器能力");
       onChanged();
     } catch (err) {

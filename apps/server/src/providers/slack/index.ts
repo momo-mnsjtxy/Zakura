@@ -1,39 +1,10 @@
-import type { InstanceHandle, ProviderPlugin } from "@zakura/core";
-import { textResult } from "@zakura/core";
-import type { McpToolDef, ProviderConfigSchema } from "@zakura/shared";
-import { eq } from "drizzle-orm";
-import { componentInstances } from "../../db/schema.js";
+import type { ProviderPlugin } from "@zakura/core";
+import type { McpToolDef } from "@zakura/shared";
 import type { AppConfig } from "../../config.js";
-import { McpUpstreamOauthService } from "../../services/mcp-upstream-oauth.js";
-import { applyOauthTokensToConfig } from "../generic-mcp.js";
+import { createOauthRestProvider, restJson } from "../oauth-rest.js";
 
 type SlackProduct = "channels" | "messages" | "users";
 const PRODUCTS: SlackProduct[] = ["channels", "messages", "users"];
-
-const configSchema: ProviderConfigSchema = {
-  type: "object",
-  title: "Slack",
-  required: ["product"],
-  properties: {
-    product: { type: "string", enum: PRODUCTS },
-    oauthAccessToken: { type: "string", format: "password" },
-    oauthRefreshToken: { type: "string", format: "password" },
-    oauthExpiresAt: { type: "number" },
-    oauthClientId: { type: "string" },
-    oauthClientSecret: { type: "string", format: "password" },
-    oauthTokenEndpoint: { type: "string" },
-    authRequired: { type: "boolean" },
-  },
-};
-
-let appConfigRef: AppConfig | null = null;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let dbRef: any = null;
-
-export function injectSlackRuntime(config: AppConfig, db: unknown): void {
-  appConfigRef = config;
-  dbRef = db;
-}
 
 export function slackBuiltinUrl(product: SlackProduct): string {
   return `zakura://slack/${product}`;
@@ -44,18 +15,6 @@ export function resolveSlackProduct(value: string): SlackProduct | null {
   if (PRODUCTS.includes(raw as SlackProduct)) return raw as SlackProduct;
   const matched = raw.match(/^zakura:\/\/slack\/(channels|messages|users)$/);
   return matched ? (matched[1] as SlackProduct) : null;
-}
-
-function parseProduct(config: Record<string, unknown>): SlackProduct {
-  const value =
-    typeof config.product === "string"
-      ? config.product
-      : typeof config.mcpUrl === "string"
-        ? config.mcpUrl
-        : "";
-  const product = resolveSlackProduct(value);
-  if (!product) throw new Error("config.product 须为 channels | messages | users");
-  return product;
 }
 
 async function slackApi<T>(
@@ -70,17 +29,14 @@ async function slackApi<T>(
       if (value != null && value !== "") url.searchParams.set(key, value);
     }
   }
-  const headers = new Headers({ Authorization: `Bearer ${token}` });
-  if (body) headers.set("Content-Type", "application/json; charset=utf-8");
-  const response = await fetch(url, {
+  const json = await restJson<T & { ok?: boolean; error?: string }>(url.toString(), token, {
     method: body ? "POST" : "GET",
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(60_000),
+    ...(body ? { json: body } : {}),
+    headers: body ? { "Content-Type": "application/json; charset=utf-8" } : undefined,
+    retry: { attempts: 3, baseDelayMs: 200, maxDelayMs: 2_000 },
   });
-  const json = (await response.json()) as T & { ok?: boolean; error?: string };
-  if (!response.ok || (json as { ok?: boolean }).ok === false) {
-    throw new Error(`Slack ${method}: ${(json as { error?: string }).error ?? response.status}`);
+  if (json.ok === false) {
+    throw new Error(`Slack ${method}: ${json.error ?? "request_failed"}`);
   }
   return json;
 }
@@ -140,90 +96,23 @@ async function callSlackTool(
   throw new Error(`Unknown Slack tool: ${name}`);
 }
 
-async function accessToken(handle: InstanceHandle): Promise<string> {
-  let current = { ...handle.config };
-  const expiresAt = Number(current.oauthExpiresAt ?? 0);
-  if (
-    (!current.oauthAccessToken || expiresAt <= Math.floor(Date.now() / 1000) + 120) &&
-    current.oauthRefreshToken &&
-    current.oauthClientId &&
-    appConfigRef
-  ) {
-    const tokenEndpoint = String(current.oauthTokenEndpoint ?? "").trim();
-    if (!tokenEndpoint) throw new Error("Slack OAuth 配置缺少 token endpoint");
-    const tokens = await new McpUpstreamOauthService(appConfigRef).refresh({
-      accessToken: String(current.oauthAccessToken ?? ""),
-      refreshToken: String(current.oauthRefreshToken),
-      expiresAt,
-      clientId: String(current.oauthClientId),
-      clientSecret:
-        typeof current.oauthClientSecret === "string" ? current.oauthClientSecret : undefined,
-      tokenEndpoint,
-    });
-    current = applyOauthTokensToConfig(current, tokens);
-    current.authRequired = false;
-    handle.config = current;
-    if (dbRef) {
-      const { encryptJson } = await import("@zakura/core");
-      await dbRef
-        .update(componentInstances)
-        .set({ configEnc: encryptJson(appConfigRef.secret, current), updatedAt: new Date() })
-        .where(eq(componentInstances.id, handle.id));
-    }
-  }
-  const token = String(current.oauthAccessToken ?? "").trim();
-  if (!token) throw new Error("AUTH_REQUIRED: 请先完成 Slack OAuth 授权");
-  return token;
+const factory = createOauthRestProvider({
+  id: "slack",
+  name: "Slack",
+  description: "平台直接调用 Slack Web API，提供频道、消息与用户工具。",
+  products: PRODUCTS,
+  toolDefs,
+  callTool: (product, name, token, args) =>
+    callSlackTool(token, product as SlackProduct, name, args),
+  health: async (token) => {
+    await slackApi(token, "auth.test");
+  },
+});
+
+export function injectSlackRuntime(config: AppConfig, db: unknown): void {
+  factory.injectRuntime(config, db);
 }
 
 export function createSlackProvider(): ProviderPlugin {
-  return {
-    id: "slack",
-    name: "Slack",
-    description: "平台直接调用 Slack Web API，提供频道、消息与用户工具。",
-    version: "1.0.0",
-    category: "connector",
-    capabilities: ["tools", "builtin"],
-    configSchema,
-    validateConfig(config) {
-      const product = parseProduct(config);
-      return { ...config, product, mcpUrl: slackBuiltinUrl(product) };
-    },
-    createRuntimeSpec(config) {
-      return { containers: [], endpointTemplate: slackBuiltinUrl(parseProduct(config)) };
-    },
-    async healthCheck(handle) {
-      try {
-        const token = await accessToken(handle);
-        await slackApi(token, "auth.test");
-        return { status: "healthy", message: `ok (${parseProduct(handle.config)})` };
-      } catch (error) {
-        return {
-          status: "unhealthy",
-          message: error instanceof Error ? error.message : String(error),
-        };
-      }
-    },
-    async listTools(handle) {
-      return toolDefs[parseProduct(handle.config)];
-    },
-    async callTool(handle, name, args) {
-      try {
-        return textResult(
-          JSON.stringify(
-            await callSlackTool(
-              await accessToken(handle),
-              parseProduct(handle.config),
-              name,
-              args,
-            ),
-            null,
-            2,
-          ),
-        );
-      } catch (error) {
-        return textResult(error instanceof Error ? error.message : String(error), true);
-      }
-    },
-  };
+  return factory.createProvider();
 }

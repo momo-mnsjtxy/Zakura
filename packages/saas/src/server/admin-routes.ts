@@ -2,6 +2,7 @@
 import { and, asc, count, desc, eq, gte, ilike, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import bcrypt from "bcryptjs";
 import { RegisterError, registerSaasUser } from "./register-user.js";
+import { AdminMembershipService, SaasAdminError } from "./admin-memberships.js";
 import type { SaasApp, SaasHostDeps, SaasSession } from "./types.js";
 import type { OauthSchema } from "./oauth-login.js";
 
@@ -99,6 +100,7 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
   const oauthIdentities = deps.schema.oauthIdentities as AnyDb;
   const newId = deps.schema.newId;
   const tenantService = deps.tenants;
+  const adminMemberships = new AdminMembershipService(db, deps.schema);
 
   const bumpUser = (id: string) => deps.invalidateSuspension?.("user", id);
   const bumpTenant = (id: string) => deps.invalidateSuspension?.("tenant", id);
@@ -865,81 +867,25 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
       .json<{ role?: string; status?: string }>()
       .catch(() => ({}) as Record<string, never>);
 
-    const membership = await db.query.tenantMemberships.findFirst({
-      where: and(
-        eq(tenantMemberships.id, membershipId),
-        eq(tenantMemberships.tenantId, tenantId),
-      ),
-    });
-    if (!membership) return c.json({ error: "Not found" }, 404);
-
-    const patch: Record<string, unknown> = { updatedAt: new Date() };
-    if (body.role) {
-      if (!["owner", "admin", "member"].includes(body.role)) {
-        return c.json({ error: "role 必须是 owner / admin / member" }, 400);
-      }
-      // 降级最后一个 owner 会让团队失去管理者
-      if (membership.role === "owner" && body.role !== "owner") {
-        const [other] = await db
-          .select({ n: count() })
-          .from(tenantMemberships)
-          .where(
-            and(
-              eq(tenantMemberships.tenantId, tenantId),
-              eq(tenantMemberships.role, "owner"),
-              ne(tenantMemberships.id, membershipId),
-            ),
-          );
-        if (Number(other?.n ?? 0) === 0) {
-          return c.json({ error: "团队至少保留一个 owner" }, 400);
-        }
-      }
-      patch.role = body.role;
+    try {
+      const updated = await adminMemberships.update(tenantId, membershipId, body);
+      return c.json({ membership: { id: updated.id, role: updated.role, status: updated.status } });
+    } catch (error) {
+      if (error instanceof SaasAdminError) return c.json({ error: error.message }, error.status);
+      throw error;
     }
-    if (body.status) {
-      if (!["active", "suspended"].includes(body.status)) {
-        return c.json({ error: "status 必须是 active / suspended" }, 400);
-      }
-      patch.status = body.status;
-    }
-
-    const [updated] = await db
-      .update(tenantMemberships)
-      .set(patch)
-      .where(eq(tenantMemberships.id, membershipId))
-      .returning();
-    return c.json({ membership: { id: updated.id, role: updated.role, status: updated.status } });
   });
 
   app.delete("/api/admin/tenants/:id/members/:membershipId", async (c) => {
     const tenantId = c.req.param("id");
     const membershipId = c.req.param("membershipId");
-    const membership = await db.query.tenantMemberships.findFirst({
-      where: and(
-        eq(tenantMemberships.id, membershipId),
-        eq(tenantMemberships.tenantId, tenantId),
-      ),
-    });
-    if (!membership) return c.json({ error: "Not found" }, 404);
-
-    if (membership.role === "owner") {
-      const [other] = await db
-        .select({ n: count() })
-        .from(tenantMemberships)
-        .where(
-          and(
-            eq(tenantMemberships.tenantId, tenantId),
-            eq(tenantMemberships.role, "owner"),
-            ne(tenantMemberships.id, membershipId),
-          ),
-        );
-      if (Number(other?.n ?? 0) === 0) {
-        return c.json({ error: "团队至少保留一个 owner" }, 400);
-      }
+    try {
+      await adminMemberships.remove(tenantId, membershipId);
+      return c.json({ ok: true });
+    } catch (error) {
+      if (error instanceof SaasAdminError) return c.json({ error: error.message }, error.status);
+      throw error;
     }
-
-    await db.delete(tenantMemberships).where(eq(tenantMemberships.id, membershipId));
-    return c.json({ ok: true });
   });
 
   // ── 共享 Runner ───────────────────────────────────────────────────────

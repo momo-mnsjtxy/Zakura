@@ -143,19 +143,16 @@ export class SkillRepoCache {
       updatedAt: now,
     };
 
-    const existing = await this.db.query.platformSkillRepos.findFirst({
-      where: eq(platformSkillRepos.repoKey, opts.repoKey),
-    });
-    if (existing) {
-      await this.db
-        .update(platformSkillRepos)
-        .set(values)
-        .where(eq(platformSkillRepos.id, existing.id));
-      return { ...existing, ...values };
-    }
-    const row = { id: newId(), ...values, refCount: 0, createdAt: now };
-    await this.db.insert(platformSkillRepos).values(row);
-    return row as PlatformSkillRepoRow;
+    const [row] = await this.db
+      .insert(platformSkillRepos)
+      .values({ id: newId(), ...values, refCount: 0, createdAt: now })
+      .onConflictDoUpdate({
+        target: platformSkillRepos.repoKey,
+        set: values,
+      })
+      .returning();
+    if (!row) throw new Error(`skill cache write failed: ${opts.repoKey}`);
+    return row;
   }
 
   /** 上游没变：只推进 checkedAt，内容原样复用 */
@@ -187,32 +184,31 @@ export class SkillRepoCache {
 
   /** 预置一条空记录，让官方仓库在首次同步前也能出现在商店里 */
   async ensurePlaceholder(repoKey: string, source: SkillSource): Promise<void> {
-    const existing = await this.db.query.platformSkillRepos.findFirst({
-      where: eq(platformSkillRepos.repoKey, repoKey),
-    });
-    if (existing) return;
     const now = new Date();
-    await this.db.insert(platformSkillRepos).values({
-      id: newId(),
-      repoKey,
-      provider: "github",
-      sourceJson: JSON.stringify(cacheScopeSource(source)),
-      ref: source.ref ?? null,
-      version: null,
-      upstreamEtag: null,
-      packagesJson: "[]",
-      partial: false,
-      skillCount: 0,
-      sizeBytes: 0,
-      warningsJson: "[]",
-      // 让它立刻进入待刷新队列
-      checkedAt: new Date(0),
-      fetchedAt: new Date(0),
-      refCount: 0,
-      lastError: null,
-      createdAt: now,
-      updatedAt: now,
-    });
+    await this.db
+      .insert(platformSkillRepos)
+      .values({
+        id: newId(),
+        repoKey,
+        provider: "github",
+        sourceJson: JSON.stringify(cacheScopeSource(source)),
+        ref: source.ref ?? null,
+        version: null,
+        upstreamEtag: null,
+        packagesJson: "[]",
+        partial: false,
+        skillCount: 0,
+        sizeBytes: 0,
+        warningsJson: "[]",
+        // 让它立刻进入待刷新队列
+        checkedAt: new Date(0),
+        fetchedAt: new Date(0),
+        refCount: 0,
+        lastError: null,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .onConflictDoNothing({ target: platformSkillRepos.repoKey });
   }
 
   /** 后台刷新候选：最久没检查的优先，官方仓库与被引用多的排前面 */
