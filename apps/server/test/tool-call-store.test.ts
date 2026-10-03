@@ -10,7 +10,9 @@ import type { Db } from "../src/db/client.js";
 import { signSession } from "../src/services/auth.js";
 import { ToolCallStore } from "../src/services/tool-call-store.js";
 
-type ApiApp = { request: (input: string, init?: RequestInit) => Promise<Response> };
+type ApiApp = {
+  request: (input: string, init?: RequestInit) => Promise<Response>;
+};
 
 const PROVIDER_ID = "test-tool-call-audit";
 
@@ -38,7 +40,9 @@ describe("tool call audit lifecycle", () => {
     dataDir = mkdtempSync(join(tmpdir(), "zakura-tool-call-store-"));
     const databaseUrl = `pglite:${join(dataDir, "db")}`;
     await (await import("../src/db/migrate.js")).runMigrations(databaseUrl);
-    const opened = await (await import("../src/db/client.js")).createDb({ databaseUrl, dataDir });
+    const opened = await (
+      await import("../src/db/client.js")
+    ).createDb({ databaseUrl, dataDir });
     db = opened.db;
     close = opened.close;
 
@@ -81,8 +85,20 @@ describe("tool call audit lifecycle", () => {
       { id: spaceB, tenantId: tenantB, name: "Space B", slug: "space-b" },
     ]);
     await db.insert(agents).values([
-      { id: agentA, tenantId: tenantA, spaceId: spaceA, name: "Agent A", slug: "agent-a" },
-      { id: agentB, tenantId: tenantB, spaceId: spaceB, name: "Agent B", slug: "agent-b" },
+      {
+        id: agentA,
+        tenantId: tenantA,
+        spaceId: spaceA,
+        name: "Agent A",
+        slug: "agent-a",
+      },
+      {
+        id: agentB,
+        tenantId: tenantB,
+        spaceId: spaceB,
+        name: "Agent B",
+        slug: "agent-b",
+      },
     ]);
     await db.insert(apiKeys).values([
       {
@@ -135,15 +151,28 @@ describe("tool call audit lifecycle", () => {
           category: "mcp",
           capabilities: ["tools"],
           configSchema: { type: "object", properties: {} },
-          createRuntimeSpec: () => ({ containers: [], endpointTemplate: "http://localhost" }),
+          createRuntimeSpec: () => ({
+            containers: [],
+            endpointTemplate: "http://localhost",
+          }),
           healthCheck: async () => ({ status: "healthy", message: "ok" }),
           listTools: async () => [
-            { name: "audit_ok", description: "success", inputSchema: { type: "object" } },
-            { name: "audit_fail", description: "failure", inputSchema: { type: "object" } },
+            {
+              name: "audit_ok",
+              description: "success",
+              inputSchema: { type: "object" },
+            },
+            {
+              name: "audit_fail",
+              description: "failure",
+              inputSchema: { type: "object" },
+            },
           ],
           callTool: async (_handle: unknown, name: string, args: unknown) => {
             if (name === "audit_fail") throw new Error("fake provider failure");
-            return { content: [{ type: "text", text: JSON.stringify({ name, args }) }] };
+            return {
+              content: [{ type: "text", text: JSON.stringify({ name, args }) }],
+            };
           },
         }) as never,
     );
@@ -192,7 +221,10 @@ describe("tool call audit lifecycle", () => {
 
     const loadInstance = (id: string) =>
       db.query.componentInstances.findFirst({
-        where: and(eq(componentInstances.id, id), eq(componentInstances.tenantId, tenantA)),
+        where: and(
+          eq(componentInstances.id, id),
+          eq(componentInstances.tenantId, tenantA),
+        ),
       });
     const orchestrator = {
       toHandle: async (_tenantId: string, id: string) => {
@@ -204,7 +236,10 @@ describe("tool call audit lifecycle", () => {
           providerId: row.providerId,
           name: row.name,
           slug: row.slug,
-          config: decryptJson<Record<string, unknown>>(config.secret, row.configEnc),
+          config: decryptJson<Record<string, unknown>>(
+            config.secret,
+            row.configEnc,
+          ),
           endpointUrl: row.endpointUrl,
           containers: {},
         };
@@ -217,7 +252,8 @@ describe("tool call audit lifecycle", () => {
     const { AgentService } = await import("../src/services/agents.js");
     const { McpGateway } = await import("../src/services/mcp-gateway.js");
     const { OauthService } = await import("../src/services/oauth.js");
-    const { CloudAgentSessionStore } = await import("../src/services/cloud-agent-session.js");
+    const { CloudAgentSessionStore } =
+      await import("../src/services/cloud-agent-session.js");
     const { createApiApp } = await import("../src/api/routes.js");
     const agentService = new AgentService(db, {} as never, config);
     store = new ToolCallStore(db);
@@ -253,7 +289,9 @@ describe("tool call audit lifecycle", () => {
   });
 
   const get = (path: string, token = tokenA) =>
-    app.request(`http://local${path}`, { headers: { authorization: `Bearer ${token}` } });
+    app.request(`http://local${path}`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
 
   it("records fake-provider success and failure exactly once and serves authenticated routes", async () => {
     const success = await gateway.callTool(
@@ -287,7 +325,10 @@ describe("tool call audit lifecycle", () => {
       }>;
     };
     assert.equal(listed.total, 2);
-    assert.equal(new Set(listed.items.map((item) => item.qualifiedName)).size, 2);
+    assert.equal(
+      new Set(listed.items.map((item) => item.qualifiedName)).size,
+      2,
+    );
     assert.equal(listed.items.filter((item) => item.isError).length, 1);
     assert.ok(listed.items.every((item) => item.agentName === "Agent A"));
     assert.ok(listed.items.every((item) => item.apiKeyName === "Key A"));
@@ -298,14 +339,21 @@ describe("tool call audit lifecycle", () => {
 
     const statsResponse = await get("/api/tool-calls/stats");
     assert.equal(statsResponse.status, 200, await statsResponse.clone().text());
-    const stats = (await statsResponse.json()) as { total: number; errors: number; last24h: number };
+    const stats = (await statsResponse.json()) as {
+      total: number;
+      errors: number;
+      last24h: number;
+    };
     assert.equal(stats.total, 2);
     assert.equal(stats.errors, 1);
     assert.equal(stats.last24h, 2);
 
     const detail = await get(`/api/tool-calls/${listed.items[0]!.id}`);
     assert.equal(detail.status, 200, await detail.clone().text());
-    assert.equal(((await detail.json()) as { id: string }).id, listed.items[0]!.id);
+    assert.equal(
+      ((await detail.json()) as { id: string }).id,
+      listed.items[0]!.id,
+    );
   });
 
   it("drops cross-tenant attribution and never exposes another tenant's log", async () => {
@@ -340,7 +388,10 @@ describe("tool call audit lifecycle", () => {
 
   it("treats wildcard characters literally and bounds valid JSON payloads", async () => {
     const oversized = Object.fromEntries(
-      Array.from({ length: 400 }, (_, index) => [`field_${index}`, "x".repeat(100)]),
+      Array.from({ length: 400 }, (_, index) => [
+        `field_${index}`,
+        "x".repeat(100),
+      ]),
     );
     await Promise.all([
       store.record({
@@ -349,7 +400,9 @@ describe("tool call audit lifecycle", () => {
         localName: "literal_100%_tool",
         providerId: "provider_100%",
         args: oversized,
-        result: { content: [{ type: "text", text: JSON.stringify(oversized) }] },
+        result: {
+          content: [{ type: "text", text: JSON.stringify(oversized) }],
+        },
         durationMs: Number.NaN,
       }),
       store.record({
@@ -364,7 +417,10 @@ describe("tool call audit lifecycle", () => {
     ]);
     await store.flush();
 
-    const literal = await store.list(tenantA, { q: "_100%", limit: Number.POSITIVE_INFINITY });
+    const literal = await store.list(tenantA, {
+      q: "_100%",
+      limit: Number.POSITIVE_INFINITY,
+    });
     assert.equal(literal.total, 1);
     assert.equal(literal.items[0]!.qualifiedName, "literal_100%_tool");
     assert.equal(literal.items[0]!.durationMs, 0);
@@ -395,11 +451,28 @@ describe("tool call audit lifecycle", () => {
     await db
       .update(toolCallLogs)
       .set({ createdAt: sameTimestamp })
-      .where(and(eq(toolCallLogs.tenantId, tenantA), eq(toolCallLogs.providerId, PROVIDER_ID)));
+      .where(
+        and(
+          eq(toolCallLogs.tenantId, tenantA),
+          eq(toolCallLogs.providerId, PROVIDER_ID),
+        ),
+      );
 
-    const first = await store.list(tenantA, { q: "page_", limit: 5, offset: 0 });
-    const second = await store.list(tenantA, { q: "page_", limit: 5, offset: 5 });
-    const repeated = await store.list(tenantA, { q: "page_", limit: 5, offset: 0 });
+    const first = await store.list(tenantA, {
+      q: "page_",
+      limit: 5,
+      offset: 0,
+    });
+    const second = await store.list(tenantA, {
+      q: "page_",
+      limit: 5,
+      offset: 5,
+    });
+    const repeated = await store.list(tenantA, {
+      q: "page_",
+      limit: 5,
+      offset: 0,
+    });
     assert.equal(first.total, 12);
     assert.deepEqual(
       first.items.map((item) => item.id),
@@ -415,7 +488,9 @@ describe("tool call audit lifecycle", () => {
     );
 
     const stats = await store.stats(tenantA, agentA);
-    const pageTools = stats.byTool.filter((item) => item.qualifiedName.startsWith("page_"));
+    const pageTools = stats.byTool.filter((item) =>
+      item.qualifiedName.startsWith("page_"),
+    );
     assert.deepEqual(
       pageTools.map((item) => item.qualifiedName),
       [...pageTools.map((item) => item.qualifiedName)].sort(),

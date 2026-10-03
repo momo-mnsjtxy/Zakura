@@ -18,6 +18,7 @@ import type {
   Task,
 } from "@modelcontextprotocol/sdk/types.js";
 import { globalRegistry } from "@zakura/core";
+import { randomBytes } from "node:crypto";
 import type { HostedInputRequest } from "../mcp/agent-capabilities.js";
 import type { Orchestrator } from "./orchestrator.js";
 
@@ -30,6 +31,10 @@ export type ProxiedTaskRef = {
   providerId: string;
   localTaskId: string;
   slug: string;
+  /** When known, only this MCP transport session may enumerate/read the task. */
+  sessionId?: string;
+  registeredAt: number;
+  expiresAt: number | null;
 };
 
 type HostedPendingInput = {
@@ -98,8 +103,45 @@ export class ZakuraTaskStore implements TaskStore {
   private readonly proxyCache = new Map<string, Task>();
   private readonly proxyResults = new Map<string, Result>();
   private readonly pendingInputs = new Map<string, HostedPendingInput>();
+  private readonly now: () => number;
+  private readonly nonce: () => string;
+  private readonly maxProxyTasks: number;
 
-  constructor(private readonly orchestrator: Orchestrator) {}
+  constructor(
+    private readonly orchestrator: Orchestrator,
+    opts: { now?: () => number; nonce?: () => string; maxProxyTasks?: number } = {},
+  ) {
+    this.now = opts.now ?? Date.now;
+    this.nonce = opts.nonce ?? (() => randomBytes(12).toString("base64url"));
+    this.maxProxyTasks = Math.max(1, opts.maxProxyTasks ?? 1_024);
+  }
+
+  private removeProxy(taskId: string): void {
+    this.proxies.delete(taskId);
+    this.proxyCache.delete(taskId);
+    this.proxyResults.delete(taskId);
+  }
+
+  private pruneProxyTasks(): void {
+    const now = this.now();
+    for (const [taskId, ref] of this.proxies) {
+      if (ref.expiresAt !== null && ref.expiresAt <= now) this.removeProxy(taskId);
+    }
+    if (this.proxies.size <= this.maxProxyTasks) return;
+    const oldest = [...this.proxies.values()].sort((a, b) => a.registeredAt - b.registeredAt);
+    for (const ref of oldest) {
+      if (this.proxies.size <= this.maxProxyTasks) break;
+      this.removeProxy(ref.publicTaskId);
+    }
+  }
+
+  private proxyRef(taskId: string, sessionId?: string): ProxiedTaskRef | null {
+    this.pruneProxyTasks();
+    const ref = this.proxies.get(taskId);
+    if (!ref) return null;
+    if (ref.sessionId && ref.sessionId !== sessionId) return null;
+    return ref;
+  }
 
   /** 注册下游 CreateTaskResult，返回对外 task 快照 */
   registerProxyTask(opts: {
@@ -116,8 +158,38 @@ export class ZakuraTaskStore implements TaskStore {
       pollInterval?: number;
       statusMessage?: string;
     };
+    sessionId?: string;
   }): Task {
-    const publicTaskId = qualifyProxyTaskId(opts.slug, opts.upstream.taskId);
+    this.pruneProxyTasks();
+    const existing = [...this.proxies.values()].find(
+      (ref) =>
+        ref.tenantId === opts.tenantId &&
+        ref.instanceId === opts.instanceId &&
+        ref.localTaskId === opts.upstream.taskId &&
+        ref.sessionId === opts.sessionId,
+    );
+    if (existing) {
+      const refreshedAt = this.now();
+      existing.registeredAt = refreshedAt;
+      existing.expiresAt =
+        typeof opts.upstream.ttl === "number" && opts.upstream.ttl >= 0
+          ? refreshedAt + opts.upstream.ttl
+          : null;
+      const task = normalizeUpstreamTask(
+        opts.upstream as unknown as Record<string, unknown>,
+        existing.publicTaskId,
+      );
+      this.proxyCache.set(existing.publicTaskId, task);
+      return task;
+    }
+    let publicTaskId = "";
+    do {
+      // Preserve the exported qualify/parse format while keeping tenant and
+      // upstream ids out of the capability presented to clients.
+      publicTaskId = qualifyProxyTaskId(`${opts.slug}-${this.nonce()}`, "task");
+    } while (this.proxies.has(publicTaskId));
+    const registeredAt = this.now();
+    const ttl = opts.upstream.ttl;
     this.proxies.set(publicTaskId, {
       publicTaskId,
       tenantId: opts.tenantId,
@@ -125,12 +197,16 @@ export class ZakuraTaskStore implements TaskStore {
       providerId: opts.providerId,
       localTaskId: opts.upstream.taskId,
       slug: opts.slug,
+      sessionId: opts.sessionId,
+      registeredAt,
+      expiresAt: typeof ttl === "number" && ttl >= 0 ? registeredAt + ttl : null,
     });
     const task = normalizeUpstreamTask(
       opts.upstream as unknown as Record<string, unknown>,
       publicTaskId,
     );
     this.proxyCache.set(publicTaskId, task);
+    this.pruneProxyTasks();
     return task;
   }
 
@@ -142,16 +218,21 @@ export class ZakuraTaskStore implements TaskStore {
     inputRequests: Record<string, HostedInputRequest>,
     statusMessage = "Waiting for user input",
   ): Promise<Record<string, unknown>> {
+    this.pruneProxyTasks();
     if (this.proxies.has(taskId)) {
       return Promise.reject(new Error("Cannot request input on proxied upstream task"));
     }
     return new Promise<Record<string, unknown>>((resolve, reject) => {
+      const previous = this.pendingInputs.get(taskId);
+      if (previous) previous.reject(new Error("Input request superseded by a newer request"));
+      const pending = { inputRequests, resolve, reject };
+      this.pendingInputs.set(taskId, pending);
       void this.hosted
         .updateTaskStatus(taskId, "input_required", statusMessage)
-        .then(() => {
-          this.pendingInputs.set(taskId, { inputRequests, resolve, reject });
-        })
-        .catch(reject);
+        .catch((error) => {
+          if (this.pendingInputs.get(taskId) === pending) this.pendingInputs.delete(taskId);
+          reject(error);
+        });
     });
   }
 
@@ -159,6 +240,7 @@ export class ZakuraTaskStore implements TaskStore {
   async applyTaskUpdate(
     taskId: string,
     inputResponses?: Record<string, unknown>,
+    sessionId?: string,
   ): Promise<TaskView> {
     const pending = this.pendingInputs.get(taskId);
     if (pending) {
@@ -170,7 +252,7 @@ export class ZakuraTaskStore implements TaskStore {
       return task;
     }
 
-    const ref = this.proxies.get(taskId);
+    const ref = this.proxyRef(taskId, sessionId);
     if (ref) {
       try {
         await this.upstreamRpc(ref, "tasks/update", {
@@ -180,7 +262,7 @@ export class ZakuraTaskStore implements TaskStore {
       } catch {
         /* 下游可能尚无 tasks/update */
       }
-      const task = await this.getTask(taskId);
+      const task = await this.getTask(taskId, sessionId);
       if (!task) throw new Error(`Task not found: ${taskId}`);
       return task;
     }
@@ -221,8 +303,8 @@ export class ZakuraTaskStore implements TaskStore {
     const hosted = await this.hosted.getTask(taskId, sessionId);
     if (hosted) return this.enrichView(hosted);
 
-    const ref = this.proxies.get(taskId);
-    if (!ref) return this.proxyCache.get(taskId) ?? null;
+    const ref = this.proxyRef(taskId, sessionId);
+    if (!ref) return null;
 
     try {
       const raw = (await this.upstreamRpc(ref, "tasks/get", {
@@ -261,7 +343,8 @@ export class ZakuraTaskStore implements TaskStore {
       this.pendingInputs.delete(taskId);
       pending.reject(new Error(`Task ${status} while waiting for input`));
     }
-    if (this.proxies.has(taskId)) {
+    const ref = this.proxyRef(taskId, sessionId);
+    if (ref) {
       this.proxyResults.set(taskId, result);
       const prev = this.proxyCache.get(taskId);
       if (prev) {
@@ -277,10 +360,10 @@ export class ZakuraTaskStore implements TaskStore {
   }
 
   async getTaskResult(taskId: string, sessionId?: string): Promise<Result> {
-    if (this.proxyResults.has(taskId)) {
+    const ref = this.proxyRef(taskId, sessionId);
+    if (ref && this.proxyResults.has(taskId)) {
       return this.proxyResults.get(taskId)!;
     }
-    const ref = this.proxies.get(taskId);
     if (ref) {
       const raw = await this.upstreamRpc(ref, "tasks/result", {
         taskId: ref.localTaskId,
@@ -310,7 +393,7 @@ export class ZakuraTaskStore implements TaskStore {
       }
     }
 
-    const ref = this.proxies.get(taskId);
+    const ref = this.proxyRef(taskId, sessionId);
     if (ref) {
       if (status === "cancelled") {
         try {
@@ -340,7 +423,13 @@ export class ZakuraTaskStore implements TaskStore {
     sessionId?: string,
   ): Promise<{ tasks: Task[]; nextCursor?: string }> {
     const hosted = await this.hosted.listTasks(cursor, sessionId);
-    const proxied = [...this.proxyCache.values()];
+    this.pruneProxyTasks();
+    const proxied = sessionId
+      ? [...this.proxies.values()]
+          .filter((ref) => ref.sessionId === sessionId)
+          .map((ref) => this.proxyCache.get(ref.publicTaskId))
+          .filter((task): task is Task => Boolean(task))
+      : [];
     if (!cursor) {
       return {
         tasks: [
@@ -358,7 +447,20 @@ export class ZakuraTaskStore implements TaskStore {
       p.reject(new Error("Task store cleaned up"));
     }
     this.pendingInputs.clear();
+    this.proxies.clear();
+    this.proxyCache.clear();
+    this.proxyResults.clear();
     this.hosted.cleanup();
+  }
+
+  cleanupTenant(tenantId: string): number {
+    let removed = 0;
+    for (const [taskId, ref] of this.proxies) {
+      if (ref.tenantId !== tenantId) continue;
+      this.removeProxy(taskId);
+      removed += 1;
+    }
+    return removed;
   }
 }
 

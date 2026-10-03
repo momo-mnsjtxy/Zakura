@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
   fetchAuditLogs,
@@ -15,36 +15,41 @@ import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { PageLoading } from "@/components/ui/progress-linear";
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from "@/components/ui/table";
+import { createNetworkUiController } from "@/lib/network-ui-state";
 
 export default function NetworkSecurityPage() {
   const [policy, setPolicy] = useState<NetworkSecurityPolicyDto | null>(null);
   const [deniedPorts, setDeniedPorts] = useState("");
   const [audit, setAudit] = useState<NetworkAuditLogDto[]>([]);
   const [busy, setBusy] = useState(false);
+  const requests = useRef(createNetworkUiController());
 
   const load = useCallback(async () => {
+    const request = requests.current.begin("security");
     try {
       const [p, a] = await Promise.all([
         fetchSecurityPolicy(),
         fetchAuditLogs({ limit: 30 }),
       ]);
+      if (!request.current()) return;
       setPolicy(p.policy);
       setDeniedPorts(p.policy.deniedPorts.join(", "));
       setAudit(a.items);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : String(err));
+      if (request.current()) toast.error(err instanceof Error ? err.message : String(err));
     }
   }, []);
 
   useEffect(() => {
     void load();
+    return () => requests.current.invalidate("security");
   }, [load]);
 
   async function save(patch: Partial<NetworkSecurityPolicyDto>) {
     if (!policy) return;
     setBusy(true);
     try {
-      const res = await updateSecurityPolicy({ ...policy, ...patch });
+      const res = await requests.current.runOnce("security:save", () => updateSecurityPolicy({ ...policy, ...patch }));
       setPolicy(res.policy);
       setDeniedPorts(res.policy.deniedPorts.join(", "));
       toast.success("已保存");

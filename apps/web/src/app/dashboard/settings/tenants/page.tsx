@@ -6,6 +6,8 @@ import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { Loader2, Plus } from "lucide-react";
 import { api, setSession } from "@/lib/api";
+import { authCallbackResult } from "@/lib/auth-callback-state";
+import { TenantSwitchEnrollment } from "@/components/tenant-switch-enrollment";
 import { SettingsHeader, SettingsSection } from "@/components/settings-shell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -39,6 +41,7 @@ export default function TeamsSettingsPage() {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
+  const [switchEnrollment, setSwitchEnrollment] = useState<{ ticket: string; destination: string } | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -74,11 +77,15 @@ export default function TeamsSettingsPage() {
     if (tenantId === currentId) return;
     setBusy(true);
     try {
-      const res = await api<{ session: string; tenant: { onboardingCompleted?: boolean } }>(
+      const res = await api<{ session?: string; tenant?: { onboardingCompleted?: boolean }; mfaEnrollmentRequired?: boolean; mfaEnrollmentTicket?: string; methods?: string[] }>(
         "/api/auth/switch-tenant",
         { method: "POST", json: { tenantId } },
       );
-      setSession(res.session);
+      const destination = res.tenant?.onboardingCompleted === false ? "/onboarding" : "/dashboard/agents";
+      const outcome = authCallbackResult(res);
+      if (outcome.kind === "enrollment") { setSwitchEnrollment({ ticket: outcome.ticket, destination }); return; }
+      if (outcome.kind !== "session") throw new Error(outcome.message ?? "切换团队失败");
+      setSession(outcome.session);
       toast.success("已切换团队");
       router.push(
         res.tenant?.onboardingCompleted === false ? "/onboarding" : "/dashboard/agents",
@@ -120,6 +127,8 @@ export default function TeamsSettingsPage() {
   if (!multiTenant) return null;
 
   return (
+    <>
+    {switchEnrollment ? <TenantSwitchEnrollment {...switchEnrollment} onClose={() => setSwitchEnrollment(null)} /> : null}
     <div className="space-y-5">
       <SettingsHeader
         title="所有团队"
@@ -199,6 +208,6 @@ export default function TeamsSettingsPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </div>
+    </div></>
   );
 }

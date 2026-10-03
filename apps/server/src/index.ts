@@ -390,6 +390,7 @@ async function main() {
     modelCatalog,
     upstreamModels: upstreamModelsSvc,
     toolCallStore,
+    taskStore,
     oauth,
     runtimeNodes,
     migrations,

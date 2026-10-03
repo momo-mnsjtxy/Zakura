@@ -16,3 +16,11 @@ export function normalizeRetentionDays(value) {
 export function enabledManagedServices(services) {
   return (services ?? []).filter((service) => service.mode !== "disabled");
 }
+
+export function auditExportMeta(headers) {
+  const read = (name) => headers?.get?.(name);
+  const total = Number(read("x-audit-total") ?? 0);
+  const exported = Number(read("x-audit-exported") ?? 0);
+  const truncated = read("x-audit-truncated") === "true" || (total > 0 && exported < total);
+  return { total, exported, truncated };
+}

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { RefreshCw, Square } from "lucide-react";
 import {
@@ -14,29 +14,34 @@ import { Button } from "@/components/ui/button";
 import { useConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from "@/components/ui/table";
+import { createNetworkUiController, removeById } from "@/lib/network-ui-state";
 
 export default function NetworkActiveExposuresPage() {
   const { confirm } = useConfirmDialog();
   const [rows, setRows] = useState<PortExposureDto[]>([]);
   const [busy, setBusy] = useState(false);
+  const requests = useRef(createNetworkUiController());
 
   const load = useCallback(async () => {
+    const request = requests.current.begin("active");
     try {
       const res = await fetchActiveExposures();
-      setRows(res.exposures);
+      if (request.current()) setRows(res.exposures ?? []);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : String(err));
+      if (request.current()) toast.error(err instanceof Error ? err.message : String(err));
     }
   }, []);
 
   useEffect(() => {
     void load();
+    return () => requests.current.invalidate("active");
   }, [load]);
 
   async function onStop(id: string) {
     setBusy(true);
     try {
-      await stopExposure(id);
+      await requests.current.runOnce(`stop:${id}`, () => stopExposure(id));
+      setRows((current) => removeById(current, id));
       toast.success("已关闭");
       await load();
     } catch (err) {
@@ -50,7 +55,8 @@ export default function NetworkActiveExposuresPage() {
     if (!(await confirm({ title: "关闭全部活跃暴露？", confirmLabel: "全部关闭" }))) return;
     setBusy(true);
     try {
-      const res = await stopAllExposures();
+      const res = await requests.current.runOnce("stop:all", () => stopAllExposures());
+      setRows([]);
       toast.success(`已关闭 ${res.stopped} 个`);
       await load();
     } catch (err) {

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Loader2, Star } from "lucide-react";
 import {
@@ -17,6 +17,7 @@ import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
 import { PageLoading } from "@/components/ui/progress-linear";
+import { createNetworkUiController } from "@/lib/network-ui-state";
 
 function ProviderCard({
   provider,
@@ -305,20 +306,23 @@ function ProviderCard({
 export default function NetworkExposureProvidersPage() {
   const [providers, setProviders] = useState<TunnelProviderSettingDto[]>([]);
   const [loading, setLoading] = useState(true);
+  const requests = useRef(createNetworkUiController());
 
   const load = useCallback(async () => {
+    const request = requests.current.begin("providers");
     try {
       const res = await fetchProviders();
-      setProviders(res.providers);
+      if (request.current()) setProviders(res.providers ?? []);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : String(err));
+      if (request.current()) toast.error(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      if (request.current()) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
     void load();
+    return () => requests.current.invalidate("providers");
   }, [load]);
 
   if (loading) {

@@ -322,6 +322,7 @@ export async function createApiApp(deps: {
   modelCatalog?: import("../services/model-catalog.js").ModelCatalogService;
   upstreamModels?: import("../services/upstream-models.js").UpstreamModelsService;
   toolCallStore: ToolCallStore;
+  taskStore?: { cleanupTenant(tenantId: string): number };
   oauth: OauthService;
   runtimeNodes?: RuntimeNodeService;
   migrations?: MigrationService;
@@ -359,6 +360,7 @@ export async function createApiApp(deps: {
     modelCatalog,
     upstreamModels,
     toolCallStore,
+    taskStore,
     oauth,
     runtimeNodes,
     migrations,
@@ -2593,6 +2595,9 @@ export async function createApiApp(deps: {
     );
     tenantContentLifecycle = new TenantContentLifecycleService(db, {
       stopChannels: (tenantId) => remoteRuntime!.stopTenant(tenantId),
+      cleanupTaskState: (tenantId) => {
+        taskStore?.cleanupTenant(tenantId);
+      },
       agentLifecycle: agentTenantLifecycle.callbacks(),
       cleanupChannelState: (tenantId) => remoteRuntime!.purgeTenantState(tenantId),
       cleanupSkillFiles: (tenantId) => skills?.cleanupTenant(tenantId) ?? Promise.resolve(),

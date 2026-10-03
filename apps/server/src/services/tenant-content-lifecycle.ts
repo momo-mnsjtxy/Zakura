@@ -25,6 +25,8 @@ export type AgentTenantLifecycleCallbacks = {
 
 export type TenantContentLifecycleCallbacks = {
   stopChannels(tenantId: string): Promise<void>;
+  /** Process-local task caches are cleared only when the whole tenant loses access. */
+  cleanupTaskState?: (tenantId: string) => Promise<void> | void;
   /** Agent owner supplies this seam without creating a service dependency cycle. */
   agentLifecycle?: AgentTenantLifecycleCallbacks;
   cleanupSkillFiles(tenantId: string): Promise<void>;
@@ -208,6 +210,12 @@ export class TenantContentLifecycleService {
     const operations: Array<() => Promise<void> | void> = [
       () => this.callbacks.stopChannels(job.tenantId),
     ];
+    if (
+      this.callbacks.cleanupTaskState &&
+      (job.action === "tenant_deleted" || job.action === "tenant_suspended")
+    ) {
+      operations.push(() => this.callbacks.cleanupTaskState!(job.tenantId));
+    }
     if (job.action === "tenant_deleted") {
       operations.unshift(() => this.ensureDeleteLease(job.tenantId).then(() => undefined));
     } else if (job.action === "tenant_suspended" && this.callbacks.agentLifecycle) {

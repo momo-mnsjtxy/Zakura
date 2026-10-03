@@ -51,7 +51,11 @@ export type ToolCallStats = {
   errors: number;
   avgDurationMs: number;
   last24h: number;
-  byAgent: Array<{ agentId: string | null; agentName: string | null; count: number }>;
+  byAgent: Array<{
+    agentId: string | null;
+    agentName: string | null;
+    count: number;
+  }>;
   byApiKey: Array<{
     apiKeyId: string | null;
     apiKeyName: string | null;
@@ -97,7 +101,11 @@ function jsonWithStringLimit(value: unknown): string {
     // for quote/backslash expansion in the preview string.
     let low = 0;
     let high = Math.min(raw.length, MAX_JSON_CHARS);
-    let best = JSON.stringify({ truncated: true, originalChars: raw.length, preview: "" });
+    let best = JSON.stringify({
+      truncated: true,
+      originalChars: raw.length,
+      preview: "",
+    });
     while (low <= high) {
       const middle = Math.floor((low + high) / 2);
       const candidate = JSON.stringify({
@@ -130,7 +138,11 @@ function resultPayload(result: McpToolResult): unknown {
   const text = texts.join("\n");
   if (!text) return null;
   const trimmed = text.trim();
-  if (trimmed.startsWith("{") || trimmed.startsWith("[") || trimmed.startsWith('"')) {
+  if (
+    trimmed.startsWith("{") ||
+    trimmed.startsWith("[") ||
+    trimmed.startsWith('"')
+  ) {
     try {
       return JSON.parse(trimmed);
     } catch {
@@ -140,7 +152,12 @@ function resultPayload(result: McpToolResult): unknown {
   return text;
 }
 
-function boundedInteger(value: number | undefined, fallback: number, min: number, max: number) {
+function boundedInteger(
+  value: number | undefined,
+  fallback: number,
+  min: number,
+  max: number,
+) {
   if (!Number.isFinite(value)) return fallback;
   return Math.min(Math.max(Math.trunc(value!), min), max);
 }
@@ -192,7 +209,9 @@ export class ToolCallStore {
 
     return new Promise((resolve) => {
       if (this.queue.length + (this.active ? 1 : 0) >= MAX_PENDING_WRITES) {
-        console.error("[tool-call-store] record queue is full; audit entry was not accepted");
+        console.error(
+          "[tool-call-store] record queue is full; audit entry was not accepted",
+        );
         resolve();
         return;
       }
@@ -230,11 +249,17 @@ export class ToolCallStore {
       .from(toolCallLogs)
       .leftJoin(
         agents,
-        and(eq(toolCallLogs.agentId, agents.id), eq(toolCallLogs.tenantId, agents.tenantId)),
+        and(
+          eq(toolCallLogs.agentId, agents.id),
+          eq(toolCallLogs.tenantId, agents.tenantId),
+        ),
       )
       .leftJoin(
         apiKeys,
-        and(eq(toolCallLogs.apiKeyId, apiKeys.id), eq(toolCallLogs.tenantId, apiKeys.tenantId)),
+        and(
+          eq(toolCallLogs.apiKeyId, apiKeys.id),
+          eq(toolCallLogs.tenantId, apiKeys.tenantId),
+        ),
       )
       .where(where)
       .orderBy(desc(toolCallLogs.createdAt), desc(toolCallLogs.id))
@@ -265,11 +290,17 @@ export class ToolCallStore {
       .from(toolCallLogs)
       .leftJoin(
         agents,
-        and(eq(toolCallLogs.agentId, agents.id), eq(toolCallLogs.tenantId, agents.tenantId)),
+        and(
+          eq(toolCallLogs.agentId, agents.id),
+          eq(toolCallLogs.tenantId, agents.tenantId),
+        ),
       )
       .leftJoin(
         apiKeys,
-        and(eq(toolCallLogs.apiKeyId, apiKeys.id), eq(toolCallLogs.tenantId, apiKeys.tenantId)),
+        and(
+          eq(toolCallLogs.apiKeyId, apiKeys.id),
+          eq(toolCallLogs.tenantId, apiKeys.tenantId),
+        ),
       )
       .where(and(eq(toolCallLogs.tenantId, tenantId), eq(toolCallLogs.id, id)))
       .limit(1);
@@ -285,7 +316,10 @@ export class ToolCallStore {
 
   async stats(tenantId: string, agentId?: string): Promise<ToolCallStats> {
     const base = agentId
-      ? and(eq(toolCallLogs.tenantId, tenantId), eq(toolCallLogs.agentId, agentId))
+      ? and(
+          eq(toolCallLogs.tenantId, tenantId),
+          eq(toolCallLogs.agentId, agentId),
+        )
       : eq(toolCallLogs.tenantId, tenantId);
     const since24h = new Date(Date.now() - 24 * 60 * 60 * 1_000);
 
@@ -312,7 +346,10 @@ export class ToolCallStore {
       .from(toolCallLogs)
       .leftJoin(
         agents,
-        and(eq(toolCallLogs.agentId, agents.id), eq(toolCallLogs.tenantId, agents.tenantId)),
+        and(
+          eq(toolCallLogs.agentId, agents.id),
+          eq(toolCallLogs.tenantId, agents.tenantId),
+        ),
       )
       .where(base)
       .groupBy(toolCallLogs.agentId, agents.name)
@@ -329,7 +366,10 @@ export class ToolCallStore {
       .from(toolCallLogs)
       .leftJoin(
         apiKeys,
-        and(eq(toolCallLogs.apiKeyId, apiKeys.id), eq(toolCallLogs.tenantId, apiKeys.tenantId)),
+        and(
+          eq(toolCallLogs.apiKeyId, apiKeys.id),
+          eq(toolCallLogs.tenantId, apiKeys.tenantId),
+        ),
       )
       .where(base)
       .groupBy(toolCallLogs.apiKeyId, apiKeys.name, apiKeys.keyPrefix)
@@ -409,7 +449,10 @@ export class ToolCallStore {
     console.error("[tool-call-store] record failed:", lastError);
   }
 
-  private async ownedAgentId(tenantId: string, agentId: string | null): Promise<string | null> {
+  private async ownedAgentId(
+    tenantId: string,
+    agentId: string | null,
+  ): Promise<string | null> {
     if (!agentId) return null;
     const [row] = await this.db
       .select({ id: agents.id })
@@ -419,7 +462,10 @@ export class ToolCallStore {
     return row?.id ?? null;
   }
 
-  private async ownedApiKeyId(tenantId: string, apiKeyId: string | null): Promise<string | null> {
+  private async ownedApiKeyId(
+    tenantId: string,
+    apiKeyId: string | null,
+  ): Promise<string | null> {
     if (!apiKeyId) return null;
     const [row] = await this.db
       .select({ id: apiKeys.id })
@@ -437,7 +483,12 @@ export class ToolCallStore {
     const [row] = await this.db
       .select({ id: componentInstances.id })
       .from(componentInstances)
-      .where(and(eq(componentInstances.id, instanceId), eq(componentInstances.tenantId, tenantId)))
+      .where(
+        and(
+          eq(componentInstances.id, instanceId),
+          eq(componentInstances.tenantId, tenantId),
+        ),
+      )
       .limit(1);
     return row?.id ?? null;
   }
@@ -451,11 +502,14 @@ export class ToolCallStore {
   private buildWhere(tenantId: string, filters: ToolCallListFilters) {
     const parts = [eq(toolCallLogs.tenantId, tenantId)];
     if (filters.agentId) parts.push(eq(toolCallLogs.agentId, filters.agentId));
-    if (filters.apiKeyId) parts.push(eq(toolCallLogs.apiKeyId, filters.apiKeyId));
+    if (filters.apiKeyId)
+      parts.push(eq(toolCallLogs.apiKeyId, filters.apiKeyId));
     if (filters.isError === true) parts.push(eq(toolCallLogs.isError, true));
     if (filters.isError === false) parts.push(eq(toolCallLogs.isError, false));
-    if (validDate(filters.since)) parts.push(gte(toolCallLogs.createdAt, filters.since));
-    if (validDate(filters.until)) parts.push(lte(toolCallLogs.createdAt, filters.until));
+    if (validDate(filters.since))
+      parts.push(gte(toolCallLogs.createdAt, filters.since));
+    if (validDate(filters.until))
+      parts.push(lte(toolCallLogs.createdAt, filters.until));
     if (filters.q?.trim()) {
       const pattern = literalLikePattern(filters.q.trim());
       const escape = "\\";

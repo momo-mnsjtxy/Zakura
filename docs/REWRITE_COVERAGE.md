@@ -31,9 +31,9 @@ Generated build output is excluded. These counts prevent a carried-over compatib
 
 | Scope | Baseline-identical files | Changed files | Added files | Missing files |
 |---|---:|---:|---:|---:|
-| `apps/server` | 377 | 146 | 79 | 0 |
+| `apps/server` | 375 | 148 | 81 | 0 |
 | `packages/saas` | 7 | 6 | 2 | 0 |
-| `apps/web` | 253 | 45 | 43 | 0 |
+| `apps/web` | 245 | 53 | 46 | 0 |
 | `packages/core` | 29 | 14 | 23 | 0 |
 | `go` | 35 | 11 | 17 | 0 |
 | `apps/oauth-bridge` | 1 | 3 | 5 | 0 |

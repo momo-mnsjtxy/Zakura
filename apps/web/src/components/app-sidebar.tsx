@@ -38,6 +38,8 @@ import {
   Blocks,
 } from "lucide-react";
 import { api, setSession } from "@/lib/api";
+import { authCallbackResult } from "@/lib/auth-callback-state";
+import { TenantSwitchEnrollment } from "@/components/tenant-switch-enrollment";
 import { AGENT_SUBNAV, fetchAgents, type AgentListItem } from "@/lib/agents";
 import { SPACE_SUBNAV } from "@/lib/space-subnav";
 import { fetchSpaces, type SpaceItem } from "@/lib/spaces";
@@ -447,6 +449,7 @@ function TenantHeader({
     Array<{ tenant: { id: string; name: string }; role: string }>
   >([]);
   const [currentTenantId, setCurrentTenantId] = useState("");
+  const [switchEnrollment, setSwitchEnrollment] = useState<{ ticket: string; destination: string } | null>(null);
 
   useEffect(() => {
     if (!multiTenant) return;
@@ -467,19 +470,23 @@ function TenantHeader({
   async function switchTenant(tenantId: string) {
     if (tenantId === currentTenantId) return;
     try {
-      const res = await api<{ session: string; tenant: { onboardingCompleted?: boolean } }>(
+      const res = await api<{ session?: string; tenant?: { onboardingCompleted?: boolean }; mfaEnrollmentRequired?: boolean; mfaEnrollmentTicket?: string; methods?: string[] }>(
         "/api/auth/switch-tenant",
         { method: "POST", json: { tenantId } },
       );
-      setSession(res.session);
-      window.location.href =
-        res.tenant?.onboardingCompleted === false ? "/onboarding" : "/dashboard/agents";
+      const destination = res.tenant?.onboardingCompleted === false ? "/onboarding" : "/dashboard/agents";
+      const outcome = authCallbackResult(res);
+      if (outcome.kind === "enrollment") { setSwitchEnrollment({ ticket: outcome.ticket, destination }); return; }
+      if (outcome.kind !== "session") throw new Error(outcome.message ?? "切换团队失败");
+      setSession(outcome.session);
+      window.location.href = destination;
     } catch (err) {
       console.error(err);
     }
   }
 
-  return (
+  return (<>
+    {switchEnrollment ? <TenantSwitchEnrollment {...switchEnrollment} onClose={() => setSwitchEnrollment(null)} /> : null}
     <div className="min-w-0 px-1 group-data-[collapsible=icon]:px-0">
       <BrandMark
         className="group-data-[collapsible=icon]:justify-center"
@@ -519,7 +526,7 @@ function TenantHeader({
           {tenant || "—"}
         </div>
       )}
-    </div>
+    </div></>
   );
 }
 

@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
 import { createActionController, createLatestRequestGate } from "@/lib/chat-state";
-import { normalizeRetentionDays } from "@/lib/admin-ui-state";
+import { auditExportMeta, normalizeRetentionDays } from "@/lib/admin-ui-state";
 import { useMe } from "@/components/me-context";
 import { SettingsHeader, SettingsSection } from "@/components/settings-shell";
 import { Button } from "@/components/ui/button";
@@ -71,6 +71,8 @@ export default function AuditSettingsPage() {
               const res = await fetch(`/api/tenant/audit?format=csv${action ? `&action=${encodeURIComponent(action)}` : ""}`, {
                 headers: { Authorization: `Bearer ${getSession() ?? ""}` },
               });
+              if (!res.ok) throw new Error(`导出失败 (${res.status})`);
+              const meta = auditExportMeta(res.headers);
               const blob = await res.blob();
               const url = URL.createObjectURL(blob);
               const a = document.createElement("a");
@@ -78,6 +80,8 @@ export default function AuditSettingsPage() {
               a.download = "audit.csv";
               a.click();
               URL.revokeObjectURL(url);
+              if (meta.truncated) toast.warning(`导出受限：共 ${meta.total} 条，本次导出 ${meta.exported} 条`);
+              else toast.success(`已导出 ${meta.exported || meta.total} 条审计记录`);
             }}
           >
             导出 CSV

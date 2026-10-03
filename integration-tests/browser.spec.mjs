@@ -79,3 +79,39 @@ test("restricted MFA enrollment retries setup and stores session only after reco
   expect(pageErrors, pageErrors.map((error) => error.stack ?? error.message).join("\n")).toEqual([]);
   await page.screenshot({ path: "artifacts/e2e/mfa-enrollment-dashboard.png", fullPage: true });
 });
+
+test("generic OAuth callback completes MFA before storing its session", async ({ page }) => {
+  const pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error));
+  await page.route(/\/api\/(?:agents|spaces)(?:\?.*)?$/, (route) => route.fulfill({ status: 200, contentType: "application/json", body: "[]" }));
+  await page.goto("http://127.0.0.1:3001/console/oauth/fixture-mfa/callback?code=fixture&state=fixture");
+  await expect(page.getByRole("heading", { name: "需要二次验证" })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => localStorage.getItem("zakura_session"))).toBeNull();
+  await page.getByLabel("验证码").fill("123456");
+  await page.getByRole("button", { name: "验证", exact: true }).click();
+  await expect(page).toHaveURL(/\/dashboard\/agents/);
+  await expect.poll(() => page.evaluate(() => localStorage.getItem("zakura_session"))).toBe("fixture-oauth-session");
+  await expect(page.getByText("页面出错了")).toHaveCount(0);
+  expect(pageErrors).toEqual([]);
+});
+
+test("tenant switch enrollment retries without replacing the current session prematurely", async ({ page }) => {
+  const pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error));
+  await page.addInitScript(() => localStorage.setItem("zakura_session", "fixture-session"));
+  await page.route(/\/api\/(?:agents|spaces)(?:\?.*)?$/, (route) => route.fulfill({ status: 200, contentType: "application/json", body: "[]" }));
+  await page.goto("http://127.0.0.1:3001/dashboard/agents");
+  await page.getByText("Fixture Team", { exact: true }).first().click();
+  await page.getByRole("menuitem", { name: /Second Team/ }).click();
+  await expect(page.getByRole("heading", { name: "保护你的账号" })).toBeVisible();
+  await expect(page.getByText("Tenant enrollment temporarily unavailable")).toBeVisible();
+  await expect.poll(() => page.evaluate(() => localStorage.getItem("zakura_session"))).toBe("fixture-session");
+  await page.getByRole("button", { name: "重试" }).click();
+  await expect(page.getByText("TENANTSECRET123")).toBeVisible();
+  await page.getByLabel("验证码").fill("654321");
+  await page.getByRole("button", { name: "启用并继续" }).click();
+  await expect(page).toHaveURL(/\/dashboard\/agents/);
+  await expect.poll(() => page.evaluate(() => localStorage.getItem("zakura_session"))).toBe("fixture-switched-session");
+  await expect(page.getByText("页面出错了")).toHaveCount(0);
+  expect(pageErrors).toEqual([]);
+});

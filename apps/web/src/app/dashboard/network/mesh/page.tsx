@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Check, Copy, KeyRound, RefreshCw } from "lucide-react";
 import {
@@ -23,6 +23,7 @@ import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { PageLoading } from "@/components/ui/progress-linear";
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from "@/components/ui/table";
+import { createNetworkUiController } from "@/lib/network-ui-state";
 
 export default function NetworkMeshPage() {
   const [data, setData] = useState<MeshPayload | null>(null);
@@ -33,17 +34,21 @@ export default function NetworkMeshPage() {
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
   const [generatedKey, setGeneratedKey] = useState<string | null>(null);
+  const requests = useRef(createNetworkUiController());
 
   const load = useCallback(async () => {
+    const request = requests.current.begin("mesh");
     try {
-      setData(await fetchMesh());
+      const result = await fetchMesh();
+      if (request.current()) setData(result);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : String(err));
+      if (request.current()) toast.error(err instanceof Error ? err.message : String(err));
     }
   }, []);
 
   useEffect(() => {
     void load();
+    return () => requests.current.invalidate("mesh");
   }, [load]);
 
   useEffect(() => {

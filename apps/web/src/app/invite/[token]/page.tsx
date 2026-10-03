@@ -12,6 +12,7 @@ import { Label } from "@/components/ui/label";
 import { createActionLock, inviteState } from "@/lib/auth-flow";
 import { createLatestRequestGate } from "@/lib/chat-state";
 import { AuthMfaEnrollment } from "@/components/auth-mfa-enrollment";
+import { AuthMfaChallenge } from "@/components/auth-mfa-challenge";
 import { authCallbackResult } from "@/lib/auth-callback-state";
 
 type InviteInfo = {
@@ -31,6 +32,8 @@ export default function InviteAcceptPage() {
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
   const [enrollmentTicket, setEnrollmentTicket] = useState<string | null>(null);
+  const [mfa, setMfa] = useState<{ ticket: string; methods: string[] } | null>(null);
+  const [authDestination, setAuthDestination] = useState("/dashboard/agents");
   const [meEmail, setMeEmail] = useState<string | null>(null);
   const loadGate = useRef(createLatestRequestGate());
   const acceptAction = useRef(createActionLock());
@@ -63,6 +66,8 @@ export default function InviteAcceptPage() {
         tenant?: { onboardingCompleted?: boolean };
         mfaEnrollmentRequired?: boolean;
         mfaEnrollmentTicket?: string;
+        mfaRequired?: boolean;
+        mfaTicket?: string;
         methods?: string[];
       }>(`/api/invites/${token}/accept`, {
         method: "POST",
@@ -71,7 +76,9 @@ export default function InviteAcceptPage() {
           : { email: info?.email, password, name: name || undefined },
       });
       const outcome = authCallbackResult(res);
+      setAuthDestination(res.tenant?.onboardingCompleted === false ? "/onboarding" : "/dashboard/agents");
       if (outcome.kind === "enrollment") { setEnrollmentTicket(outcome.ticket); return; }
+      if (outcome.kind === "mfa") { setMfa({ ticket: outcome.ticket, methods: outcome.methods }); return; }
       if (outcome.kind !== "session") throw new Error(outcome.message);
       setSession(outcome.session);
       toast.success("已加入团队");
@@ -97,7 +104,9 @@ export default function InviteAcceptPage() {
           <p className="mt-1 text-sm text-muted-foreground">接受邀请成为团队成员</p>
         </div>
 
-        {enrollmentTicket ? (
+        {mfa ? (
+          <AuthMfaChallenge ticket={mfa.ticket} methods={mfa.methods} onSession={(session) => { setSession(session); toast.success("已加入团队"); router.push(authDestination); }} onCancel={() => setMfa(null)} />
+        ) : enrollmentTicket ? (
           <AuthMfaEnrollment ticket={enrollmentTicket} onSession={(result) => {
             setSession(result.session);
             toast.success("已加入团队");

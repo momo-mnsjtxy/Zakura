@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { toast } from "sonner";
 import { Network, RefreshCw, Shield } from "lucide-react";
@@ -14,21 +14,26 @@ import { SettingsHeader, SettingsSection } from "@/components/settings-shell";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { PageLoading } from "@/components/ui/progress-linear";
+import { createNetworkUiController } from "@/lib/network-ui-state";
 
 export default function NetworkOverviewPage() {
   const [data, setData] = useState<NetworkOverviewDto | null>(null);
   const [busy, setBusy] = useState(false);
+  const requests = useRef(createNetworkUiController());
 
   const load = useCallback(async () => {
+    const request = requests.current.begin("overview");
     try {
-      setData(await fetchNetworkOverview());
+      const result = await fetchNetworkOverview();
+      if (request.current()) setData(result);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : String(err));
+      if (request.current()) toast.error(err instanceof Error ? err.message : String(err));
     }
   }, []);
 
   useEffect(() => {
     void load();
+    return () => requests.current.invalidate("overview");
   }, [load]);
 
   async function testDefaultTunnel() {
@@ -38,7 +43,7 @@ export default function NetworkOverviewPage() {
     }
     setBusy(true);
     try {
-      const res = await testProvider(data.defaultProvider);
+      const res = await requests.current.runOnce(`test:${data.defaultProvider}`, () => testProvider(data.defaultProvider!));
       if (res.ok) {
         toast.success(res.publicUrl ? `就绪：${res.publicUrl}` : res.message);
       } else {

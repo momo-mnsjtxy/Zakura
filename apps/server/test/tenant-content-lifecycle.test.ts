@@ -91,10 +91,12 @@ describe("durable tenant content lifecycle", () => {
     let skillAttempts = 0;
     let connectorCleanups = 0;
     let memoryCleanups = 0;
+    let taskCleanups = 0;
     let deleteLeases = 0;
     const leaseFinishes: boolean[] = [];
     const lifecycle = new TenantContentLifecycleService(db, {
       stopChannels: async () => {},
+      cleanupTaskState: async () => { taskCleanups += 1; },
       agentLifecycle: {
         beginTenantDelete: async () => {
           deleteLeases += 1;
@@ -125,6 +127,7 @@ describe("durable tenant content lifecycle", () => {
     assert.equal(job?.attempts, 1);
     assert.equal(connectorCleanups, 1, "independent cleanup should still run");
     assert.equal(memoryCleanups, 1);
+    assert.equal(taskCleanups, 1);
     assert.deepEqual(leaseFinishes, [false]);
 
     now = new Date(now.getTime() + 2_000);
@@ -136,6 +139,7 @@ describe("durable tenant content lifecycle", () => {
     assert.equal(job?.attempts, 2);
     assert.equal(deleteLeases, 2);
     assert.deepEqual(leaseFinishes, [false, false]);
+    assert.equal(taskCleanups, 2);
 
     await tenantsService.deleteTenantAsPlatformAdmin(tenantId);
     assert.equal(await db.query.tenants.findFirst({ where: eq(tenants.id, tenantId) }), undefined);
@@ -146,6 +150,7 @@ describe("durable tenant content lifecycle", () => {
       "delete tombstone must survive tenant cascade",
     );
     assert.equal(deleteLeases, 3);
+    assert.equal(taskCleanups, 2, "completed delete cleanup must remain idempotent");
     assert.deepEqual(leaseFinishes, [false, false, true]);
     await lifecycle.stop();
     await events.close();
@@ -162,12 +167,13 @@ describe("durable tenant content lifecycle", () => {
     const eventsA = new PlatformEventBus({ transport: hub.create(), instanceId: "events-a" });
     const eventsB = new PlatformEventBus({ transport: hub.create(), instanceId: "events-b" });
     const state = {
-      a: { stopped: 0, suspended: 0, revoked: 0 },
-      b: { stopped: 0, suspended: 0, revoked: 0 },
-      late: { stopped: 0, suspended: 0, revoked: 0 },
+      a: { stopped: 0, suspended: 0, revoked: 0, tasks: 0 },
+      b: { stopped: 0, suspended: 0, revoked: 0, tasks: 0 },
+      late: { stopped: 0, suspended: 0, revoked: 0, tasks: 0 },
     };
     const callbacks = (key: keyof typeof state) => ({
       stopChannels: async () => { state[key].stopped += 1; },
+      cleanupTaskState: async () => { state[key].tasks += 1; },
       agentLifecycle: {
         beginTenantDelete: async () => ({ finish: async () => {} }),
         suspendTenant: async () => { state[key].suspended += 1; },
@@ -192,8 +198,15 @@ describe("durable tenant content lifecycle", () => {
     await a.lifecycleHook().afterSuspend(tenantId);
     await waitFor(() => state.a.stopped > 0 && state.b.stopped > 0);
     await waitFor(() => state.a.suspended > 0 && state.b.suspended > 0);
+    await waitFor(() => state.a.tasks > 0 && state.b.tasks > 0);
+    const taskCountsAfterSuspend = { a: state.a.tasks, b: state.b.tasks };
     await a.lifecycleHook().afterMemberRemoved(tenantId, "removed-user");
     await waitFor(() => state.a.revoked > 0 && state.b.revoked > 0);
+    assert.deepEqual(
+      { a: state.a.tasks, b: state.b.tasks },
+      taskCountsAfterSuspend,
+      "member revocation must not clear all tenant task state",
+    );
 
     const eventsLate = new PlatformEventBus({ transport: hub.create(), instanceId: "events-late" });
     const late = new TenantContentLifecycleService(db, callbacks("late"), {
@@ -202,6 +215,7 @@ describe("durable tenant content lifecycle", () => {
     await late.tick();
     assert.ok(state.late.stopped > 0, "late replica did not observe durable suspend tombstone");
     assert.ok(state.late.suspended > 0, "late replica did not reconcile agent suspension");
+    assert.ok(state.late.tasks > 0, "late replica did not reconcile tenant task cleanup");
     await Promise.all([a.stop(), b.stop(), late.stop()]);
     await Promise.all([eventsA.close(), eventsB.close(), eventsLate.close()]);
   });
