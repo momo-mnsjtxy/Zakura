@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { toast } from "sonner";
 import {
@@ -52,6 +52,8 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { SearchField } from "@/components/ui/search-field";
 import { Switch } from "@/components/ui/switch";
+import { createActionController } from "@/lib/chat-state";
+import { adminFilterIntent, unsuspendUserRow } from "@/lib/admin-ui-state";
 import {
   Table,
   TableBody,
@@ -100,7 +102,7 @@ export default function AdminUsersPage() {
   // 用惰性初始值读一次即可，避免 useSearchParams 强制要求 Suspense 边界。
   const [status, setStatus] = useState(() => {
     if (typeof window === "undefined") return "all";
-    return new URLSearchParams(window.location.search).get("status") ?? "all";
+    return adminFilterIntent(window.location.search).status;
   });
   const [role, setRole] = useState("all");
   const filters = useMemo(() => ({ status, role }), [status, role]);
@@ -115,6 +117,7 @@ export default function AdminUsersPage() {
   const [suspendTarget, setSuspendTarget] = useState<AdminUserRow | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [editTarget, setEditTarget] = useState<AdminUserRow | null>(null);
+  const mutation = useRef(createActionController());
 
   const patchRow = list.patchItem;
 
@@ -141,19 +144,17 @@ export default function AdminUsersPage() {
   );
 
   async function handleUnsuspend(user: AdminUserRow) {
+    if (!mutation.current.begin()) return;
     setBusyId(user.id);
     try {
       await unsuspendUser(user.id);
-      patchRow((u) => u.id === user.id, {
-        suspended: false,
-        suspendedAt: null,
-        suspendedReason: null,
-      });
+      patchRow((u) => u.id === user.id, unsuspendUserRow(user));
       toast.success(`已解封 ${user.email}`);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
       setBusyId(null);
+      mutation.current.finish();
     }
   }
 
@@ -165,6 +166,7 @@ export default function AdminUsersPage() {
       confirmLabel: "删除",
     });
     if (!ok) return;
+    if (!mutation.current.begin()) return;
     setBusyId(user.id);
     try {
       const res = await api<{ deletedTenants: number }>(`/api/admin/users/${user.id}`, {
@@ -180,6 +182,7 @@ export default function AdminUsersPage() {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
       setBusyId(null);
+      mutation.current.finish();
     }
   }
 

@@ -17,6 +17,7 @@ type Handler struct {
 	ptys        map[string]*host.LiveStream
 	docker      dockerExecutor
 	operations  operationExecutor
+	system      systemExecutor
 	mu          sync.Mutex
 }
 
@@ -28,6 +29,7 @@ func New(kind, storageRoot string) *Handler {
 		ptys:        map[string]*host.LiveStream{},
 		docker:      productionDockerExecutor{},
 		operations:  productionOperationExecutor{},
+		system:      productionSystemExecutor{},
 	}
 }
 

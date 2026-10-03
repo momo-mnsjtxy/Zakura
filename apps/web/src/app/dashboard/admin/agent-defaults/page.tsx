@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
 import { SettingsHeader, SettingsSection, SettingsField } from "@/components/settings-shell";
@@ -8,6 +8,8 @@ import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { PageLoading } from "@/components/ui/progress-linear";
 import { Switch } from "@/components/ui/switch";
+import { createActionController } from "@/lib/chat-state";
+import { enabledManagedServices } from "@/lib/admin-ui-state";
 
 type AgentDefaults = {
   webSearchEnabled: boolean;
@@ -38,6 +40,7 @@ export default function AdminAgentDefaultsPage() {
   const [catalog, setCatalog] = useState<WebCatalog | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const saveAction = useRef(createActionController());
 
   useEffect(() => {
     let cancelled = false;
@@ -50,7 +53,7 @@ export default function AdminAgentDefaultsPage() {
         ]);
         if (cancelled) return;
         setDefaults(d);
-        setManagedServices(managed.services.filter((s) => s.mode !== "disabled"));
+        setManagedServices(enabledManagedServices(managed.services) as ManagedService[]);
         setCatalog(cat);
       } catch (err) {
         if (!cancelled) toast.error(err instanceof Error ? err.message : String(err));
@@ -64,7 +67,7 @@ export default function AdminAgentDefaultsPage() {
   }, []);
 
   async function save() {
-    if (!defaults) return;
+    if (!defaults || !saveAction.current.begin()) return;
     setSaving(true);
     try {
       setDefaults(
@@ -78,6 +81,7 @@ export default function AdminAgentDefaultsPage() {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
       setSaving(false);
+      saveAction.current.finish();
     }
   }
 

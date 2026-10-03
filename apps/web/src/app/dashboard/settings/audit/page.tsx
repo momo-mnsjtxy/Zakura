@@ -1,8 +1,10 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
+import { createActionController, createLatestRequestGate } from "@/lib/chat-state";
+import { normalizeRetentionDays } from "@/lib/admin-ui-state";
 import { useMe } from "@/components/me-context";
 import { SettingsHeader, SettingsSection } from "@/components/settings-shell";
 import { Button } from "@/components/ui/button";
@@ -27,11 +29,15 @@ export default function AuditSettingsPage() {
   const [action, setAction] = useState("");
   const [retentionDays, setRetentionDays] = useState(365);
   const [loading, setLoading] = useState(true);
+  const loadGate = useRef(createLatestRequestGate());
+  const retentionAction = useRef(createActionController());
 
   const load = useCallback(async () => {
+    const requestId = loadGate.current.begin();
     const res = await api<{ items: Item[]; retentionDays: number }>(
       `/api/tenant/audit?limit=80${action ? `&action=${encodeURIComponent(action)}` : ""}`,
     );
+    if (!loadGate.current.isCurrent(requestId)) return;
     setItems(res.items);
     setRetentionDays(res.retentionDays);
     setLoading(false);
@@ -89,12 +95,17 @@ export default function AuditSettingsPage() {
             onChange={(e) => setRetentionDays(Number(e.target.value))}
           />
           <Button size="sm" variant="outline" onClick={async () => {
+            if (!retentionAction.current.begin()) return;
+            try {
             const res = await api<{ retentionDays: number }>("/api/tenant/audit/retention", {
               method: "PUT",
-              json: { retentionDays },
+              json: { retentionDays: normalizeRetentionDays(retentionDays) },
             });
             setRetentionDays(res.retentionDays);
             toast.success("已保存保留天数");
+            } finally {
+              retentionAction.current.finish();
+            }
           }}>保存保留</Button>
         </div>
       </SettingsSection>

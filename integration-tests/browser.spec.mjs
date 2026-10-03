@@ -26,6 +26,13 @@ test("legacy dashboard aliases preserve navigation", async ({ page }) => {
 });
 
 test("fixture user authenticates and reaches the agent dashboard", async ({ page }) => {
+  const pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error));
+  // Production GET /api/agents and GET /api/spaces both return JSON arrays;
+  // the empty arrays are the smallest schema-valid authenticated fixture.
+  await page.route(/\/api\/(?:agents|spaces)(?:\?.*)?$/, (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: "[]" }),
+  );
   await page.goto("http://127.0.0.1:3001/login");
   await page.getByLabel("邮箱").fill("member@example.test");
   await page.getByRole("button", { name: "使用邮箱继续" }).click();
@@ -33,6 +40,8 @@ test("fixture user authenticates and reaches the agent dashboard", async ({ page
   await page.getByRole("button", { name: "登录", exact: true }).click();
   await expect(page).toHaveURL(/\/dashboard\/agents/);
   await expect(page.getByText("Fixture Team").first()).toBeVisible();
+  await expect(page.getByText("还没有 Agent")).toBeVisible();
   await expect(page.getByText("页面出错了")).toHaveCount(0);
+  expect(pageErrors, pageErrors.map((error) => error.stack ?? error.message).join("\n")).toEqual([]);
   await page.screenshot({ path: "artifacts/e2e/agent-dashboard.png", fullPage: true });
 });

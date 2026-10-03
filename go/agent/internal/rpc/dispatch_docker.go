@@ -12,7 +12,6 @@ import (
 )
 
 type dockerExecutor interface {
-	Probe() docker.Ping
 	Run(context.Context, docker.RunSpec) (docker.ContainerInfo, error)
 	Stop(context.Context, string, bool) error
 	Inspect(context.Context, string) (docker.ContainerInfo, error)
@@ -24,7 +23,6 @@ type dockerExecutor interface {
 
 type productionDockerExecutor struct{}
 
-func (productionDockerExecutor) Probe() docker.Ping { return docker.Probe() }
 func (productionDockerExecutor) Run(ctx context.Context, spec docker.RunSpec) (docker.ContainerInfo, error) {
 	return docker.Run(ctx, spec)
 }
@@ -56,8 +54,6 @@ func (h *Handler) dispatchDocker(ctx context.Context, msg Msg, send func(Msg)) (
 	var result any
 	var err error
 	switch msg.Method {
-	case "docker.ping":
-		return true, h.docker.Probe(), nil
 	case "docker.run":
 		var p docker.RunSpec
 		if err := decodeParams(msg.Params, &p); err != nil {
@@ -146,7 +142,7 @@ func (h *Handler) dispatchDocker(ctx context.Context, msg Msg, send func(Msg)) (
 
 func isDockerMethod(method string) bool {
 	switch method {
-	case "docker.ping", "docker.run", "docker.stop", "docker.inspect",
+	case "docker.run", "docker.stop", "docker.inspect",
 		"docker.exec", "docker.logs", "docker.copy", "docker.list",
 		"docker.exec.start", "docker.attach", "docker.exec.write", "docker.exec.close":
 		return true
