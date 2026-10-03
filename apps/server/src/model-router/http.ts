@@ -43,13 +43,69 @@ export function buildHeaders(
 
 /** A provider response whose HTTP status is available to routing policy. */
 export class UpstreamHttpError extends Error {
+  readonly code?: string;
+  readonly providerType?: string;
+
   constructor(
     message: string,
     readonly status: number,
+    details?: { code?: string; type?: string },
   ) {
     super(message);
     this.name = "UpstreamHttpError";
+    this.code = details?.code;
+    this.providerType = details?.type;
   }
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+/** Preserve structured provider failures carried inside a successful SSE response. */
+export function providerStreamError(prefix: string, payload: unknown): UpstreamHttpError {
+  const envelope = record(payload) ?? {};
+  const nested = record(envelope.error) ?? envelope;
+  const stringField = (key: string): string | undefined => {
+    const value = nested[key] ?? envelope[key];
+    return typeof value === "string" && value ? value : undefined;
+  };
+  const numericStatus = [
+    nested.status,
+    nested.status_code,
+    envelope.status,
+    envelope.status_code,
+  ]
+    .map((value) =>
+      typeof value === "number"
+        ? value
+        : typeof value === "string" && /^\d{3}$/.test(value)
+          ? Number(value)
+          : null,
+    )
+    .find((value): value is number => value != null);
+  const code = stringField("code");
+  const type = stringField("type");
+  const message =
+    stringField("message") ??
+    (typeof envelope.error === "string" ? envelope.error : undefined) ??
+    "upstream stream error";
+  const classification = `${code ?? ""} ${type ?? ""} ${message}`.toLowerCase();
+  const inferredStatus =
+    /rate[_ -]?limit|too[_ -]?many|quota/.test(classification)
+      ? 429
+      : /server[_ -]?error|overload|temporar|unavailable|internal[_ -]?error/.test(
+            classification,
+          )
+        ? 503
+        : 400;
+  const status = numericStatus ?? inferredStatus;
+  return new UpstreamHttpError(`${prefix} HTTP ${status}: ${message}`, status, {
+    ...(code ? { code } : {}),
+    ...(type ? { type } : {}),
+  });
 }
 
 function errorChain(error: unknown): unknown[] {
@@ -294,15 +350,27 @@ export function apiError(
   text: string,
 ): UpstreamHttpError {
   let message = text.slice(0, 500);
+  let code: string | undefined;
+  let type: string | undefined;
   if (data && typeof data === "object" && "error" in data) {
     const providerError = (data as { error?: unknown }).error;
     if (typeof providerError === "string") message = providerError;
     else if (providerError && typeof providerError === "object") {
-      const providerMessage = (providerError as { message?: unknown }).message;
+      const details = providerError as {
+        message?: unknown;
+        code?: unknown;
+        type?: unknown;
+      };
+      const providerMessage = details.message;
       if (typeof providerMessage === "string") message = providerMessage;
+      if (typeof details.code === "string") code = details.code;
+      if (typeof details.type === "string") type = details.type;
     }
   }
-  return new UpstreamHttpError(`${prefix} HTTP ${status}: ${message}`, status);
+  return new UpstreamHttpError(`${prefix} HTTP ${status}: ${message}`, status, {
+    ...(code ? { code } : {}),
+    ...(type ? { type } : {}),
+  });
 }
 
 /** Ordered, bounded parallel mapping used by batch-only provider APIs. */

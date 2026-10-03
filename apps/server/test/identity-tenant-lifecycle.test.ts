@@ -4,18 +4,27 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
-import { eq } from "drizzle-orm";
+import { and, eq, or } from "drizzle-orm";
 import { Hono } from "hono";
 import type { Db } from "../src/db/client.js";
 import {
+  apiKeys,
+  connectorAuthProfiles,
+  connectorSettings,
   newId,
   oauthIdentities,
+  platformServiceQuotas,
   scimUserMappings,
   securityAuditLogs,
+  settings,
+  skillSourceTokens,
   ssoLoginStates,
+  tenants,
   tenantMemberships,
+  tenantDomains,
   users,
 } from "../src/db/schema.js";
+import { hashApiKey } from "@zakura/core";
 import { registerScimRoutes } from "../src/api/scim-routes.js";
 import { SecurityAuditService } from "../src/services/identity/audit.js";
 import {
@@ -29,6 +38,7 @@ import {
   upsertTenantSso,
 } from "../src/services/identity/sso.js";
 import { TenantAccessError, TenantService } from "../src/services/tenants.js";
+import { authenticateApiKey } from "../src/services/auth.js";
 import { AdminMembershipService, SaasAdminError } from "../../../packages/saas/src/server/admin-memberships.js";
 import { RegisterError, registerSaasUser } from "../../../packages/saas/src/server/register-user.js";
 import { registerSaasRoutes } from "../../../packages/saas/src/server/routes.js";
@@ -208,6 +218,33 @@ describe("identity tenancy lifecycle on PGlite", () => {
         id: newId(), tenantId: routeTenant.tenant.id, userId: routeMember.id, role: "member", status: "active", createdAt: now, updatedAt: now,
       })
       .returning();
+    const lifecycleTenant = await service.createTenant({
+      name: "Lifecycle target",
+      slug: `lifecycle-${newId()}`,
+      ownerUserId: ownerB,
+    });
+    const soleOwner = await addUser(`sole-owner-${newId()}@example.test`);
+    const dependentMember = await addUser(`dependent-member-${newId()}@example.test`);
+    const governedTenant = await service.createTenant({
+      name: "Governed tenant",
+      slug: `governed-${newId()}`,
+      ownerUserId: soleOwner.id,
+    });
+    await db.insert(tenantMemberships).values({
+      id: newId(),
+      tenantId: governedTenant.tenant.id,
+      userId: dependentMember.id,
+      role: "member",
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+    });
+    const lifecycleEvents: string[] = [];
+    const unregisterLifecycle = service.registerLifecycleHook({
+      afterSuspend: async (tenantId) => lifecycleEvents.push(`suspend:${tenantId}`),
+      afterMemberRemoved: async (tenantId, userId) =>
+        lifecycleEvents.push(`member:${tenantId}:${userId}`),
+    });
     const foreign = await db.query.tenantMemberships.findFirst({
       where: eq(tenantMemberships.tenantId, tenantB),
     });
@@ -219,7 +256,7 @@ describe("identity tenancy lifecycle on PGlite", () => {
         tenantId: routeTenant.tenant.id,
         email: routeOwner.email,
         role: "owner",
-        isPlatformAdmin: false,
+        isPlatformAdmin: true,
       });
       await next();
     });
@@ -256,6 +293,54 @@ describe("identity tenancy lifecycle on PGlite", () => {
     });
     assert.equal(promote.status, 200, await promote.clone().text());
 
+    const suspendSoleOwner = await app.request(
+      `http://test/api/admin/tenants/${routeTenant.tenant.id}/members/${routeTenant.membership.id}`,
+      {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ status: "suspended" }),
+      },
+    );
+    assert.equal(suspendSoleOwner.status, 400, await suspendSoleOwner.clone().text());
+    const deleteSoleOwner = await app.request(
+      `http://test/api/admin/tenants/${routeTenant.tenant.id}/members/${routeTenant.membership.id}`,
+      { method: "DELETE" },
+    );
+    assert.equal(deleteSoleOwner.status, 400, await deleteSoleOwner.clone().text());
+
+    const suspendSoleOwnerUser = await app.request(
+      `http://test/api/admin/users/${soleOwner.id}/suspend`,
+      { method: "POST", headers: { "content-type": "application/json" }, body: "{}" },
+    );
+    assert.equal(suspendSoleOwnerUser.status, 400, await suspendSoleOwnerUser.clone().text());
+    const deleteSoleOwnerUser = await app.request(
+      `http://test/api/admin/users/${soleOwner.id}`,
+      { method: "DELETE" },
+    );
+    assert.equal(deleteSoleOwnerUser.status, 400, await deleteSoleOwnerUser.clone().text());
+
+    const suspendMember = await app.request(
+      `http://test/api/admin/tenants/${routeTenant.tenant.id}/members/${routeMembership.id}`,
+      {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ status: "suspended" }),
+      },
+    );
+    assert.equal(suspendMember.status, 200, await suspendMember.clone().text());
+    assert.ok(lifecycleEvents.includes(`member:${routeTenant.tenant.id}:${routeMember.id}`));
+
+    const suspendTenant = await app.request(
+      `http://test/api/admin/tenants/${lifecycleTenant.tenant.id}/suspend`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ reason: "lifecycle test" }),
+      },
+    );
+    assert.equal(suspendTenant.status, 200, await suspendTenant.clone().text());
+    assert.ok(lifecycleEvents.includes(`suspend:${lifecycleTenant.tenant.id}`));
+
     const inviteResponse = await app.request("http://test/api/tenant/invites", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -267,13 +352,99 @@ describe("identity tenancy lifecycle on PGlite", () => {
     assert.equal(revoke.status, 200, await revoke.clone().text());
     const afterRevoke = await app.request(`http://test/api/invites/${invite.token}`);
     assert.equal(afterRevoke.status, 404);
+    unregisterLifecycle();
+  });
+
+  it("deletes tenant-owned credential/state rows, callbacks and cached API-key auth", async () => {
+    const deletion = await service.createTenant({
+      name: "Deletion aggregate",
+      slug: `delete-${newId()}`,
+      ownerUserId: ownerA,
+    });
+    const tenantId = deletion.tenant.id;
+    const rawKey = `zak_test_${newId()}`;
+    const keyHash = hashApiKey(rawKey);
+    const now = new Date();
+    await db.insert(apiKeys).values({
+      id: newId(), tenantId, name: "cached", keyHash, keyPrefix: rawKey.slice(0, 8), scopes: '["*"]', createdAt: now,
+    });
+    await db.insert(connectorAuthProfiles).values({
+      id: newId(), scopeKey: tenantId, profileKey: "owned", label: "Owned", kind: "custom", enabled: true,
+      configEnc: "encrypted-profile", createdAt: now, updatedAt: now,
+    });
+    await db.insert(connectorSettings).values({
+      id: newId(), scopeKey: tenantId, connectorRef: "owned", configEnc: "encrypted-settings", createdAt: now, updatedAt: now,
+    });
+    await db.insert(skillSourceTokens).values({
+      id: newId(), scopeKey: tenantId, provider: "github", tokenEnc: "encrypted-token", hint: "oken", createdAt: now, updatedAt: now,
+    });
+    await db.insert(platformServiceQuotas).values({
+      id: newId(), scopeKey: tenantId, serviceKey: "*", monthlyLimit: 10, createdAt: now, updatedAt: now,
+    });
+    await db.insert(settings).values([
+      { id: newId(), ownerKey: tenantId, key: "skills.auto-update", value: "{}" },
+      { id: newId(), ownerKey: `tenant:${tenantId}`, key: "identity.audit", value: "{}" },
+    ]);
+    assert.equal((await authenticateApiKey(db, rawKey))?.tenant.id, tenantId);
+
+    const lifecycle: string[] = [];
+    const aggregate = new TenantService(db, [{
+      beforeDelete: async (id) => { lifecycle.push(`before:${id}`); },
+      afterDelete: async (id) => { lifecycle.push(`after:${id}`); },
+    }]);
+    await aggregate.deleteTenant(tenantId, ownerA);
+    assert.deepEqual(lifecycle, [`before:${tenantId}`, `after:${tenantId}`]);
+    assert.equal(await authenticateApiKey(db, rawKey), null);
+    assert.equal(
+      (await db.select().from(connectorAuthProfiles).where(eq(connectorAuthProfiles.scopeKey, tenantId))).length,
+      0,
+    );
+    assert.equal(
+      (await db.select().from(connectorSettings).where(eq(connectorSettings.scopeKey, tenantId))).length,
+      0,
+    );
+    assert.equal(
+      (await db.select().from(skillSourceTokens).where(eq(skillSourceTokens.scopeKey, tenantId))).length,
+      0,
+    );
+    assert.equal(
+      (await db.select().from(platformServiceQuotas).where(eq(platformServiceQuotas.scopeKey, tenantId))).length,
+      0,
+    );
+    assert.equal(
+      (await db.select().from(settings).where(or(eq(settings.ownerKey, tenantId), eq(settings.ownerKey, `tenant:${tenantId}`)))).length,
+      0,
+    );
+
+    const blocked = await service.createTenant({
+      name: "Blocked deletion",
+      slug: `blocked-delete-${newId()}`,
+      ownerUserId: ownerA,
+    });
+    const guarded = new TenantService(db, [{
+      beforeDelete: async () => { throw new Error("runtime teardown failed"); },
+    }]);
+    await assert.rejects(
+      guarded.deleteTenant(blocked.tenant.id, ownerA),
+      /runtime teardown failed/,
+    );
+    assert.ok(await db.query.tenants.findFirst({ where: eq(tenants.id, blocked.tenant.id) }));
   });
 
   it("enforces tenant-bound SCIM routes, group roles and token revocation", async () => {
     const first = await createScimToken(db, tenantA, { groupRoleMap: { Admins: "admin" } });
     const second = await createScimToken(db, tenantB, { groupRoleMap: { Admins: "admin" } });
     const app = new Hono();
-    registerScimRoutes(app, { db, audit: new SecurityAuditService(db) });
+    const lifecycleEvents: string[] = [];
+    const unregisterLifecycle = service.registerLifecycleHook({
+      afterMemberRemoved: async (tenantId, userId) =>
+        lifecycleEvents.push(`${tenantId}:${userId}`),
+    });
+    registerScimRoutes(app, {
+      db,
+      audit: new SecurityAuditService(db),
+      tenantLifecycle: service,
+    });
 
     const createdResponse = await app.request("http://test/scim/v2/Users", {
       method: "POST",
@@ -301,9 +472,50 @@ describe("identity tenancy lifecycle on PGlite", () => {
     assert.equal(groupPatch.status, 200, await groupPatch.clone().text());
     const mapping = await db.query.scimUserMappings.findFirst({ where: eq(scimUserMappings.id, provisioned.id) });
     const membership = await db.query.tenantMemberships.findFirst({
-      where: eq(tenantMemberships.userId, mapping!.userId),
+      where: and(
+        eq(tenantMemberships.tenantId, tenantA),
+        eq(tenantMemberships.userId, mapping!.userId),
+      ),
     });
     assert.equal(membership?.role, "admin");
+
+    const deactivate = await app.request(`http://test/scim/v2/Users/${provisioned.id}`, {
+      method: "PATCH",
+      headers: { authorization: `Bearer ${first.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ Operations: [{ op: "replace", path: "active", value: false }] }),
+    });
+    assert.equal(deactivate.status, 200, await deactivate.clone().text());
+    assert.ok(lifecycleEvents.includes(`${tenantA}:${mapping!.userId}`));
+    const reactivate = await app.request(`http://test/scim/v2/Users/${provisioned.id}`, {
+      method: "PATCH",
+      headers: { authorization: `Bearer ${first.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ Operations: [{ op: "replace", path: "active", value: true }] }),
+    });
+    assert.equal(reactivate.status, 200, await reactivate.clone().text());
+
+    await db.insert(tenantMemberships).values({
+      id: newId(),
+      tenantId: tenantB,
+      userId: mapping!.userId,
+      role: "member",
+      status: "active",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const profileChange = await app.request(`http://test/scim/v2/Users/${provisioned.id}`, {
+      method: "PUT",
+      headers: { authorization: `Bearer ${first.token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        userName: "changed-by-scim@example.test",
+        displayName: "Changed by SCIM",
+        externalId: "ext-1",
+        active: true,
+      }),
+    });
+    assert.equal(profileChange.status, 409, await profileChange.clone().text());
+    const unchangedUser = await db.query.users.findFirst({ where: eq(users.id, mapping!.userId) });
+    assert.equal(unchangedUser?.email, "scim-user@example.test");
+    assert.equal(unchangedUser?.name, "SCIM User");
 
     const remove = await app.request(`http://test/scim/v2/Groups/${groupId}`, {
       method: "PATCH",
@@ -321,11 +533,20 @@ describe("identity tenancy lifecycle on PGlite", () => {
     assert.equal(revoked.status, 401);
     const auditRows = await db.select().from(securityAuditLogs).where(eq(securityAuditLogs.tenantId, tenantA));
     assert.ok(auditRows.some((row) => row.action === "scim.user_create"));
+    unregisterLifecycle();
   });
 
   it("atomically consumes SSO state and completes OIDC against a fake IdP", async () => {
     const secret = "sso-test-secret";
     const urls = { webPublicUrl: "https://web.example.test", publicBaseUrl: "https://api.example.test" };
+    await db.insert(tenantDomains).values({
+      id: newId(),
+      tenantId: tenantA,
+      domain: "example.test",
+      txtToken: "verified-for-test",
+      verifiedAt: new Date(),
+      joinMode: "sso_required",
+    });
     await upsertTenantSso(db, secret, tenantA, {
       enabled: true,
       protocol: "oidc",
@@ -398,6 +619,36 @@ describe("identity tenancy lifecycle on PGlite", () => {
       assert.equal(secondLogin.user.email, "oidc-user@example.test");
       const identities = await db.select().from(oauthIdentities).where(eq(oauthIdentities.providerUserId, "subject-1"));
       assert.equal(identities.length, 1);
+
+      await upsertTenantSso(db, secret, tenantB, {
+        enabled: true,
+        protocol: "oidc",
+        issuer: "https://idp.example.test",
+        clientId: "client-1",
+        clientSecret: "client-secret",
+        authorizeUrl: "https://idp.example.test/authorize",
+        tokenUrl: "https://idp.example.test/token",
+        jwksUrl: "https://idp.example.test/jwks",
+        jitEnabled: true,
+      });
+      assertedEmail = firstLogin.user.email;
+      const hostileStart = await startOidcSso(db, urls, "acme-b");
+      const hostileAuthorize = new URL(hostileStart.authorizeUrl);
+      expectedNonce = hostileAuthorize.searchParams.get("nonce")!;
+      await assert.rejects(
+        completeOidcSso(db, secret, urls, {
+          code: "hostile-code",
+          state: hostileAuthorize.searchParams.get("state")!,
+        }),
+        /可信关联/,
+      );
+      const hostileIdentity = await db.query.oauthIdentities.findFirst({
+        where: and(
+          eq(oauthIdentities.provider, `sso:${tenantB}`),
+          eq(oauthIdentities.providerUserId, "subject-1"),
+        ),
+      });
+      assert.equal(hostileIdentity, undefined);
     } finally {
       globalThis.fetch = originalFetch;
     }

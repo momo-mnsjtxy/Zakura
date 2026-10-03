@@ -3,6 +3,7 @@ import type { Db } from "../db/client.js";
 import { extractBearer } from "../services/auth.js";
 import { SecurityAuditService } from "../services/identity/audit.js";
 import { parseJsonObject } from "../services/identity/util.js";
+import type { TenantLifecycleNotifier } from "../services/tenants.js";
 import {
   ScimError,
   authenticateScim,
@@ -22,8 +23,11 @@ function scimStatus(status: number): 400 | 401 | 403 | 404 | 409 | 500 {
   return 500;
 }
 
-export function registerScimRoutes(app: Hono, deps: { db: Db; audit: SecurityAuditService }) {
-  const { db, audit } = deps;
+export function registerScimRoutes(
+  app: Hono,
+  deps: { db: Db; audit: SecurityAuditService; tenantLifecycle?: TenantLifecycleNotifier },
+) {
+  const { db, audit, tenantLifecycle } = deps;
 
   app.use("/scim/v2/*", async (c, next) => {
     c.header("content-type", "application/scim+json");
@@ -73,7 +77,7 @@ export function registerScimRoutes(app: Hono, deps: { db: Db; audit: SecurityAud
     try {
       const token = await withToken(c);
       const body = (await c.req.json()) as Record<string, unknown>;
-      const user = await scimCreateUser(db, token.tenantId, body);
+      const user = await scimCreateUser(db, token.tenantId, body, "member", tenantLifecycle);
       await audit.append(token.tenantId, "scim.user_create", {
         actor: { type: "scim", id: token.id },
         targetType: "user",
@@ -91,7 +95,13 @@ export function registerScimRoutes(app: Hono, deps: { db: Db; audit: SecurityAud
     try {
       const token = await withToken(c);
       const body = (await c.req.json()) as Record<string, unknown>;
-      const user = await scimReplaceUser(db, token.tenantId, c.req.param("id"), body);
+      const user = await scimReplaceUser(
+        db,
+        token.tenantId,
+        c.req.param("id"),
+        body,
+        tenantLifecycle,
+      );
       await audit.append(token.tenantId, "scim.user_replace", {
         actor: { type: "scim", id: token.id },
         targetType: "user",
@@ -108,7 +118,13 @@ export function registerScimRoutes(app: Hono, deps: { db: Db; audit: SecurityAud
     try {
       const token = await withToken(c);
       const body = (await c.req.json()) as Record<string, unknown>;
-      const user = await scimPatchUser(db, token.tenantId, c.req.param("id"), body);
+      const user = await scimPatchUser(
+        db,
+        token.tenantId,
+        c.req.param("id"),
+        body,
+        tenantLifecycle,
+      );
       await audit.append(token.tenantId, "scim.user_patch", {
         actor: { type: "scim", id: token.id },
         targetType: "user",
@@ -124,7 +140,7 @@ export function registerScimRoutes(app: Hono, deps: { db: Db; audit: SecurityAud
   app.delete("/scim/v2/Users/:id", async (c) => {
     try {
       const token = await withToken(c);
-      await scimDeleteUser(db, token.tenantId, c.req.param("id"));
+      await scimDeleteUser(db, token.tenantId, c.req.param("id"), tenantLifecycle);
       await audit.append(token.tenantId, "scim.user_delete", {
         actor: { type: "scim", id: token.id },
         targetType: "user",

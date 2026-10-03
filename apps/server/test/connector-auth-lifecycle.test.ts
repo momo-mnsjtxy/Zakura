@@ -82,6 +82,10 @@ describe("connector auth persistence lifecycle", () => {
   });
 
   it("serializes profile/settings merges so concurrent fields are not lost", async () => {
+    const { ConnectorAuthService } = await import("../src/services/connector-auth.js");
+    const secondInstance = new ConnectorAuthService(db, {
+      secret: "01234567890123456789012345678901",
+    } as never);
     await auth.saveProfile(tenantA, "custom-profile", {
       kind: "custom",
       enabled: true,
@@ -89,7 +93,7 @@ describe("connector auth persistence lifecycle", () => {
     });
     await Promise.all([
       auth.mergeProfileValues(tenantA, "custom-profile", { generatedSecret: "one" }),
-      auth.mergeProfileValues(tenantA, "custom-profile", { callbackState: "two" }),
+      secondInstance.mergeProfileValues(tenantA, "custom-profile", { callbackState: "two" }),
       auth.mergeProfileValues(tenantA, "custom-profile", { installationId: "three" }),
     ]);
     const profile = await auth.getProfile(tenantA, "custom-profile");
@@ -106,7 +110,7 @@ describe("connector auth persistence lifecycle", () => {
     ];
     await Promise.all([
       auth.saveSettings(tenantA, "github", { region: "eu" }, fields),
-      auth.saveSettings(tenantA, "github", { workspace: "core" }, fields),
+      secondInstance.saveSettings(tenantA, "github", { workspace: "core" }, fields),
     ]);
     assert.deepEqual(await auth.getSettings(tenantA, "github"), {
       region: "eu",
@@ -147,4 +151,3 @@ describe("connector auth persistence lifecycle", () => {
     assert.equal(view[0]?.authorized, true);
   });
 });
-

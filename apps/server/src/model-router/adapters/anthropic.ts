@@ -11,7 +11,11 @@ import {
 } from "../adapter.js";
 import { apiError, httpJson, httpSse } from "../http.js";
 import { acceptsImageInput, expandToolImageMessages, imageOmittedText } from "../media.js";
-import { buildOpenAIChatCompletion, toModelChatResult } from "../openai-response.js";
+import {
+  assertCompleteToolCalls,
+  buildOpenAIChatCompletion,
+  toModelChatResult,
+} from "../openai-response.js";
 import { applyReasoningOptions } from "../reasoning.js";
 import type { ResolvedRoute } from "../types.js";
 
@@ -250,6 +254,7 @@ async function chat(
     : toolCalls!.length
       ? "tool_calls"
       : "stop";
+  assertCompleteToolCalls(toolCalls!, finishReason, toolCalls!.length);
 
   const openai = buildOpenAIChatCompletion({
     id: res.data?.id,
@@ -388,6 +393,7 @@ export function anthropicStreamStateToResult(
     : toolCalls.length
       ? "tool_calls"
       : "stop";
+  assertCompleteToolCalls(toolCalls, finishReason, toolCalls.length);
   const openai = buildOpenAIChatCompletion({
     model: state.model ?? fallbackModel,
     content: state.text || null,

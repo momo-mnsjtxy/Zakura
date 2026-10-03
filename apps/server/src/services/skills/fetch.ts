@@ -14,6 +14,7 @@ import {
   type SkillPackage,
   type SkillSource,
 } from "@zakura/shared";
+import { createHash } from "node:crypto";
 import {
   SkillSourceError,
   normalizeSkillName,
@@ -102,15 +103,19 @@ export async function hydratePackage(
   const assets = pkg.assets ?? [];
   if (!assets.length) return pkg;
   const { owner, repo, ref, path: dir } = pkg.source;
-  if (pkg.source.kind !== "github" || !owner || !repo) return pkg;
+  if ((pkg.source.kind !== "github" && pkg.source.kind !== "gitlab") || !owner || !repo) return pkg;
 
-  const rawBase = rawBaseUrl(owner, repo, ref || "HEAD");
+  const rawBase = pkg.source.kind === "github" ? rawBaseUrl(owner, repo, ref || "HEAD") : "";
+  const gitlabProject = encodeURIComponent(`${owner}/${repo}`);
   const have = new Set(pkg.files.map((f) => f.path));
   const wanted = assets.filter((a) => !have.has(a.path));
   const contents = await mapPool(wanted, DOWNLOAD_CONCURRENCY, async (asset) => {
     const full = dir ? `${dir}/${asset.path}` : asset.path;
     try {
-      return await httpText(`${rawBase}/${encodeURI(full)}`, opts);
+      const url = pkg.source.kind === "github"
+        ? `${rawBase}/${encodeURI(full)}`
+        : `https://gitlab.com/api/v4/projects/${gitlabProject}/repository/files/${encodeURIComponent(full)}/raw?ref=${encodeURIComponent(ref || "HEAD")}`;
+      return await httpText(url, opts);
     } catch {
       return null;
     }
@@ -163,6 +168,8 @@ const SKIP_EXTENSIONS = new Set([
 export interface FetchOptions {
   /** GitHub PAT，用于提升 API 限额（可选） */
   githubToken?: string | undefined;
+  /** GitLab access token for private projects (optional). */
+  gitlabToken?: string | undefined;
   /**
    * 只下载 SKILL.md，捆绑文件仅登记路径与体积（放进 pkg.assets）。
    * 安装前预览用，避免为一个 40 技能的仓库拉几百个文件。
@@ -184,6 +191,10 @@ async function httpJson<T>(url: string, opts: FetchOptions, accept = "applicatio
   const token = opts.githubToken?.trim();
   if (token && url.includes("api.github.com")) {
     headers.Authorization = `Bearer ${token}`;
+  }
+  const gitlabToken = opts.gitlabToken?.trim();
+  if (gitlabToken && url.includes("gitlab.com/api/v4/")) {
+    headers["PRIVATE-TOKEN"] = gitlabToken;
   }
   const res = await fetchWithTimeout(url, { headers }, opts.signal);
   if (!res.ok) {
@@ -208,9 +219,19 @@ async function httpJson<T>(url: string, opts: FetchOptions, accept = "applicatio
 }
 
 async function httpText(url: string, opts: FetchOptions): Promise<string> {
+  const headers: Record<string, string> = {
+    "User-Agent": USER_AGENT,
+    Accept: "text/plain, text/markdown, */*",
+  };
+  if (opts.gitlabToken?.trim() && url.includes("gitlab.com/api/v4/")) {
+    headers["PRIVATE-TOKEN"] = opts.gitlabToken.trim();
+  }
+  if (opts.githubToken?.trim() && url.includes("raw.githubusercontent.com")) {
+    headers.Authorization = `Bearer ${opts.githubToken.trim()}`;
+  }
   const res = await fetchWithTimeout(
     url,
-    { headers: { "User-Agent": USER_AGENT, Accept: "text/plain, text/markdown, */*" } },
+    { headers },
     opts.signal,
   );
   if (!res.ok) throw new SkillSourceError(`下载失败 ${res.status}：${url}`);
@@ -546,7 +567,10 @@ async function fetchGithub(source: SkillSource, opts: FetchOptions): Promise<Fet
   // 不传 ref 时直接用 HEAD：省掉一次仅为读 default_branch 的 API 调用
   const ref = source.ref || "HEAD";
 
-  const treeKey = `${owner}/${repo}@${ref}`;
+  const credentialKey = opts.githubToken?.trim()
+    ? createHash("sha256").update(opts.githubToken.trim()).digest("base64url").slice(0, 16)
+    : "anonymous";
+  const treeKey = `${owner}/${repo}@${ref}:${credentialKey}`;
   let cachedTree = readCache(treeCache, treeKey);
   if (!cachedTree) {
     try {

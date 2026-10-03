@@ -54,6 +54,9 @@ export type SaasHostDeps = {
       actorUserId: string,
     ) => Promise<unknown>;
     leaveTenant: (tenantId: string, userId: string) => Promise<unknown>;
+    deleteTenantAsPlatformAdmin?: (tenantId: string) => Promise<unknown>;
+    notifyTenantSuspended?: (tenantId: string) => Promise<void>;
+    notifyMemberAccessRevoked?: (tenantId: string, userId: string) => Promise<void>;
     listInvites: (tenantId: string) => Promise<
       Array<{
         id: string;

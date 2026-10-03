@@ -1,9 +1,15 @@
 import bcrypt from "bcryptjs";
-import { and, asc, eq, isNull } from "drizzle-orm";
+import { and, asc, eq, isNull, or } from "drizzle-orm";
 import { createHash, randomBytes } from "node:crypto";
 import type { Db } from "../db/client.js";
 import {
   newId,
+  apiKeys,
+  connectorAuthProfiles,
+  connectorSettings,
+  platformServiceQuotas,
+  settings,
+  skillSourceTokens,
   tenantInvites,
   tenantMemberships,
   tenants,
@@ -14,6 +20,8 @@ import {
   type User,
 } from "../db/schema.js";
 import { CredentialLifecycleService } from "./identity/credential-lifecycle.js";
+import { invalidateTenantSuspension } from "./account-status.js";
+import { invalidateApiKeyAuthHashes } from "./auth.js";
 import {
   inviteRole,
   isTenantRole,
@@ -80,6 +88,26 @@ export function slugifyTenant(input: string): string {
   );
 }
 
+export type TenantLifecycleHook = {
+  /** Stop external/background work before tenant-owned rows are removed. */
+  beforeDelete?: (tenantId: string) => Promise<void> | void;
+  /** Best-effort cache/runtime notification after the transaction commits. */
+  afterDelete?: (tenantId: string) => Promise<void> | void;
+  /** Idempotent post-commit notification that all tenant access was suspended. */
+  afterSuspend?: (tenantId: string) => Promise<void> | void;
+  /**
+   * Idempotent post-commit notification that one user's tenant access was
+   * revoked. This also fires when a membership is suspended rather than
+   * physically removed.
+   */
+  afterMemberRemoved?: (tenantId: string, userId: string) => Promise<void> | void;
+};
+
+export type TenantLifecycleNotifier = {
+  notifyTenantSuspended: (tenantId: string) => Promise<void>;
+  notifyMemberAccessRevoked: (tenantId: string, userId: string) => Promise<void>;
+};
+
 function hashInviteToken(raw: string): string {
   return createHash("sha256").update(raw).digest("hex");
 }
@@ -95,13 +123,49 @@ function isUniqueViolation(error: unknown): boolean {
   return value.cause !== error && isUniqueViolation(value.cause);
 }
 
+// drizzle's PGlite/Postgres transaction callback types do not distribute over
+// the Db union, although both executors expose the same schema/query contract.
+function transactionDb(value: unknown): Db {
+  return value as Db;
+}
+
 /**
  * Tenant aggregate boundary. Every member/invite mutation is tenant-qualified;
  * multi-row lifecycle transitions use a transaction so tokens cannot be consumed
  * without their resulting membership being durable.
  */
 export class TenantService {
-  constructor(private readonly db: Db) {}
+  private readonly lifecycleHooks = new Set<TenantLifecycleHook>();
+
+  constructor(private readonly db: Db, hooks: readonly TenantLifecycleHook[] = []) {
+    hooks.forEach((hook) => this.lifecycleHooks.add(hook));
+  }
+
+  registerLifecycleHook(hook: TenantLifecycleHook): () => void {
+    this.lifecycleHooks.add(hook);
+    return () => this.lifecycleHooks.delete(hook);
+  }
+
+  /**
+   * Emit only after the mutation commits. Callers await these notifications so
+   * runtime teardown failures are visible; handlers must be safe to retry.
+   */
+  async notifyTenantSuspended(tenantId: string): Promise<void> {
+    await Promise.all(
+      [...this.lifecycleHooks].map((hook) =>
+        Promise.resolve().then(() => hook.afterSuspend?.(tenantId)),
+      ),
+    );
+  }
+
+  /** Emit after a membership delete or active -> suspended transition commits. */
+  async notifyMemberAccessRevoked(tenantId: string, userId: string): Promise<void> {
+    await Promise.all(
+      [...this.lifecycleHooks].map((hook) =>
+        Promise.resolve().then(() => hook.afterMemberRemoved?.(tenantId, userId)),
+      ),
+    );
+  }
 
   async listForUser(userId: string) {
     const rows = await this.db
@@ -184,7 +248,7 @@ export class TenantService {
           : `${slugifyTenant(name).slice(0, 43)}-${randomBytes(2).toString("hex")}`;
       try {
         return await this.db.transaction(async (tx) => {
-          const database = tx as Db;
+          const database = transactionDb(tx);
           const now = new Date();
           const [tenant] = await database
             .insert(tenants)
@@ -231,13 +295,47 @@ export class TenantService {
     return row;
   }
 
-  async deleteTenant(tenantId: string, actorUserId: string) {
-    await this.requireMembership(tenantId, actorUserId, "owner");
+  private async deleteTenantAggregate(tenantId: string) {
     const tenant = await this.db.query.tenants.findFirst({ where: eq(tenants.id, tenantId) });
     if (!tenant) throw new TenantAccessError("Team not found", 404);
     if (tenant.isDefault) throw new TenantAccessError("The default team cannot be deleted", 400);
-    await this.db.delete(tenants).where(eq(tenants.id, tenantId));
+
+    for (const hook of this.lifecycleHooks) await hook.beforeDelete?.(tenantId);
+    const keyRows = await this.db
+      .select({ keyHash: apiKeys.keyHash })
+      .from(apiKeys)
+      .where(eq(apiKeys.tenantId, tenantId));
+    await this.db.transaction(async (tx) => {
+      const database = transactionDb(tx);
+      // These ownership columns intentionally support non-tenant platform scopes,
+      // so they cannot carry a tenant FK/cascade and must be removed explicitly.
+      await database.delete(connectorAuthProfiles).where(eq(connectorAuthProfiles.scopeKey, tenantId));
+      await database.delete(connectorSettings).where(eq(connectorSettings.scopeKey, tenantId));
+      await database.delete(skillSourceTokens).where(eq(skillSourceTokens.scopeKey, tenantId));
+      await database.delete(platformServiceQuotas).where(eq(platformServiceQuotas.scopeKey, tenantId));
+      await database
+        .delete(settings)
+        .where(or(eq(settings.ownerKey, tenantId), eq(settings.ownerKey, `tenant:${tenantId}`)));
+      await database.delete(tenants).where(eq(tenants.id, tenantId));
+    });
+    invalidateTenantSuspension(tenantId);
+    await invalidateApiKeyAuthHashes(keyRows.map((row) => row.keyHash));
+    for (const hook of this.lifecycleHooks) {
+      await Promise.resolve().then(() => hook.afterDelete?.(tenantId)).catch((error) => {
+        console.warn("[tenant] afterDelete hook failed", error);
+      });
+    }
     return { ok: true as const };
+  }
+
+  async deleteTenant(tenantId: string, actorUserId: string) {
+    await this.requireMembership(tenantId, actorUserId, "owner");
+    return this.deleteTenantAggregate(tenantId);
+  }
+
+  /** Platform-admin entry point; still uses the complete tenant aggregate cleanup. */
+  async deleteTenantAsPlatformAdmin(tenantId: string) {
+    return this.deleteTenantAggregate(tenantId);
   }
 
   async listMembers(tenantId: string) {
@@ -289,17 +387,29 @@ export class TenantService {
 
   async removeMember(tenantId: string, membershipId: string, actorUserId: string) {
     await this.requireMembership(tenantId, actorUserId, "admin");
-    const target = await this.db.query.tenantMemberships.findFirst({
-      where: and(eq(tenantMemberships.id, membershipId), eq(tenantMemberships.tenantId, tenantId)),
+    const removedUserId = await this.db.transaction(async (tx) => {
+      const database = transactionDb(tx);
+      const target = await database.query.tenantMemberships.findFirst({
+        where: and(
+          eq(tenantMemberships.id, membershipId),
+          eq(tenantMemberships.tenantId, tenantId),
+        ),
+      });
+      if (!target) throw new TenantAccessError("Member not found", 404);
+      if (target.role === "owner") throw new TenantAccessError("Cannot remove owner", 400);
+      if (target.userId === actorUserId) {
+        throw new TenantAccessError("Cannot remove yourself; leave the tenant instead", 400);
+      }
+      const deleted = await database
+        .delete(tenantMemberships)
+        .where(
+          and(eq(tenantMemberships.id, membershipId), eq(tenantMemberships.tenantId, tenantId)),
+        )
+        .returning();
+      if (!deleted.length) throw new TenantAccessError("Member not found", 404);
+      return target.userId;
     });
-    if (!target) throw new TenantAccessError("Member not found", 404);
-    if (target.role === "owner") throw new TenantAccessError("Cannot remove owner", 400);
-    if (target.userId === actorUserId) {
-      throw new TenantAccessError("Cannot remove yourself; leave the tenant instead", 400);
-    }
-    await this.db
-      .delete(tenantMemberships)
-      .where(and(eq(tenantMemberships.id, membershipId), eq(tenantMemberships.tenantId, tenantId)));
+    await this.notifyMemberAccessRevoked(tenantId, removedUserId);
     return { ok: true as const };
   }
 
@@ -312,6 +422,7 @@ export class TenantService {
     await this.db
       .delete(tenantMemberships)
       .where(and(eq(tenantMemberships.id, membership.id), eq(tenantMemberships.tenantId, tenantId)));
+    await this.notifyMemberAccessRevoked(tenantId, userId);
     return { ok: true as const };
   }
 
@@ -338,7 +449,7 @@ export class TenantService {
 
     const token = `inv_${randomBytes(24).toString("base64url")}`;
     return this.db.transaction(async (tx) => {
-      const database = tx as Db;
+      const database = transactionDb(tx);
       const now = new Date();
       await database
         .delete(tenantInvites)
@@ -392,21 +503,23 @@ export class TenantService {
   }): Promise<{ user: User; tenant: Tenant; membership: TenantMembership }> {
     const found = await this.getInviteByToken(input.token);
     if (!found?.invite || !found.tenant) throw new TenantAccessError("Invalid invite", 404);
-    if (found.invite.acceptedAt) throw new TenantAccessError("Invite already used", 400);
-    if (found.invite.expiresAt <= new Date()) throw new TenantAccessError("Invite expired", 400);
-    if (found.tenant.suspendedAt) throw new TenantAccessError("该团队已被封禁", 403);
+    const invite = found.invite;
+    const invitedTenant = found.tenant;
+    if (invite.acceptedAt) throw new TenantAccessError("Invite already used", 400);
+    if (invite.expiresAt <= new Date()) throw new TenantAccessError("Invite expired", 400);
+    if (invitedTenant.suspendedAt) throw new TenantAccessError("该团队已被封禁", 403);
 
     let user: User | undefined;
     let passwordHash: string | undefined;
     if (input.userId) {
       user = await this.db.query.users.findFirst({ where: eq(users.id, input.userId) });
       if (!user) throw new TenantAccessError("User not found", 404);
-      if (user.email.toLowerCase() !== found.invite.email.toLowerCase()) {
+      if (user.email.toLowerCase() !== invite.email.toLowerCase()) {
         throw new TenantAccessError("Invite email does not match signed-in user", 403);
       }
     } else {
-      const email = (input.email ?? found.invite.email).trim().toLowerCase();
-      if (email !== found.invite.email.toLowerCase()) {
+      const email = (input.email ?? invite.email).trim().toLowerCase();
+      if (email !== invite.email.toLowerCase()) {
         throw new TenantAccessError("Email must match invite", 400);
       }
       user = await this.db.query.users.findFirst({ where: eq(users.email, email) });
@@ -424,11 +537,11 @@ export class TenantService {
     if (user?.suspendedAt) throw new TenantAccessError("账号已被封禁", 403);
 
     return this.db.transaction(async (tx) => {
-      const database = tx as Db;
-      if (!(await new CredentialLifecycleService(database).claimInvite(found.invite.id))) {
+      const database = transactionDb(tx);
+      if (!(await new CredentialLifecycleService(database).claimInvite(invite.id))) {
         throw new TenantAccessError("Invite already used", 400);
       }
-      const tenant = await database.query.tenants.findFirst({ where: eq(tenants.id, found.tenant.id) });
+      const tenant = await database.query.tenants.findFirst({ where: eq(tenants.id, invitedTenant.id) });
       if (!tenant) throw new TenantAccessError("Invalid invite", 404);
       if (tenant.suspendedAt) throw new TenantAccessError("该团队已被封禁", 403);
 
@@ -439,8 +552,8 @@ export class TenantService {
           .insert(users)
           .values({
             id: newId(),
-            email: found.invite.email,
-            name: input.name?.trim() || found.invite.email.split("@")[0],
+            email: invite.email,
+            name: input.name?.trim() || invite.email.split("@")[0],
             passwordHash: passwordHash!,
             isPlatformAdmin: false,
             createdAt: now,
@@ -456,7 +569,7 @@ export class TenantService {
         const [updated] = await database
           .update(tenantMemberships)
           .set({
-            role: strongestRole(existing.role, found.invite.role),
+            role: strongestRole(existing.role, invite.role),
             status: "active",
             updatedAt: now,
           })
@@ -470,7 +583,7 @@ export class TenantService {
             id: newId(),
             tenantId: tenant.id,
             userId: claimedUser.id,
-            role: inviteRole(found.invite.role),
+            role: inviteRole(invite.role),
             status: "active",
             createdAt: now,
             updatedAt: now,
@@ -487,7 +600,7 @@ export class TenantService {
     const deleted = await this.db
       .delete(tenantInvites)
       .where(and(eq(tenantInvites.id, inviteId), eq(tenantInvites.tenantId, tenantId)))
-      .returning({ id: tenantInvites.id });
+      .returning();
     if (!deleted.length) throw new TenantAccessError("Invite not found", 404);
     return { ok: true as const };
   }

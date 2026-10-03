@@ -100,6 +100,28 @@ describe("anthropic stream accumulation", () => {
     );
     assert.equal(state.reasoning, "先分析");
   });
+
+  it("does not expose truncated or invalid tool arguments", () => {
+    const truncated = createAnthropicStreamState();
+    absorbAnthropicStreamEvent(truncated, {
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "tool_use", id: "toolu_unsafe", name: "write" },
+    });
+    absorbAnthropicStreamEvent(truncated, {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "input_json_delta", partial_json: '{"path":' },
+    });
+    absorbAnthropicStreamEvent(truncated, {
+      type: "message_delta",
+      delta: { stop_reason: "max_tokens" },
+    });
+    assert.throws(
+      () => anthropicStreamStateToResult(truncated, "m"),
+      /阻止执行/,
+    );
+  });
 });
 
 describe("gemini stream accumulation", () => {
@@ -153,5 +175,20 @@ describe("gemini stream accumulation", () => {
         error: { message: "quota" },
       }),
     );
+  });
+
+  it("does not expose function calls when generation hit MAX_TOKENS", () => {
+    const state = createGeminiStreamState();
+    absorbGeminiStreamChunk(state, {
+      candidates: [
+        {
+          content: {
+            parts: [{ functionCall: { name: "write", args: { path: "a" } } }],
+          },
+          finishReason: "MAX_TOKENS",
+        },
+      ],
+    });
+    assert.throws(() => geminiStreamStateToResult(state, "m"), /阻止执行/);
   });
 });

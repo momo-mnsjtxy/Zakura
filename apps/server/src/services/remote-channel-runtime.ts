@@ -45,7 +45,6 @@ import {
   RemoteChannelSessionRegistry,
   formatRemoteInboundPrefix,
   type RemoteChannelSessionHandle,
-  type RemoteChannelToolPort,
   type RemoteChannelTrigger,
   type RemoteChatHandle,
 } from "./remote-channel-tools.js";
@@ -201,8 +200,10 @@ export class RemoteChannelRuntime {
   private readonly bots = new Map<string, Bot>();
   /** Binding startup can be triggered by boot, UI enable and a webhook concurrently. */
   private readonly botStarts = new Map<string, Promise<Bot>>();
+  private readonly bindingTenants = new Map<string, string>();
+  private readonly stoppedTenants = new Set<string>();
   private readonly states = new Map<string, PostgresStateAdapter | MemoryStateAdapter>();
-  readonly sessions: RemoteChannelToolPort = new RemoteChannelSessionRegistry();
+  readonly sessions = new RemoteChannelSessionRegistry();
 
   constructor(
     private readonly config: AppConfig,
@@ -212,6 +213,11 @@ export class RemoteChannelRuntime {
   ) {}
 
   async handleWebhook(tenantId: string, bindingId: string, request: Request): Promise<Response> {
+    if (!(await this.ingress.isTenantAvailable(tenantId))) {
+      await this.stopTenant(tenantId);
+      return Response.json({ error: "团队不可用" }, { status: 403 });
+    }
+    this.stoppedTenants.delete(tenantId);
     const binding = await this.ingress.getBinding(tenantId, bindingId);
     if (!binding || !isChatSdkPlatform(binding.platform)) {
       return Response.json({ error: "远程连接不存在或平台不支持" }, { status: 404 });
@@ -243,15 +249,26 @@ export class RemoteChannelRuntime {
       this.states.delete(bindingId);
       await state.disconnect().catch(() => undefined);
     }
+    this.sessions.unbindBinding(bindingId);
+    this.bindingTenants.delete(bindingId);
   }
 
   async startBinding(tenantId: string, bindingId: string): Promise<void> {
+    if (!(await this.ingress.isTenantAvailable(tenantId))) {
+      throw new Error("团队不可用，远程连接未启动");
+    }
+    this.stoppedTenants.delete(tenantId);
     const binding = await this.ingress.getBinding(tenantId, bindingId);
     if (!binding || !binding.enabled || !isChatSdkPlatform(binding.platform)) return;
     await this.getBot(tenantId, binding);
   }
 
   async startTenant(tenantId: string): Promise<void> {
+    if (!(await this.ingress.isTenantAvailable(tenantId))) {
+      await this.stopTenant(tenantId);
+      return;
+    }
+    this.stoppedTenants.delete(tenantId);
     const bindings = await this.ingress.listBindings(tenantId);
     for (const binding of bindings) {
       if (!binding.enabled || !isChatSdkPlatform(binding.platform)) continue;
@@ -265,11 +282,37 @@ export class RemoteChannelRuntime {
     }
   }
 
+  /** Stop every adapter, state connection and live reply handle for a tenant. */
+  async stopTenant(tenantId: string): Promise<void> {
+    this.stoppedTenants.add(tenantId);
+    const persisted = await this.ingress.listBindings(tenantId).catch(() => []);
+    const ids = new Set(persisted.map((binding) => binding.id));
+    for (const [bindingId, owner] of this.bindingTenants) {
+      if (owner === tenantId) ids.add(bindingId);
+    }
+    await Promise.all([...ids].map((bindingId) => this.invalidate(bindingId)));
+  }
+
+  /** Compatible with TenantService.registerLifecycleHook. */
+  lifecycleHook(): {
+    beforeDelete: (tenantId: string) => Promise<void>;
+    afterSuspend: (tenantId: string) => Promise<void>;
+    afterMemberRemoved: (tenantId: string, userId: string) => Promise<void>;
+  } {
+    return {
+      beforeDelete: (tenantId) => this.stopTenant(tenantId),
+      afterSuspend: (tenantId) => this.stopTenant(tenantId),
+      afterMemberRemoved: (tenantId, _userId) => this.stopTenant(tenantId),
+    };
+  }
+
   async stop(): Promise<void> {
     await Promise.allSettled(this.botStarts.values());
     for (const bot of this.bots.values()) await bot.shutdown().catch(() => undefined);
     this.bots.clear();
     this.botStarts.clear();
+    this.bindingTenants.clear();
+    this.stoppedTenants.clear();
     for (const state of this.states.values()) await state.disconnect().catch(() => undefined);
     this.states.clear();
   }
@@ -409,6 +452,8 @@ export class RemoteChannelRuntime {
     tenantId: string,
     binding: { id: string; platform: string; profileKey: string; agentId?: string },
   ): Promise<Bot> {
+    if (this.stoppedTenants.has(tenantId)) throw new Error("团队不可用，远程连接未启动");
+    this.bindingTenants.set(binding.id, tenantId);
     const existing = this.bots.get(binding.id);
     if (existing) return existing;
     const starting = this.botStarts.get(binding.id);
@@ -683,6 +728,11 @@ export class RemoteChannelRuntime {
     });
 
     await bot.initialize();
+
+    if (this.stoppedTenants.has(tenantId) || !(await this.ingress.isTenantAvailable(tenantId))) {
+      await bot.shutdown().catch(() => undefined);
+      throw new Error("团队不可用，远程连接已停止");
+    }
 
     void registerPlatformSlashCommands(binding.platform, adapterConfig)
       .then((result) => {

@@ -147,7 +147,7 @@ async function main() {
   runtimeNodes.bindHub(runnerHub);
   const agentService = new AgentService(db, runtime, config, runtimeNodes);
   const memoryStore = new MemoryStore(db);
-  const memoryProviders = new MemoryProvidersService(db);
+  const memoryProviders = new MemoryProvidersService(db, config.secret);
   const modelRouter = new ModelRouterService(db);
   const modelUpstreams = new ModelUpstreamsService(db, (tenantId) =>
     modelRouter.invalidateCache(tenantId),

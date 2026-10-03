@@ -23,6 +23,7 @@ describe("agent duplicate REST API", () => {
   let close: () => Promise<void>;
   let app: ApiApp;
   let token: string;
+  let platformToken: string;
   let tenantId: string;
 
   before(async () => {
@@ -39,11 +40,20 @@ describe("agent duplicate REST API", () => {
     const { tenants, users, tenantMemberships, newId } = await import("../src/db/schema.js");
     tenantId = newId();
     const userId = newId();
+    const platformUserId = newId();
     await db.insert(tenants).values({ id: tenantId, name: "Duplicate API", slug: "duplicate-api" });
     await db.insert(users).values({ id: userId, email: "duplicate-api@example.test" });
+    await db.insert(users).values({
+      id: platformUserId,
+      email: "platform-admin@example.test",
+      isPlatformAdmin: true,
+    });
     await db
       .insert(tenantMemberships)
       .values({ tenantId, userId, role: "owner", status: "active" });
+    await db
+      .insert(tenantMemberships)
+      .values({ tenantId, userId: platformUserId, role: "owner", status: "active" });
 
     const config = {
       dataDir,
@@ -78,6 +88,13 @@ describe("agent duplicate REST API", () => {
       email: "duplicate-api@example.test",
       role: "owner",
     });
+    platformToken = signSession(config.secret, {
+      userId: platformUserId,
+      tenantId,
+      email: "platform-admin@example.test",
+      role: "owner",
+      isPlatformAdmin: true,
+    });
   });
 
   after(async () => {
@@ -96,12 +113,56 @@ describe("agent duplicate REST API", () => {
       headers: headers(),
       body: body === undefined ? undefined : JSON.stringify(body),
     });
+  const requestAs = (authToken: string, path: string, method: string, body: unknown) =>
+    app.request(path, {
+      method,
+      headers: {
+        authorization: `Bearer ${authToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
   const get = (path: string) => app.request(path, { headers: headers() });
 
   const listAgents = async (spaceId: string) =>
     (await (await get(`/api/agents?spaceId=${spaceId}`)).json()) as Array<Record<string, unknown>>;
 
   let space: Record<string, unknown>;
+
+  it("requires a platform-admin session to create or enable a platform assistant", async () => {
+    const deniedCreate = await requestAs(token, "/api/agents", "POST", {
+      name: "Forbidden Platform Assistant",
+      config: { platformAssistant: true },
+      createApiKey: false,
+    });
+    assert.equal(deniedCreate.status, 403, await deniedCreate.clone().text());
+
+    const normal = await requestAs(token, "/api/agents", "POST", {
+      name: "Promotable Agent",
+      createApiKey: false,
+    });
+    assert.equal(normal.status, 201, await normal.clone().text());
+    const normalId = String(((await normal.json()) as Record<string, unknown>).id);
+    const deniedUpdate = await requestAs(token, `/api/agents/${normalId}`, "PATCH", {
+      config: { cloud: { platformAssistant: true } },
+    });
+    assert.equal(deniedUpdate.status, 403, await deniedUpdate.clone().text());
+
+    const allowed = await requestAs(platformToken, `/api/agents/${normalId}`, "PATCH", {
+      config: { cloud: { platformAssistant: true } },
+    });
+    assert.equal(allowed.status, 200, await allowed.clone().text());
+    const body = (await allowed.json()) as { config?: { cloud?: { platformAssistant?: boolean } } };
+    assert.equal(body.config?.cloud?.platformAssistant, true);
+
+    const deniedDuplicate = await requestAs(
+      token,
+      `/api/agents/${normalId}/duplicate`,
+      "POST",
+      {},
+    );
+    assert.equal(deniedDuplicate.status, 403, await deniedDuplicate.clone().text());
+  });
 
   it("duplicates an agent into the same space, copying name/description/config", async () => {
     const spaceRes = await post("/api/spaces", { name: "Dup Space", description: "shared" });

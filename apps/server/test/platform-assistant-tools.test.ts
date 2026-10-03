@@ -52,12 +52,68 @@ describe("platform assistant tools", () => {
     const result = await callPlatformAssistantTool(
       "migrate_instance",
       { instance_id: "abc", target_node_id: "node-1" },
-      { tenantId: "t1", agentId: "a1", instanceMigrations: null },
+      {
+        tenantId: "t1",
+        agentId: "a1",
+        isPlatformAdmin: true,
+        instanceMigrations: null,
+      },
     );
     const text =
       result.content.find((c): c is { type: "text"; text: string } => c.type === "text")?.text ??
       "";
     assert.match(text, /not implemented/i);
     assert.equal(result.isError, true);
+  });
+
+  it("rejects platform credential writes without explicit platform-admin authorization", async () => {
+    let writes = 0;
+    const result = await callPlatformAssistantTool(
+      "set_connector_credentials",
+      { profile: "github", scope: "platform", values: { token: "secret" } },
+      {
+        tenantId: "tenant",
+        agentId: "agent",
+        isPlatformAdmin: false,
+        integrations: {
+          async saveProfile() {
+            writes += 1;
+            return null;
+          },
+        } as never,
+      },
+    );
+    assert.equal(result.isError, true);
+    assert.equal(writes, 0);
+    const text = result.content.find((part) => part.type === "text")?.text ?? "";
+    assert.match(text, /platform admin/i);
+  });
+
+  it("allows an explicitly authorized platform admin to invoke platform tools", async () => {
+    let writes = 0;
+    const result = await callPlatformAssistantTool(
+      "set_connector_credentials",
+      { profile: "github", scope: "platform", values: { token: "secret" } },
+      {
+        tenantId: "tenant",
+        agentId: "agent",
+        isPlatformAdmin: true,
+        integrations: {
+          async saveProfile() {
+            writes += 1;
+            return {
+              key: "github",
+              enabled: true,
+              configuredFields: ["token"],
+              connectorRefs: ["github"],
+            };
+          },
+        } as never,
+      },
+    );
+    assert.notEqual(result.isError, true);
+    assert.equal(writes, 1);
+    const text = result.content.find((part) => part.type === "text")?.text ?? "";
+    assert.equal(text.includes("secret"), false);
   });
 });

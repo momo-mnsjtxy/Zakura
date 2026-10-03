@@ -13,7 +13,10 @@ export type SkillFetchOptions = {
 const inflight = new Map<string, Promise<Response>>();
 
 function fingerprint(headers: Headers): string {
-  const auth = headers.get("authorization") ?? "";
+  const auth = [
+    headers.get("authorization") ?? "",
+    headers.get("private-token") ?? "",
+  ].join("\u0000");
   return auth
     ? createHash("sha256").update(auth).digest("base64url").slice(0, 16)
     : "anonymous";
@@ -119,4 +122,3 @@ export async function fetchSkillSource(
   // The canonical response is never consumed; each caller receives its own body.
   return (await request).clone();
 }
-

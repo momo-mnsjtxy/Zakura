@@ -4,7 +4,9 @@ import type { ModelChatMessage } from "@zakura/shared";
 import {
   executeChatStream,
   isAbortError,
+  isRetryableModelError,
   registerBuiltinModelAdapters,
+  UpstreamHttpError,
 } from "../src/model-router/index.js";
 import type { ResolvedRoute } from "../src/model-router/types.js";
 
@@ -54,6 +56,76 @@ function fragmentedResponse(payloads: unknown[]): Response {
 }
 
 describe("model provider contracts over deterministic fake HTTP", () => {
+  it("preserves SSE provider status/code for retry policy", async () => {
+    globalThis.fetch = (async () =>
+      fragmentedResponse([
+        {
+          error: {
+            status: 429,
+            code: "rate_limit_exceeded",
+            type: "rate_limit_error",
+            message: "slow down",
+          },
+        },
+      ])) as typeof fetch;
+
+    await assert.rejects(
+      executeChatStream(
+        route("openai"),
+        [{ role: "user", content: "go" }],
+        undefined,
+        {},
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof UpstreamHttpError);
+        assert.equal(error.status, 429);
+        assert.equal(error.code, "rate_limit_exceeded");
+        assert.equal(error.providerType, "rate_limit_error");
+        assert.equal(isRetryableModelError(error), true);
+        return true;
+      },
+    );
+  });
+
+  for (const [finishReason, argumentsText] of [
+    ["length", '{"q":"x"}'],
+    ["content_filter", '{"q":"x"}'],
+    ["tool_calls", '{"q":'],
+  ] as const) {
+    it(`blocks ${finishReason} or incomplete tool arguments`, async () => {
+      globalThis.fetch = (async () =>
+        fragmentedResponse([
+          {
+            choices: [
+              {
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: "unsafe_call",
+                      function: { name: "lookup", arguments: argumentsText },
+                    },
+                  ],
+                },
+                finish_reason: finishReason,
+              },
+            ],
+          },
+          "[DONE]",
+        ])) as typeof fetch;
+
+      await assert.rejects(
+        executeChatStream(
+          route("openai"),
+          [{ role: "user", content: "go" }],
+          undefined,
+          {},
+        ),
+        /阻止执行/,
+      );
+    });
+  }
+
   it("normalizes fragmented OpenAI text, reasoning, tools, usage, and tool history", async () => {
     let requestBody: Record<string, unknown> | null = null;
     globalThis.fetch = (async (_input, init) => {

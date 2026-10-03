@@ -20,6 +20,8 @@ import type { DockerRuntime } from "../runtime/docker.js";
 import {
   type AgentProvidersConfig,
   getAgentProviders,
+  isPlatformAssistant,
+  isPlatformAssistantConfig,
   mergeAgentProviders,
   parseAgentConfig,
 } from "./agent-providers.js";
@@ -52,6 +54,14 @@ import { TtlCache } from "../model-router/cache.js";
 const ZAKURA_AUTO_NAME = "Zakura 自动";
 /** Agent 配置读多写少：热路径短 TTL 进程内缓存 */
 const AGENT_CACHE_TTL_MS = 30_000;
+
+export class AgentAuthorizationError extends Error {
+  readonly status = 403 as const;
+  constructor(message: string) {
+    super(message);
+    this.name = "AgentAuthorizationError";
+  }
+}
 
 /** Platform-only slots surface as「Zakura 自动」so tenants never see jina/firecrawl ids. */
 function displayNameForWebService(
@@ -182,6 +192,7 @@ export class AgentService {
       /** @deprecated 电脑/文件能力已迁到 Space；仅为旧调用保持兼容，不再写 Agent 行 */
       enableComputer?: boolean;
       workspaceImage?: string | null;
+      platformAdminAuthorized?: boolean;
     },
   ) {
     // Space 承载电脑/工作区；Agent 只保留身份与记忆。
@@ -231,6 +242,14 @@ export class AgentService {
           },
         },
       } satisfies Record<string, unknown>);
+    if (
+      isPlatformAssistantConfig(defaultConfig) &&
+      input.platformAdminAuthorized !== true
+    ) {
+      throw new AgentAuthorizationError(
+        "Platform assistant configuration requires platform admin authorization",
+      );
+    }
 
     const [row] = await this.db
       .insert(agents)
@@ -294,7 +313,11 @@ export class AgentService {
     };
   }
 
-  async duplicate(tenantId: string, id: string, opts?: { name?: string }) {
+  async duplicate(
+    tenantId: string,
+    id: string,
+    opts?: { name?: string; platformAdminAuthorized?: boolean },
+  ) {
     const source = await this.get(tenantId, id);
     if (!source) throw new Error("Agent not found");
 
@@ -326,6 +349,7 @@ export class AgentService {
       spaceId: source.spaceId,
       description: source.description,
       config,
+      platformAdminAuthorized: opts?.platformAdminAuthorized,
     });
   }
 
@@ -421,10 +445,21 @@ export class AgentService {
       /** Restart workspace after feature change when container-backed */
       restart?: boolean;
       userId?: string;
+      platformAdminAuthorized?: boolean;
     },
   ): Promise<AgentWithSpace> {
     const agent = await this.get(tenantId, id);
     if (!agent) throw new Error("Agent not found");
+    if (
+      input.config !== undefined &&
+      !isPlatformAssistant(agent) &&
+      isPlatformAssistantConfig(input.config) &&
+      input.platformAdminAuthorized !== true
+    ) {
+      throw new AgentAuthorizationError(
+        "Platform assistant configuration requires platform admin authorization",
+      );
+    }
 
     if (input.runtimeNodeId !== undefined && input.userId) {
       await assertNodeBindAllowed(this.db, this.config, {

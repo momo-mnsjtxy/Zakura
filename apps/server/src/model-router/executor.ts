@@ -130,11 +130,24 @@ export async function executeChat(
   messages: ModelChatMessage[],
   options?: ModelChatInvokeOptions,
 ): Promise<ModelChatResult> {
-  const history = normalizeToolCallHistory(messages);
-  return invokeOnRoute(route, "chat", async (adapter, hydrated) => {
-    if (!adapter.chat) throw new Error(`协议 ${adapter.protocol} 未实现 chat`);
-    return adapter.chat(applyInvokeRouteOptions(hydrated, options), history, options);
-  });
+  return invokeOnRoute(route, "chat", (adapter, hydrated) =>
+    executeChatWithAdapter(adapter, hydrated, messages, options),
+  );
+}
+
+/** Invoke an adapter already selected/hydrated by the route state machine. */
+export function executeChatWithAdapter(
+  adapter: ModelProtocolAdapter,
+  route: ResolvedRoute,
+  messages: ModelChatMessage[],
+  options?: ModelChatInvokeOptions,
+): Promise<ModelChatResult> {
+  if (!adapter.chat) throw new Error(`协议 ${adapter.protocol} 未实现 chat`);
+  return adapter.chat(
+    applyInvokeRouteOptions(route, options),
+    normalizeToolCallHistory(messages),
+    options,
+  );
 }
 
 export async function executeChatStream(
@@ -143,27 +156,51 @@ export async function executeChatStream(
   options: ModelChatInvokeOptions | undefined,
   callbacks: ChatStreamCallbacks,
 ): Promise<ModelChatResult> {
+  return invokeOnRoute(route, "chat", (adapter, hydrated) =>
+    executeChatStreamWithAdapter(
+      adapter,
+      hydrated,
+      messages,
+      options,
+      callbacks,
+    ),
+  );
+}
+
+export async function executeChatStreamWithAdapter(
+  adapter: ModelProtocolAdapter,
+  route: ResolvedRoute,
+  messages: ModelChatMessage[],
+  options: ModelChatInvokeOptions | undefined,
+  callbacks: ChatStreamCallbacks,
+): Promise<ModelChatResult> {
   const history = normalizeToolCallHistory(messages);
-  return invokeOnRoute(route, "chat", async (adapter, hydrated) => {
-    const configured = applyInvokeRouteOptions(hydrated, options);
-    if (adapter.chatStream) {
-      return adapter.chatStream(configured, history, options, callbacks);
-    }
-    if (!adapter.chat) throw new Error(`协议 ${adapter.protocol} 未实现 chat`);
-    const result = await adapter.chat(configured, history, options);
-    if (result.content) callbacks.onDelta?.(result.content);
-    return result;
-  });
+  const configured = applyInvokeRouteOptions(route, options);
+  if (adapter.chatStream) {
+    return adapter.chatStream(configured, history, options, callbacks);
+  }
+  if (!adapter.chat) throw new Error(`协议 ${adapter.protocol} 未实现 chat`);
+  const result = await adapter.chat(configured, history, options);
+  if (result.content) callbacks.onDelta?.(result.content);
+  return result;
 }
 
 export function executeEmbed(
   route: ResolvedRoute,
   texts: string[],
 ): Promise<ModelEmbeddingResult> {
-  return invokeOnRoute(route, "embedding", (adapter, hydrated) => {
-    if (!adapter.embed) throw new Error(`协议 ${adapter.protocol} 未实现 embed`);
-    return adapter.embed(hydrated, texts);
-  });
+  return invokeOnRoute(route, "embedding", (adapter, hydrated) =>
+    executeEmbedWithAdapter(adapter, hydrated, texts),
+  );
+}
+
+export function executeEmbedWithAdapter(
+  adapter: ModelProtocolAdapter,
+  route: ResolvedRoute,
+  texts: string[],
+): Promise<ModelEmbeddingResult> {
+  if (!adapter.embed) throw new Error(`协议 ${adapter.protocol} 未实现 embed`);
+  return adapter.embed(route, texts);
 }
 
 export function executeRerank(
@@ -171,22 +208,39 @@ export function executeRerank(
   query: string,
   documents: string[],
 ): Promise<ModelRerankResult> {
-  return invokeOnRoute(route, "rerank", (adapter, hydrated) => {
-    if (!adapter.rerank) throw new Error(`协议 ${adapter.protocol} 未实现 rerank`);
-    return adapter.rerank(hydrated, query, documents);
-  });
+  return invokeOnRoute(route, "rerank", (adapter, hydrated) =>
+    executeRerankWithAdapter(adapter, hydrated, query, documents),
+  );
+}
+
+export function executeRerankWithAdapter(
+  adapter: ModelProtocolAdapter,
+  route: ResolvedRoute,
+  query: string,
+  documents: string[],
+): Promise<ModelRerankResult> {
+  if (!adapter.rerank) throw new Error(`协议 ${adapter.protocol} 未实现 rerank`);
+  return adapter.rerank(route, query, documents);
 }
 
 export function executeImage(
   route: ResolvedRoute,
   prompt: string,
 ): Promise<ModelImageResult> {
-  return invokeOnRoute(route, "image", (adapter, hydrated) => {
-    if (!adapter.generateImage) {
-      throw new Error(`协议 ${adapter.protocol} 未实现 generateImage`);
-    }
-    return adapter.generateImage(hydrated, prompt);
-  });
+  return invokeOnRoute(route, "image", (adapter, hydrated) =>
+    executeImageWithAdapter(adapter, hydrated, prompt),
+  );
+}
+
+export function executeImageWithAdapter(
+  adapter: ModelProtocolAdapter,
+  route: ResolvedRoute,
+  prompt: string,
+): Promise<ModelImageResult> {
+  if (!adapter.generateImage) {
+    throw new Error(`协议 ${adapter.protocol} 未实现 generateImage`);
+  }
+  return adapter.generateImage(route, prompt);
 }
 
 /**
@@ -209,11 +263,9 @@ export async function executeWithFallback<T>(
   const failures: RouteFailure[] = [];
 
   for (const route of routes) {
-    assertCapability(route, capability);
-    const adapter = resolveAdapterForCapability(route.upstream.protocol, capability);
     try {
       const result = await withModelRetries(
-        () => operation(adapter, route),
+        () => invokeOnRoute(route, capability, operation),
         {
           attempts: options?.attemptsPerRoute ?? 2,
           baseDelayMs: options?.baseDelayMs,
@@ -239,10 +291,18 @@ export function executeEvaluation(
   route: ResolvedRoute,
   input: ModelEvaluationInput,
 ): Promise<ModelEvaluationResult> {
-  return invokeOnRoute(route, "evaluation", (adapter, hydrated) => {
-    if (!adapter.evaluate) {
-      throw new Error(`协议 ${adapter.protocol} 不支持评估能力`);
-    }
-    return adapter.evaluate(hydrated, input);
-  });
+  return invokeOnRoute(route, "evaluation", (adapter, hydrated) =>
+    executeEvaluationWithAdapter(adapter, hydrated, input),
+  );
+}
+
+export function executeEvaluationWithAdapter(
+  adapter: ModelProtocolAdapter,
+  route: ResolvedRoute,
+  input: ModelEvaluationInput,
+): Promise<ModelEvaluationResult> {
+  if (!adapter.evaluate) {
+    throw new Error(`协议 ${adapter.protocol} 不支持评估能力`);
+  }
+  return adapter.evaluate(route, input);
 }

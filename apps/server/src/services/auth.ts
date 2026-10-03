@@ -16,7 +16,7 @@ import {
   type User,
 } from "../db/schema.js";
 import { REDIS_KEYS } from "./redis.js";
-import { redisGetJson, redisSetJson, REDIS_TTL } from "./redis-store.js";
+import { redisDel, redisGetJson, redisSetJson, REDIS_TTL } from "./redis-store.js";
 import { recordUserUsage } from "./user-usage.js";
 
 export interface SessionPayload {
@@ -297,6 +297,14 @@ const apiKeyAuthCache = new Map<
   { apiKey: ApiKey; tenant: Tenant; expiresAt: number }
 >();
 const lastUsedThrottle = new Map<string, number>();
+
+/** Remove durable API-key auth cache entries after key or tenant deletion. */
+export async function invalidateApiKeyAuthHashes(keyHashes: readonly string[]): Promise<void> {
+  const unique = [...new Set(keyHashes.filter(Boolean))];
+  if (!unique.length) return;
+  for (const keyHash of unique) apiKeyAuthCache.delete(keyHash);
+  await redisDel(...unique.map((keyHash) => REDIS_KEYS.auth(keyHash)));
+}
 
 function touchApiKeyLastUsed(db: Db, apiKeyId: string): void {
   const now = Date.now();

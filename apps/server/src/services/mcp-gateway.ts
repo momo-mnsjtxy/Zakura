@@ -1294,6 +1294,7 @@ export class McpGateway {
       onProgress?: (message: string, data?: Record<string, unknown>) => void;
       defaultWorkingDir?: string;
       projectSlug?: string;
+      isPlatformAdmin?: boolean;
     },
   ): Promise<McpToolResult | McpCreateTaskResult> {
     const tools = await this.listToolsForTenant(tenantId, opts);
@@ -1369,6 +1370,7 @@ export class McpGateway {
       onProgress?: (message: string, data?: Record<string, unknown>) => void;
       defaultWorkingDir?: string;
       projectSlug?: string;
+      isPlatformAdmin?: boolean;
     },
   ): Promise<McpToolResult | McpCreateTaskResult> {
     void opts;
@@ -1450,6 +1452,7 @@ export class McpGateway {
         return callPlatformAssistantTool(tool.localName, args, {
           tenantId,
           agentId: agent.id,
+          isPlatformAdmin: opts?.isPlatformAdmin === true,
           connectionCatalog: this.connectionCatalog,
           integrations: this.integrationCatalog,
           runtimeNodes: this.runtimeNodes,

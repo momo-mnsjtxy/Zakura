@@ -11,6 +11,52 @@ type NormalizedUsage = {
   totalTokens?: number;
 };
 
+const UNSAFE_TOOL_FINISH_REASONS = new Set(["length", "content_filter"]);
+
+/** Tool arguments are executable only when they form one complete JSON object. */
+export function hasCompleteToolArguments(argumentsText: string): boolean {
+  const value = argumentsText.trim();
+  if (!value) return true; // Providers commonly omit `{}` for zero-argument tools.
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Boolean(parsed && typeof parsed === "object" && !Array.isArray(parsed));
+  } catch {
+    return false;
+  }
+}
+
+export class IncompleteModelToolCallError extends Error {
+  readonly retryable = false;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "IncompleteModelToolCallError";
+  }
+}
+
+export function assertCompleteToolCalls(
+  calls: ModelToolCall[],
+  finishReason: string | null | undefined,
+  observedFragments = calls.length,
+): void {
+  if (observedFragments === 0) return;
+  if (UNSAFE_TOOL_FINISH_REASONS.has(finishReason ?? "")) {
+    throw new IncompleteModelToolCallError(
+      `模型工具调用因 ${finishReason} 截断，已阻止执行`,
+    );
+  }
+  if (
+    calls.length !== observedFragments ||
+    calls.some(
+      (call) =>
+        !call.function.name.trim() ||
+        !hasCompleteToolArguments(call.function.arguments),
+    )
+  ) {
+    throw new IncompleteModelToolCallError("模型返回了不完整的工具调用参数，已阻止执行");
+  }
+}
+
 function hasUsage(usage: NormalizedUsage | undefined): usage is NormalizedUsage {
   return Boolean(
     usage &&
@@ -177,7 +223,10 @@ export function chatStreamStateToResult(
   state: ChatStreamState,
   fallbackModel: string,
 ): ModelChatResult {
-  const completeCalls = state.toolCalls.filter((call) => call.name.trim());
+  const observedCalls = state.toolCalls.filter(
+    (call) => call.id || call.name || call.arguments,
+  );
+  const completeCalls = observedCalls.filter((call) => call.name.trim());
   // `stop` is the only explicit declaration that tools are not actionable.
   // Several compatible gateways end at EOF or send finish_reason=null.
   const includeCalls = state.finishReason !== "stop" && completeCalls.length > 0;
@@ -191,6 +240,11 @@ export function chatStreamStateToResult(
         },
       }))
     : undefined;
+  assertCompleteToolCalls(
+    toolCalls ?? [],
+    state.finishReason,
+    includeCalls ? observedCalls.length : 0,
+  );
   return toModelChatResult(
     buildOpenAIChatCompletion({
       model: state.model ?? fallbackModel,

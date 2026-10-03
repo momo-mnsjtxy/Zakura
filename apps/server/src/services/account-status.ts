@@ -21,7 +21,12 @@ export type SuspensionInfo = {
 const TTL_MS = 15_000;
 
 type UserEntry = { suspendedAt: Date | null; reason: string | null; expiresAt: number };
-type TenantEntry = { suspendedAt: Date | null; reason: string | null; expiresAt: number };
+type TenantEntry = {
+  exists: boolean;
+  suspendedAt: Date | null;
+  reason: string | null;
+  expiresAt: number;
+};
 
 const userCache = new Map<string, UserEntry>();
 const tenantCache = new Map<string, TenantEntry>();
@@ -59,6 +64,7 @@ async function readTenant(db: Db, tenantId: string): Promise<TenantEntry> {
   if (cached && cached.expiresAt > Date.now()) return cached;
   const row = await db.query.tenants.findFirst({ where: eq(tenants.id, tenantId) });
   const entry: TenantEntry = {
+    exists: Boolean(row),
     suspendedAt: row?.suspendedAt ?? null,
     reason: row?.suspendedReason ?? null,
     expiresAt: Date.now() + TTL_MS,
@@ -83,6 +89,11 @@ export async function checkSessionSuspended(
   }
   if (session.tenantId) {
     const tenant = await readTenant(db, session.tenantId);
+    // Cached API-key principals must stop authenticating as soon as their tenant
+    // is deleted. Treat a missing tenant as invalid rather than active.
+    if (!tenant.exists) {
+      return { scope: "tenant", reason: null, suspendedAt: new Date(0) };
+    }
     if (tenant.suspendedAt) {
       return { scope: "tenant", reason: tenant.reason, suspendedAt: tenant.suspendedAt };
     }

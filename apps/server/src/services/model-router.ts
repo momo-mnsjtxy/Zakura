@@ -11,12 +11,7 @@ import type {
 } from "@zakura/shared";
 import type { Db } from "../db/client.js";
 import {
-  executeChat,
   executeChatStream,
-  executeEmbed,
-  executeEvaluation,
-  executeImage,
-  executeRerank,
   executeWithFallback,
   isAbortError,
   isRetryableModelError,
@@ -26,9 +21,15 @@ import {
   type RouteResolveQuery,
 } from "../model-router/index.js";
 import {
+  executeChatWithAdapter,
+  executeEmbedWithAdapter,
+  executeEvaluationWithAdapter,
+  executeImageWithAdapter,
+  executeRerankWithAdapter,
   ModelRouteChainError,
   type RouteFailure,
 } from "../model-router/executor.js";
+import type { ModelProtocolAdapter } from "../model-router/adapter.js";
 import type { ResolvedRoute } from "../model-router/types.js";
 
 export type RouteResolveInput = RouteResolveQuery;
@@ -104,14 +105,10 @@ export class ModelRouterService {
     tenantId: string,
     capability: ModelCapability,
     query: RouteResolveInput,
-    invoke: (route: ResolvedRoute) => Promise<T>,
+    invoke: (adapter: ModelProtocolAdapter, route: ResolvedRoute) => Promise<T>,
   ): Promise<RoutedResult<T>> {
     const routes = await this.resolveChain(tenantId, query);
-    const { result, route } = await executeWithFallback(
-      routes,
-      capability,
-      (_adapter, candidate) => invoke(candidate),
-    );
+    const { result, route } = await executeWithFallback(routes, capability, invoke);
     return withRouteIdentity(result, route);
   }
 
@@ -121,8 +118,8 @@ export class ModelRouterService {
     query: RouteResolveInput,
     options?: ModelChatInvokeOptions,
   ): Promise<RoutedResult<ModelChatResult>> {
-    return this.invokeBuffered(tenantId, "chat", query, (route) =>
-      executeChat(route, messages, options),
+    return this.invokeBuffered(tenantId, "chat", query, (adapter, route) =>
+      executeChatWithAdapter(adapter, route, messages, options),
     );
   }
 
@@ -135,7 +132,7 @@ export class ModelRouterService {
       tenantId,
       "evaluation",
       { capability: "evaluation", ...query },
-      (route) => executeEvaluation(route, input),
+      (adapter, route) => executeEvaluationWithAdapter(adapter, route, input),
     );
   }
 
@@ -206,8 +203,8 @@ export class ModelRouterService {
     texts: string[],
     query: RouteResolveInput,
   ): Promise<RoutedResult<ModelEmbeddingResult>> {
-    return this.invokeBuffered(tenantId, "embedding", query, (route) =>
-      executeEmbed(route, texts),
+    return this.invokeBuffered(tenantId, "embedding", query, (adapter, route) =>
+      executeEmbedWithAdapter(adapter, route, texts),
     );
   }
 
@@ -217,8 +214,8 @@ export class ModelRouterService {
     documents: string[],
     query: RouteResolveInput,
   ): Promise<RoutedResult<ModelRerankResult>> {
-    return this.invokeBuffered(tenantId, "rerank", query, (route) =>
-      executeRerank(route, search, documents),
+    return this.invokeBuffered(tenantId, "rerank", query, (adapter, route) =>
+      executeRerankWithAdapter(adapter, route, search, documents),
     );
   }
 
@@ -227,8 +224,8 @@ export class ModelRouterService {
     prompt: string,
     query: RouteResolveInput,
   ): Promise<RoutedResult<ModelImageResult>> {
-    return this.invokeBuffered(tenantId, "image", query, (route) =>
-      executeImage(route, prompt),
+    return this.invokeBuffered(tenantId, "image", query, (adapter, route) =>
+      executeImageWithAdapter(adapter, route, prompt),
     );
   }
 }

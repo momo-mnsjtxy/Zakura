@@ -20,7 +20,10 @@ import { newId } from "../../db/schema.js";
 import type { McpGateway } from "../mcp-gateway.js";
 import type { ModelRouterService } from "../model-router.js";
 import type { CloudAgentSessionStore } from "../cloud-agent-session.js";
-import { isAbortError } from "../../model-router/http.js";
+import {
+  isAbortError,
+  ModelCallAbortedError,
+} from "../../model-router/http.js";
 import {
   estimateRequestTokens,
   applyTokenCalibration,
@@ -97,6 +100,29 @@ function watchCancel(
       clearInterval(timer);
     },
   };
+}
+
+/** Keep the established retry timing while allowing cancellation to cut it short. */
+async function waitForModelRetry(
+  delayMs: number,
+  cancelPromise: Promise<void>,
+  cancelled: () => Promise<boolean>,
+): Promise<void> {
+  if (await cancelled()) throw new ModelCallAbortedError();
+  const watcher = watchCancel(cancelPromise, cancelled);
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    const outcome = await Promise.race([
+      new Promise<"elapsed">((resolve) => {
+        timer = setTimeout(() => resolve("elapsed"), Math.max(0, delayMs));
+      }),
+      watcher.hit,
+    ]);
+    if (outcome === "cancelled") throw new ModelCallAbortedError();
+  } finally {
+    if (timer) clearTimeout(timer);
+    watcher.dispose();
+  }
 }
 
 export type AgentLoopDeps = {
@@ -184,6 +210,10 @@ export type AgentLoopInput = {
   defaultWorkingDir?: string;
   /** 会话绑定的项目 slug，供技能工具读取项目级 SKILL.md */
   projectSlug?: string;
+  /** Internal deterministic-test seam; production keeps the 1500ms base. */
+  modelRetryBaseDelayMs?: number;
+  /** Explicit authorization carried from the user/session that started this run. */
+  platformAdminAuthorized?: boolean;
 };
 
 export type AgentLoopResult = {
@@ -349,6 +379,7 @@ async function streamModelRound(
     cancelPromise: Promise<void>;
     /** 上下文溢出时同步压缩 messages 并返回是否成功 */
     onContextOverflow?: (messages: ModelChatMessage[]) => Promise<boolean>;
+    retryBaseDelayMs?: number;
   },
 ): Promise<{
   publisher: DeltaPublisher;
@@ -485,7 +516,11 @@ async function streamModelRound(
         `模型调用中断，正在重试（第 ${attempt}/${maxAttempts - 1} 次）`,
         { error: message.slice(0, 600) },
       );
-      await new Promise((r) => setTimeout(r, 1500 * attempt));
+      await waitForModelRetry(
+        (input.retryBaseDelayMs ?? 1500) * attempt,
+        input.cancelPromise,
+        input.isCancelled,
+      );
     } finally {
       roundDone = true;
       clearInterval(poll);
@@ -561,6 +596,9 @@ export async function runAgentLoop(
           isCancelled: cancelled,
           cancelPromise,
           ...(options ? { options } : {}),
+          ...(input.modelRetryBaseDelayMs != null
+            ? { retryBaseDelayMs: input.modelRetryBaseDelayMs }
+            : {}),
           ...(input.hooks?.compactInLoop
             ? {
                 onContextOverflow: (msgs) =>
@@ -774,6 +812,7 @@ export async function runAgentLoop(
                       ? { defaultWorkingDir: input.defaultWorkingDir }
                       : {}),
                     ...(input.projectSlug ? { projectSlug: input.projectSlug } : {}),
+                    isPlatformAdmin: input.platformAdminAuthorized === true,
                     onProgress: (message, data) => {
                       const stdout =
                         data && typeof data.stdout === "string" ? data.stdout : undefined;
@@ -812,7 +851,7 @@ export async function runAgentLoop(
 
         if (raced === "cancelled") {
           const note = "（已取消：不再等待该工具结果）";
-          void store.appendEvent({
+          await store.appendEvent({
             sessionId,
             type: "tool_call_result",
             runId,

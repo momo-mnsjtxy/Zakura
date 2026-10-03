@@ -13,9 +13,18 @@ import {
   type ChatStreamCallbacks,
   type ModelProtocolAdapter,
 } from "../adapter.js";
-import { apiError, buildHeaders, httpJson, httpSse, isAbortError } from "../http.js";
+import {
+  apiError,
+  buildHeaders,
+  httpJson,
+  httpSse,
+  isAbortError,
+  isRetryableModelError,
+  providerStreamError,
+} from "../http.js";
 import {
   absorbChatStreamChunk,
+  assertCompleteToolCalls,
   buildOpenAIChatCompletion,
   chatStreamStateToResult,
   createChatStreamState,
@@ -138,6 +147,7 @@ async function chat(
           maxTokens: route.options.maxTokens,
         });
       } catch (err) {
+        if (isRetryableModelError(err) || isAbortError(err)) throw err;
         console.warn(
           `[openai] responses failed, falling back to chat/completions:`,
           err instanceof Error ? err.message : err,
@@ -190,10 +200,16 @@ async function chat(
 
   const choice = res.data?.choices?.[0];
   const finishReason = choice?.finish_reason ?? null;
+  const rawToolCalls = choice?.message?.tool_calls;
   const toolCalls =
     finishReason === "stop"
       ? undefined
-      : parseOpenAIToolCalls(choice?.message?.tool_calls);
+      : parseOpenAIToolCalls(rawToolCalls);
+  assertCompleteToolCalls(
+    toolCalls ?? [],
+    finishReason,
+    Array.isArray(rawToolCalls) && finishReason !== "stop" ? rawToolCalls.length : 0,
+  );
   const openai = buildOpenAIChatCompletion({
     id: res.data?.id,
     created: res.data?.created,
@@ -254,7 +270,14 @@ async function chatStream(
         // it has usable output. Only real failures reach here. Buffered tool
         // calls have not executed yet, but visible deltas cannot be retracted
         // by this adapter; let the caller handle those failures and cancellation.
-        if (responsesEmitted || isAbortError(err) || callbacks.signal?.aborted) throw err;
+        if (
+          responsesEmitted ||
+          isAbortError(err) ||
+          isRetryableModelError(err) ||
+          callbacks.signal?.aborted
+        ) {
+          throw err;
+        }
         console.warn(
           `[openai] responses stream failed, falling back to chat/completions:`,
           err instanceof Error ? err.message : err,
@@ -306,8 +329,8 @@ async function chatStream(
       } catch {
         return;
       }
-      const err = (chunk as { error?: { message?: string } }).error;
-      if (err?.message) throw new Error(`chat(stream) upstream error: ${err.message}`);
+      const err = (chunk as { error?: unknown }).error;
+      if (err) throw providerStreamError("chat(stream)", chunk);
       const delta = absorbChatStreamChunk(state, chunk);
       if (delta.reasoning) callbacks.onReasoningDelta?.(delta.reasoning);
       if (delta.content) callbacks.onDelta?.(delta.content);

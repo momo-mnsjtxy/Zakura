@@ -59,6 +59,12 @@ export function getAgentProviders(agent: Agent | { configJson: string }): AgentP
 /** 是否为内部平台配置助手（仅该 Agent 可见连接管理类 tools） */
 export function isPlatformAssistant(agent: Agent | { configJson: string }): boolean {
   const cfg = parseAgentConfig(agent);
+  return isPlatformAssistantConfig(cfg);
+}
+
+export function isPlatformAssistantConfig(config: unknown): boolean {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return false;
+  const cfg = config as AgentConfigBag;
   if (cfg.platformAssistant === true) return true;
   const cloud = cfg.cloud;
   if (cloud && typeof cloud === "object" && !Array.isArray(cloud) && cloud.platformAssistant === true) {

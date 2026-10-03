@@ -53,6 +53,8 @@ export function registerSkillRoutes(
   const { skills, agentService } = deps;
   const isPlatformAdmin = (session: NonNullable<SessionVars["session"]>) =>
     canManagePlatformToken(session, deps.multiTenant ?? false);
+  const canManageTenantToken = (session: NonNullable<SessionVars["session"]>) =>
+    session.isPlatformAdmin === true || session.role === "owner" || session.role === "admin";
 
   /** 商店元信息 + 内置技能目录 */
   app.get("/api/skills/stores", (c) =>
@@ -187,6 +189,9 @@ export function registerSkillRoutes(
   /** 列出可见令牌：租户自备的，加上（管理员可见的）平台默认 */
   app.get("/api/skills/tokens", async (c) => {
     const session = c.get("session")!;
+    if (!canManageTenantToken(session)) {
+      return c.json({ error: "配置租户令牌需要管理员权限" }, 403);
+    }
     const isAdmin = isPlatformAdmin(session);
     try {
       const tokens = await skills.tokenStore.list(session.tenantId, isAdmin);
@@ -206,6 +211,9 @@ export function registerSkillRoutes(
       scope?: SkillTokenScope;
     };
     const scope: SkillTokenScope = body.scope === "platform" ? "platform" : "tenant";
+    if (scope === "tenant" && !canManageTenantToken(session)) {
+      return c.json({ error: "配置租户令牌需要管理员权限" }, 403);
+    }
     if (scope === "platform" && !isPlatformAdmin(session)) {
       return c.json({ error: "配置平台令牌需要平台管理员权限" }, 403);
     }
@@ -229,6 +237,9 @@ export function registerSkillRoutes(
     const session = c.get("session")!;
     const provider = c.req.param("provider") === "gitlab" ? "gitlab" : "github";
     const scope: SkillTokenScope = c.req.query("scope") === "platform" ? "platform" : "tenant";
+    if (scope === "tenant" && !canManageTenantToken(session)) {
+      return c.json({ error: "配置租户令牌需要管理员权限" }, 403);
+    }
     if (scope === "platform" && !isPlatformAdmin(session)) {
       return c.json({ error: "配置平台令牌需要平台管理员权限" }, 403);
     }

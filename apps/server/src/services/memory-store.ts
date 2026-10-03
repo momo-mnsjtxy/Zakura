@@ -9,7 +9,6 @@ import {
 } from "../db/schema.js";
 import { toVectorLiteral } from "../db/vector.js";
 import {
-  MEMORY_LAYERS,
   clampImportance,
   fusedScore,
   graphNeighborScore,
@@ -628,17 +627,6 @@ export class MemoryStore {
     if (!a || !b) throw new Error("Memory not found");
 
     const normalizedRelation = relation.trim() || "related";
-    const existing = await this.db.query.memoryEdges.findFirst({
-      where: and(
-        eq(memoryEdges.tenantId, tenantId),
-        eq(memoryEdges.agentId, agentId),
-        eq(memoryEdges.fromMemoryId, fromId),
-        eq(memoryEdges.toMemoryId, toId),
-        eq(memoryEdges.relation, normalizedRelation),
-      ),
-    });
-    if (existing) return serializeEdge(existing);
-
     const [row] = await this.db
       .insert(memoryEdges)
       .values({
@@ -651,8 +639,29 @@ export class MemoryStore {
         weight: "1",
         createdAt: new Date(),
       })
+      .onConflictDoNothing({
+        target: [
+          memoryEdges.tenantId,
+          memoryEdges.agentId,
+          memoryEdges.fromMemoryId,
+          memoryEdges.toMemoryId,
+          memoryEdges.relation,
+        ],
+      })
       .returning();
-    return serializeEdge(row);
+    if (row) return serializeEdge(row);
+
+    const existing = await this.db.query.memoryEdges.findFirst({
+      where: and(
+        eq(memoryEdges.tenantId, tenantId),
+        eq(memoryEdges.agentId, agentId),
+        eq(memoryEdges.fromMemoryId, fromId),
+        eq(memoryEdges.toMemoryId, toId),
+        eq(memoryEdges.relation, normalizedRelation),
+      ),
+    });
+    if (!existing) throw new Error("Memory link conflict could not be reconciled");
+    return serializeEdge(existing);
   }
 
   async unlink(tenantId: string, agentId: string, edgeId: string) {

@@ -41,6 +41,8 @@ import {
 } from "@zakura/core";
 import { recordUserUsage } from "../user-usage.js";
 import type { AgentWithSpace } from "../agent-view.js";
+import { isPlatformAssistant } from "../agent-providers.js";
+import { isTenantSuspended } from "../account-status.js";
 import { newId } from "../../db/schema.js";
 import { SUBAGENT_TOOL_QUALIFIED, type McpGateway } from "../mcp-gateway.js";
 import {
@@ -234,6 +236,18 @@ export class CloudAgentRuntime {
     };
   }
 
+  private async assertTenantCanRun(tenantId: string): Promise<void> {
+    if (!this.deps.db) return;
+    if (!(await isTenantSuspended(this.deps.db, tenantId))) return;
+    const error = new Error("所在团队已被封禁，无法启动 Agent 运行") as Error & {
+      status?: number;
+      code?: string;
+    };
+    error.status = 403;
+    error.code = "account_suspended";
+    throw error;
+  }
+
   private async withCompactLock<T>(sessionId: string, fn: () => Promise<T>): Promise<T> {
     const prev = this.compactLocks.get(sessionId) ?? Promise.resolve();
     let release!: () => void;
@@ -316,10 +330,18 @@ export class CloudAgentRuntime {
     project?: string | null;
     eventSummary?: string;
   }): Promise<{ sessionId: string; runId: string }> {
+    await this.assertTenantCanRun(input.tenantId);
     const prompt = input.prompt.trim();
     if (!prompt) throw new Error("automation prompt is empty");
     const agent = await this.deps.agentService.get(input.tenantId, input.agentId);
     if (!agent) throw new Error("AgentWithSpace 不存在");
+    if (isPlatformAssistant(agent)) {
+      const error = new Error(
+        "Platform assistant automation requires an interactive platform admin",
+      ) as Error & { status?: number };
+      error.status = 403;
+      throw error;
+    }
 
     const session = await this.store.createSession({
       tenantId: input.tenantId,
@@ -395,7 +417,9 @@ export class CloudAgentRuntime {
     options?: CloudAgentRunOptions;
     userId?: string | null;
     userName?: string | null;
+    platformAdminAuthorized?: boolean;
   }): Promise<{ runId: string }> {
+    await this.assertTenantCanRun(input.tenantId);
     // A slow preparation may outlive cancellation and a later inbound binding.
     // Keep this turn's reply target, rather than looking up the next turn's handle.
     const remoteHandle = this.deps.remoteChannels?.get(input.sessionId);
@@ -414,6 +438,13 @@ export class CloudAgentRuntime {
 
     const agent = await this.deps.agentService.get(input.tenantId, input.agentId);
     if (!agent) throw new Error("AgentWithSpace 不存在");
+    if (isPlatformAssistant(agent) && input.platformAdminAuthorized !== true) {
+      const error = new Error("Platform assistant runs require platform admin authorization") as Error & {
+        status?: number;
+      };
+      error.status = 403;
+      throw error;
+    }
 
     let content = input.content?.trim() ?? "";
     let parentRunId = input.parentRunId;
@@ -523,6 +554,7 @@ export class CloudAgentRuntime {
         targetMessageId,
         isFirstTurn,
         remoteHandle,
+        platformAdminAuthorized: input.platformAdminAuthorized === true,
         ...(input.options ? { options: input.options } : {}),
       }),
     ).catch(async (err) => {
@@ -582,6 +614,7 @@ export class CloudAgentRuntime {
     mode?: CloudAgentFollowUpMode;
     userId?: string | null;
     userName?: string | null;
+    platformAdminAuthorized?: boolean;
   }): Promise<{ messageId: string; mode: CloudAgentFollowUpMode }> {
     const content = input.content?.trim() ?? "";
     const attachments = parseAttachments(input.attachments);
@@ -593,6 +626,15 @@ export class CloudAgentRuntime {
       input.sessionId,
     );
     if (!session) throw new Error("会话不存在");
+    const agent = await this.deps.agentService.get(input.tenantId, input.agentId);
+    if (!agent) throw new Error("AgentWithSpace 不存在");
+    if (isPlatformAssistant(agent) && input.platformAdminAuthorized !== true) {
+      const error = new Error("Platform assistant runs require platform admin authorization") as Error & {
+        status?: number;
+      };
+      error.status = 403;
+      throw error;
+    }
     // 没有活跃 Run 时无处注入，一律按 queue 排队（随后立即出队开新回合）
     const mode: CloudAgentFollowUpMode =
       session.activeRunId && input.mode !== "queue" ? "steer" : "queue";
@@ -652,6 +694,7 @@ export class CloudAgentRuntime {
             content: taken.content,
             ...(taken.attachments?.length ? { attachments: taken.attachments } : {}),
             ...(taken.userId ? { userId: taken.userId, userName: taken.userName } : {}),
+            platformAdminAuthorized: true,
           });
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
@@ -691,10 +734,26 @@ export class CloudAgentRuntime {
     if (!session) throw new Error("会话不存在");
     const hit = await this.store.claimQueuedForImmediate(input.sessionId, input.messageId);
     if (!hit) return { ok: false };
-    if (session.activeRunId) {
-      await this.store.requestCancel(input.sessionId, session.activeRunId);
-      if (this.deps.askUser) {
-        void this.deps.askUser.cancelRun(session.activeRunId);
+    // The run observed before the queue claim may finish while the atomic
+    // reservation is being written. Re-read before deciding whether a later
+    // run will drain queue-next, otherwise the reserved message is stranded.
+    const latest = await this.store.getSession(
+      input.tenantId,
+      input.agentId,
+      input.sessionId,
+    );
+    const activeRunId = latest?.activeRunId ?? null;
+    if (activeRunId) {
+      const cancelled = await this.store.requestCancel(input.sessionId, activeRunId);
+      if (cancelled && this.deps.askUser) {
+        void this.deps.askUser.cancelRun(activeRunId);
+      }
+      if (!cancelled) {
+        void this.startNextQueued({
+          tenantId: input.tenantId,
+          agentId: input.agentId,
+          sessionId: input.sessionId,
+        });
       }
     } else {
       void this.startNextQueued({
@@ -1442,6 +1501,7 @@ export class CloudAgentRuntime {
     isFirstTurn: boolean;
     options?: CloudAgentRunOptions;
     remoteHandle?: RemoteChannelSessionHandle;
+    platformAdminAuthorized?: boolean;
   }): Promise<void> {
     const { tenantId, agent, sessionId, runId } = input;
     await this.store.markRunStarted(runId);
@@ -1938,6 +1998,7 @@ export class CloudAgentRuntime {
       ...(defaultWorkingDir ? { defaultWorkingDir } : {}),
       ...(sessionPreferences?.project ? { projectSlug: sessionPreferences.project } : {}),
       ...(input.options ? { options: input.options } : {}),
+      platformAdminAuthorized: input.platformAdminAuthorized === true,
       ...(cloud.maxToolRounds != null ? { maxRounds: cloud.maxToolRounds } : {}),
       hooks: {
         ...(autoCompactOn

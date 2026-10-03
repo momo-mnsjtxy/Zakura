@@ -38,6 +38,7 @@ import {
 import {
   createUserSession,
   extractBearer,
+  invalidateApiKeyAuthHashes,
   isSessionAdmin,
   loginUser,
   LoginBlockedError,
@@ -1824,6 +1825,7 @@ export async function createApiApp(deps: {
       let result = await agentService.create(session.tenantId, {
         ...parsed.data,
         memoryProviderId: parsed.data.memoryProviderId ?? null,
+        platformAdminAuthorized: session.isPlatformAdmin === true,
       });
       // 无鉴权官方 MCP（如 Grep）：安装到租户并绑定到新 Agent
       try {
@@ -1855,9 +1857,13 @@ export async function createApiApp(deps: {
         201,
       );
     } catch (err) {
+      const status =
+        err && typeof err === "object" && "status" in err
+          ? Number((err as { status: number }).status) || 400
+          : 400;
       return c.json(
         { error: friendlyError(err, "创建 Agent 失败，请检查名称或所属空间后重试") },
-        400,
+        status as 400,
       );
     }
   });
@@ -1875,6 +1881,7 @@ export async function createApiApp(deps: {
     try {
       let result = await agentService.duplicate(session.tenantId, c.req.param("id"), {
         name: parsed.data.name,
+        platformAdminAuthorized: session.isPlatformAdmin === true,
       });
       try {
         const agent = await agentService.ensureDefaultMcpBindings(
@@ -1905,7 +1912,11 @@ export async function createApiApp(deps: {
         201,
       );
     } catch (err) {
-      return c.json({ error: friendlyError(err, "复制 Agent 失败，请重试") }, 400);
+      const status =
+        err && typeof err === "object" && "status" in err
+          ? Number((err as { status: number }).status) || 400
+          : 400;
+      return c.json({ error: friendlyError(err, "复制 Agent 失败，请重试") }, status as 400);
     }
   });
 
@@ -2200,6 +2211,7 @@ export async function createApiApp(deps: {
       const agent = await agentService.update(session.tenantId, c.req.param("id"), {
         ...body,
         userId: session.userId,
+        platformAdminAuthorized: session.isPlatformAdmin === true,
       });
       return c.json(agentService.serialize(agent));
     } catch (err) {
@@ -2544,6 +2556,7 @@ export async function createApiApp(deps: {
         remoteIngress!,
         cloudStore,
       );
+      tenantService.registerLifecycleHook(remoteRuntime.lifecycleHook());
       const cloudRuntime = new CloudAgentRuntime({
         store: cloudStore,
         gateway,
@@ -2924,7 +2937,7 @@ export async function createApiApp(deps: {
   });
 
   registerIdentityRoutes(app as never, { db, config, audit: securityAudit });
-  registerScimRoutes(app as never, { db, audit: securityAudit });
+  registerScimRoutes(app as never, { db, audit: securityAudit, tenantLifecycle: tenantService });
   registerTenantRoutes(app, {
     db,
     config,
@@ -3262,6 +3275,7 @@ export async function createApiApp(deps: {
     });
     if (!row) return c.json({ error: "API Key not found" }, 404);
     await db.delete(apiKeys).where(eq(apiKeys.id, row.id));
+    await invalidateApiKeyAuthHashes([row.keyHash]);
     return c.json({ ok: true });
   });
 

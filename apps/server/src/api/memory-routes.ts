@@ -8,6 +8,7 @@ import type { Hono } from "hono";
 import { MEMORY_LAYERS, type MemoryStore } from "../services/memory-store.js";
 import {
   isMemoryProviderKind,
+  redactMemoryProviderConfig,
   type MemoryProvidersService,
 } from "../services/memory-providers.js";
 import { resolveAgentMemory } from "../services/memory-runtime.js";
@@ -30,6 +31,10 @@ export type MemoryRouteDeps = {
   /** 可选：嵌入向量生成（检索 / 重嵌入）。缺省时相关能力按无嵌入降级。 */
   modelRouter?: import("../services/model-router.js").ModelRouterService;
 };
+
+function canManageMemoryProviders(session: NonNullable<SessionVars["session"]>): boolean {
+  return session.isPlatformAdmin === true || session.role === "owner" || session.role === "admin";
+}
 
 export function registerMemoryRoutes(
   app: Hono<{ Variables: SessionVars }>,
@@ -55,6 +60,7 @@ export function registerMemoryRoutes(
 
   app.post("/api/memory-providers", async (c) => {
     const session = c.get("session")!;
+    if (!canManageMemoryProviders(session)) return c.json({ error: "Admin only" }, 403);
     const body = await c.req.json<{
       name?: string;
       kind?: string;
@@ -89,6 +95,7 @@ export function registerMemoryRoutes(
 
   app.patch("/api/memory-providers/:id", async (c) => {
     const session = c.get("session")!;
+    if (!canManageMemoryProviders(session)) return c.json({ error: "Admin only" }, 403);
     const body = await c.req.json<{
       name?: string;
       config?: Record<string, unknown>;
@@ -104,6 +111,7 @@ export function registerMemoryRoutes(
 
   app.delete("/api/memory-providers/:id", async (c) => {
     const session = c.get("session")!;
+    if (!canManageMemoryProviders(session)) return c.json({ error: "Admin only" }, 403);
     try {
       await memoryProviders.remove(session.tenantId, c.req.param("id"));
       return c.json({ ok: true });
@@ -114,6 +122,7 @@ export function registerMemoryRoutes(
 
   app.post("/api/memory-providers/:id/health", async (c) => {
     const session = c.get("session")!;
+    if (!canManageMemoryProviders(session)) return c.json({ error: "Admin only" }, 403);
     try {
       const health = await memoryProviders.healthCheck(session.tenantId, c.req.param("id"));
       return c.json(health);
@@ -156,7 +165,7 @@ export function registerMemoryRoutes(
             id: resolved.provider.id,
             name: resolved.provider.name,
             kind: resolved.kind,
-            config: resolved.config,
+            config: redactMemoryProviderConfig(resolved.config),
             storesLocally: resolved.storesLocally,
           }
         : null,

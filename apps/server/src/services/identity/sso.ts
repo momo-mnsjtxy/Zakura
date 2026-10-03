@@ -17,6 +17,12 @@ import { findVerifiedDomainPolicy, maybeAutoJoinTenant } from "./domains.js";
 import { verifyRs256Jwt } from "./jwt.js";
 import { newSecretToken } from "./util.js";
 
+// drizzle's PGlite/Postgres transaction callback types do not distribute over
+// the Db union, although both executors expose the same schema/query contract.
+function transactionDb(value: unknown): Db {
+  return value as Db;
+}
+
 export type SsoPublicConfig = {
   enabled: boolean;
   protocol: "oidc" | "saml";
@@ -402,7 +408,7 @@ async function provisionSsoUser(
 ) {
   if (input.tenant.suspendedAt) throw new Error("所在团队已被封禁");
   const result = await db.transaction(async (tx) => {
-    const database = tx as Db;
+    const database = transactionDb(tx);
     const now = new Date();
     const identity = await database.query.oauthIdentities.findFirst({
       where: and(
@@ -416,6 +422,28 @@ async function provisionSsoUser(
     let user = identity
       ? await database.query.users.findFirst({ where: eq(users.id, identity.userId) })
       : await database.query.users.findFirst({ where: eq(users.email, input.email) });
+    const existingMembership = user
+      ? await database.query.tenantMemberships.findFirst({
+          where: and(
+            eq(tenantMemberships.tenantId, input.tenant.id),
+            eq(tenantMemberships.userId, user.id),
+          ),
+        })
+      : null;
+    const domainPolicy = await findVerifiedDomainPolicy(database, input.email);
+    const tenantOwnsDomain = domainPolicy?.tenantId === input.tenant.id;
+
+    // A configurable tenant IdP must not be able to claim an existing global
+    // account merely by asserting its email. The subject must already be linked,
+    // the account must already be a member, or the tenant must control the verified
+    // email domain. Existing accounts additionally need a previously verified email.
+    if (!identity) {
+      const explicitlyLinked = Boolean(existingMembership);
+      const verifiedDomainLink = tenantOwnsDomain && (!user || Boolean(user.emailVerifiedAt));
+      if (!explicitlyLinked && !verifiedDomainLink) {
+        throw new Error("SSO 邮箱未与该团队建立可信关联");
+      }
+    }
     if (!user) {
       if (!input.sso.jitEnabled) throw new Error("账号不存在，且未开启自动开通");
       [user] = await database
@@ -456,12 +484,7 @@ async function provisionSsoUser(
       });
     }
 
-    let membership = await database.query.tenantMemberships.findFirst({
-      where: and(
-        eq(tenantMemberships.tenantId, input.tenant.id),
-        eq(tenantMemberships.userId, user.id),
-      ),
-    });
+    let membership = existingMembership;
     if (!membership) {
       if (!input.sso.jitEnabled) throw new Error("成员不存在，且未开启自动开通");
       [membership] = await database

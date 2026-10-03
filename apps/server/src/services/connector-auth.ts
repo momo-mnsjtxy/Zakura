@@ -34,6 +34,7 @@ export const PLATFORM_SCOPE = "platform";
 
 /** 已保存值的占位符：前端回填时表示「保持原值」 */
 const KEEP_VALUE = "***";
+const MAX_OPTIMISTIC_ATTEMPTS = 12;
 
 /** 目录声明的档案（由 IntegrationCatalogService 汇总后传入） */
 export interface DeclaredAuthProfile {
@@ -225,21 +226,29 @@ export class ConnectorAuthService {
     values: Record<string, unknown>,
   ): Promise<void> {
     await this.mutations.run(`profile:${scopeKey}:${profileKey}`, async () => {
-      const row = await this.db.query.connectorAuthProfiles.findFirst({
-        where: and(
-          eq(connectorAuthProfiles.scopeKey, scopeKey),
-          eq(connectorAuthProfiles.profileKey, profileKey),
-        ),
-      });
-      if (!row) throw new Error("凭据档案不存在");
-      const current = decryptForMutation(this.appConfig.secret, row.configEnc);
-      await this.db
-        .update(connectorAuthProfiles)
-        .set({
-          configEnc: encryptJson(this.appConfig.secret, { ...current, ...values }),
-          updatedAt: new Date(),
-        })
-        .where(eq(connectorAuthProfiles.id, row.id));
+      for (let attempt = 0; attempt < MAX_OPTIMISTIC_ATTEMPTS; attempt++) {
+        const row = await this.db.query.connectorAuthProfiles.findFirst({
+          where: and(
+            eq(connectorAuthProfiles.scopeKey, scopeKey),
+            eq(connectorAuthProfiles.profileKey, profileKey),
+          ),
+        });
+        if (!row) throw new Error("凭据档案不存在");
+        const current = decryptForMutation(this.appConfig.secret, row.configEnc);
+        const nextEnc = encryptJson(this.appConfig.secret, { ...current, ...values });
+        const updated = await this.db
+          .update(connectorAuthProfiles)
+          .set({ configEnc: nextEnc, updatedAt: new Date() })
+          .where(
+            and(
+              eq(connectorAuthProfiles.id, row.id),
+              eq(connectorAuthProfiles.configEnc, row.configEnc),
+            ),
+          )
+          .returning({ id: connectorAuthProfiles.id });
+        if (updated.length) return;
+      }
+      throw new Error("凭据档案并发更新过多，请重试");
     });
   }
 
@@ -277,84 +286,85 @@ export class ConnectorAuthService {
     }
 
     return this.mutations.run(`profile:${scopeKey}:${key}`, async () => {
-    const existing = await this.db.query.connectorAuthProfiles.findFirst({
-      where: and(
-        eq(connectorAuthProfiles.scopeKey, scopeKey),
-        eq(connectorAuthProfiles.profileKey, key),
-      ),
-    });
-
-    // 整站已预配并启用时，团队不可自配同名档案
-    if (scopeKey !== PLATFORM_SCOPE) {
-      const platformRow = await this.db.query.connectorAuthProfiles.findFirst({
-        where: and(
-          eq(connectorAuthProfiles.scopeKey, PLATFORM_SCOPE),
-          eq(connectorAuthProfiles.profileKey, key),
-          eq(connectorAuthProfiles.enabled, true),
-        ),
-      });
-      if (platformRow) {
-        throw new Error("管理员已预配该凭据档案（整站生效），团队不可自行配置");
+      // 整站已预配并启用时，团队不可自配同名档案
+      if (scopeKey !== PLATFORM_SCOPE) {
+        const platformRow = await this.db.query.connectorAuthProfiles.findFirst({
+          where: and(
+            eq(connectorAuthProfiles.scopeKey, PLATFORM_SCOPE),
+            eq(connectorAuthProfiles.profileKey, key),
+            eq(connectorAuthProfiles.enabled, true),
+          ),
+        });
+        if (platformRow) {
+          throw new Error("管理员已预配该凭据档案（整站生效），团队不可自行配置");
+        }
       }
-    }
 
-    const kind =
-      declared?.kind ??
-      input.kind ??
-      (existing?.kind as ConnectorAuthKind | undefined) ??
-      "custom";
-    const fields = declared?.fields.length
-      ? declared.fields
-      : defaultFieldsForKind(kind);
-
-    const current = existing ? decryptForMutation(this.appConfig.secret, existing.configEnc) : {};
-    for (const [field, value] of Object.entries(input.values ?? {})) {
-      // custom 档案允许管理员自定义键；有声明的档案严格按 schema 校验
-      if (fields.length && !fields.some((item) => item.key === field)) {
-        if (kind !== "custom") throw new Error(`未知凭据字段: ${field}`);
-      }
-      if (kind === "custom" && !/^[a-zA-Z0-9_.-]{1,64}$/.test(field)) {
-        throw new Error(`凭据字段名不合法: ${field}`);
-      }
-      if (value === KEEP_VALUE || value === undefined) continue;
-      if (typeof value !== "string") {
-        const label = fields.find((item) => item.key === field)?.label ?? field;
-        throw new Error(`${label} 必须是文本`);
-      }
-      if (value === "") delete current[field];
-      else current[field] = value;
-    }
-
-    const enabled = input.enabled ?? existing?.enabled ?? false;
-    if (enabled) {
-      const missing = missingRequiredFields(fields, current);
-      if (missing.length) throw new Error(`缺少必填凭据: ${missing.join("、")}`);
-    }
-
-    const now = new Date();
-    await this.db
-      .insert(connectorAuthProfiles)
-      .values({
-        id: existing?.id ?? newId(),
-        scopeKey,
-        profileKey: key,
-        label: input.label?.trim() || declared?.label || existing?.label || key,
-        kind,
-        enabled,
-        configEnc: encryptJson(this.appConfig.secret, current),
-        createdAt: existing?.createdAt ?? now,
-        updatedAt: now,
-      })
-      .onConflictDoUpdate({
-        target: [connectorAuthProfiles.scopeKey, connectorAuthProfiles.profileKey],
-        set: {
+      for (let attempt = 0; attempt < MAX_OPTIMISTIC_ATTEMPTS; attempt++) {
+        const existing = await this.db.query.connectorAuthProfiles.findFirst({
+          where: and(
+            eq(connectorAuthProfiles.scopeKey, scopeKey),
+            eq(connectorAuthProfiles.profileKey, key),
+          ),
+        });
+        const kind = declared?.kind ?? input.kind ??
+          (existing?.kind as ConnectorAuthKind | undefined) ?? "custom";
+        const fields = declared?.fields.length ? declared.fields : defaultFieldsForKind(kind);
+        const current = existing
+          ? decryptForMutation(this.appConfig.secret, existing.configEnc)
+          : {};
+        for (const [field, value] of Object.entries(input.values ?? {})) {
+          if (fields.length && !fields.some((item) => item.key === field) && kind !== "custom") {
+            throw new Error(`未知凭据字段: ${field}`);
+          }
+          if (kind === "custom" && !/^[a-zA-Z0-9_.-]{1,64}$/.test(field)) {
+            throw new Error(`凭据字段名不合法: ${field}`);
+          }
+          if (value === KEEP_VALUE || value === undefined) continue;
+          if (typeof value !== "string") {
+            const label = fields.find((item) => item.key === field)?.label ?? field;
+            throw new Error(`${label} 必须是文本`);
+          }
+          if (value === "") delete current[field];
+          else current[field] = value;
+        }
+        const enabled = input.enabled ?? existing?.enabled ?? false;
+        if (enabled) {
+          const missing = missingRequiredFields(fields, current);
+          if (missing.length) throw new Error(`缺少必填凭据: ${missing.join("、")}`);
+        }
+        const now = new Date();
+        const values = {
           label: input.label?.trim() || declared?.label || existing?.label || key,
           kind,
           enabled,
           configEnc: encryptJson(this.appConfig.secret, current),
           updatedAt: now,
-        },
-      });
+        };
+        if (!existing) {
+          const inserted = await this.db
+            .insert(connectorAuthProfiles)
+            .values({ id: newId(), scopeKey, profileKey: key, ...values, createdAt: now })
+            .onConflictDoNothing({
+              target: [connectorAuthProfiles.scopeKey, connectorAuthProfiles.profileKey],
+            })
+            .returning({ id: connectorAuthProfiles.id });
+          if (inserted.length) return;
+          continue;
+        }
+        const updated = await this.db
+          .update(connectorAuthProfiles)
+          .set(values)
+          .where(
+            and(
+              eq(connectorAuthProfiles.id, existing.id),
+              eq(connectorAuthProfiles.configEnc, existing.configEnc),
+            ),
+          )
+          .returning({ id: connectorAuthProfiles.id });
+        if (updated.length) return;
+      }
+      throw new Error("凭据档案并发更新过多，请重试");
     });
   }
 
@@ -428,31 +438,38 @@ export class ConnectorAuthService {
   ): Promise<void> {
     if (!values.accessToken.trim()) throw new Error("accessToken 不能为空");
     await this.mutations.run(`settings:${scopeKey}:${connectorRef}`, async () => {
-    const existing = await this.db.query.connectorSettings.findFirst({
-      where: and(
-        eq(connectorSettings.scopeKey, scopeKey),
-        eq(connectorSettings.connectorRef, connectorRef),
-      ),
-    });
-    const current = existing ? decryptForMutation(this.appConfig.secret, existing.configEnc) : {};
-    current.oauthAccessToken = values.accessToken;
-    if (values.refreshToken) current.oauthRefreshToken = values.refreshToken;
-    if (values.expiresAt !== undefined) current.oauthExpiresAt = values.expiresAt;
-    const now = new Date();
-    await this.db
-      .insert(connectorSettings)
-      .values({
-        id: existing?.id ?? newId(),
-        scopeKey,
-        connectorRef,
-        configEnc: encryptJson(this.appConfig.secret, current),
-        createdAt: existing?.createdAt ?? now,
-        updatedAt: now,
-      })
-      .onConflictDoUpdate({
-        target: [connectorSettings.scopeKey, connectorSettings.connectorRef],
-        set: { configEnc: encryptJson(this.appConfig.secret, current), updatedAt: now },
-      });
+      for (let attempt = 0; attempt < MAX_OPTIMISTIC_ATTEMPTS; attempt++) {
+        const existing = await this.db.query.connectorSettings.findFirst({
+          where: and(
+            eq(connectorSettings.scopeKey, scopeKey),
+            eq(connectorSettings.connectorRef, connectorRef),
+          ),
+        });
+        const current = existing
+          ? decryptForMutation(this.appConfig.secret, existing.configEnc)
+          : {};
+        current.oauthAccessToken = values.accessToken;
+        if (values.refreshToken) current.oauthRefreshToken = values.refreshToken;
+        if (values.expiresAt !== undefined) current.oauthExpiresAt = values.expiresAt;
+        const now = new Date();
+        const nextEnc = encryptJson(this.appConfig.secret, current);
+        if (!existing) {
+          const inserted = await this.db
+            .insert(connectorSettings)
+            .values({ id: newId(), scopeKey, connectorRef, configEnc: nextEnc, createdAt: now, updatedAt: now })
+            .onConflictDoNothing({ target: [connectorSettings.scopeKey, connectorSettings.connectorRef] })
+            .returning({ id: connectorSettings.id });
+          if (inserted.length) return;
+          continue;
+        }
+        const updated = await this.db
+          .update(connectorSettings)
+          .set({ configEnc: nextEnc, updatedAt: now })
+          .where(and(eq(connectorSettings.id, existing.id), eq(connectorSettings.configEnc, existing.configEnc)))
+          .returning({ id: connectorSettings.id });
+        if (updated.length) return;
+      }
+      throw new Error("连接器授权并发更新过多，请重试");
     });
   }
 
@@ -463,40 +480,56 @@ export class ConnectorAuthService {
     fields: ConnectorField[],
   ): Promise<Record<string, unknown>> {
     return this.mutations.run(`settings:${scopeKey}:${connectorRef}`, async () => {
-    const existing = await this.db.query.connectorSettings.findFirst({
-      where: and(
-        eq(connectorSettings.scopeKey, scopeKey),
-        eq(connectorSettings.connectorRef, connectorRef),
-      ),
-    });
-    const current = existing ? decryptForMutation(this.appConfig.secret, existing.configEnc) : {};
-    for (const [key, value] of Object.entries(values)) {
-      const field = fields.find((item) => item.key === key);
-      if (!field) throw new Error(`未知设置字段: ${key}`);
-      if (value === KEEP_VALUE || value === undefined) continue;
-      if (typeof value !== "string") throw new Error(`${field.label} 必须是文本`);
-      if (value === "") delete current[key];
-      else current[key] = value;
-    }
-    const missing = missingRequiredFields(fields, current);
-    if (missing.length) throw new Error(`缺少必填设置: ${missing.join("、")}`);
+      for (let attempt = 0; attempt < MAX_OPTIMISTIC_ATTEMPTS; attempt++) {
+        const existing = await this.db.query.connectorSettings.findFirst({
+          where: and(
+            eq(connectorSettings.scopeKey, scopeKey),
+            eq(connectorSettings.connectorRef, connectorRef),
+          ),
+        });
+        const current = existing
+          ? decryptForMutation(this.appConfig.secret, existing.configEnc)
+          : {};
+        for (const [key, value] of Object.entries(values)) {
+          const field = fields.find((item) => item.key === key);
+          if (!field) throw new Error(`未知设置字段: ${key}`);
+          if (value === KEEP_VALUE || value === undefined) continue;
+          if (typeof value !== "string") throw new Error(`${field.label} 必须是文本`);
+          if (value === "") delete current[key];
+          else current[key] = value;
+        }
+        const missing = missingRequiredFields(fields, current);
+        if (missing.length) throw new Error(`缺少必填设置: ${missing.join("、")}`);
 
-    const now = new Date();
-    await this.db
-      .insert(connectorSettings)
-      .values({
-        id: existing?.id ?? newId(),
-        scopeKey,
-        connectorRef,
-        configEnc: encryptJson(this.appConfig.secret, current),
-        createdAt: existing?.createdAt ?? now,
-        updatedAt: now,
-      })
-      .onConflictDoUpdate({
-        target: [connectorSettings.scopeKey, connectorSettings.connectorRef],
-        set: { configEnc: encryptJson(this.appConfig.secret, current), updatedAt: now },
-      });
-    return current;
+        const now = new Date();
+        const nextEnc = encryptJson(this.appConfig.secret, current);
+        if (!existing) {
+          const inserted = await this.db
+            .insert(connectorSettings)
+            .values({
+              id: newId(), scopeKey, connectorRef, configEnc: nextEnc,
+              createdAt: now, updatedAt: now,
+            })
+            .onConflictDoNothing({
+              target: [connectorSettings.scopeKey, connectorSettings.connectorRef],
+            })
+            .returning({ id: connectorSettings.id });
+          if (inserted.length) return current;
+          continue;
+        }
+        const updated = await this.db
+          .update(connectorSettings)
+          .set({ configEnc: nextEnc, updatedAt: now })
+          .where(
+            and(
+              eq(connectorSettings.id, existing.id),
+              eq(connectorSettings.configEnc, existing.configEnc),
+            ),
+          )
+          .returning({ id: connectorSettings.id });
+        if (updated.length) return current;
+      }
+      throw new Error("连接器设置并发更新过多，请重试");
     });
   }
 
@@ -613,36 +646,37 @@ export class ConnectorAuthService {
   ): Promise<void> {
     if (!values.accessToken.trim()) throw new Error("accessToken 不能为空");
     await this.mutations.run(`install:${tenantId}:${agentId}:${connectorRef}`, async () => {
-    let row = await this.db.query.agentConnectorInstallations.findFirst({
-      where: and(
-        eq(agentConnectorInstallations.tenantId, tenantId),
-        eq(agentConnectorInstallations.agentId, agentId),
-        eq(agentConnectorInstallations.connectorRef, connectorRef),
-      ),
-    });
-    if (!row) {
       await this.ensureInstallations(tenantId, connectorRef, [agentId]);
-      row = await this.db.query.agentConnectorInstallations.findFirst({
-        where: and(
-          eq(agentConnectorInstallations.tenantId, tenantId),
-          eq(agentConnectorInstallations.agentId, agentId),
-          eq(agentConnectorInstallations.connectorRef, connectorRef),
-        ),
-      });
-      if (!row) throw new Error("安装连接器失败");
-    }
-    const current = decryptForMutation(this.appConfig.secret, row.configEnc);
-    current.oauthAccessToken = values.accessToken;
-    if (values.refreshToken) current.oauthRefreshToken = values.refreshToken;
-    if (values.expiresAt !== undefined) current.oauthExpiresAt = values.expiresAt;
-    await this.db
-      .update(agentConnectorInstallations)
-      .set({
-        enabled: true,
-        configEnc: encryptJson(this.appConfig.secret, current),
-        updatedAt: new Date(),
-      })
-      .where(eq(agentConnectorInstallations.id, row.id));
+      for (let attempt = 0; attempt < MAX_OPTIMISTIC_ATTEMPTS; attempt++) {
+        const row = await this.db.query.agentConnectorInstallations.findFirst({
+          where: and(
+            eq(agentConnectorInstallations.tenantId, tenantId),
+            eq(agentConnectorInstallations.agentId, agentId),
+            eq(agentConnectorInstallations.connectorRef, connectorRef),
+          ),
+        });
+        if (!row) throw new Error("安装连接器失败");
+        const current = decryptForMutation(this.appConfig.secret, row.configEnc);
+        current.oauthAccessToken = values.accessToken;
+        if (values.refreshToken) current.oauthRefreshToken = values.refreshToken;
+        if (values.expiresAt !== undefined) current.oauthExpiresAt = values.expiresAt;
+        const updated = await this.db
+          .update(agentConnectorInstallations)
+          .set({
+            enabled: true,
+            configEnc: encryptJson(this.appConfig.secret, current),
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(agentConnectorInstallations.id, row.id),
+              eq(agentConnectorInstallations.configEnc, row.configEnc),
+            ),
+          )
+          .returning({ id: agentConnectorInstallations.id });
+        if (updated.length) return;
+      }
+      throw new Error("连接器授权并发更新过多，请重试");
     });
   }
 }

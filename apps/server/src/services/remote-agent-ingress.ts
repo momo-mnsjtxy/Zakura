@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import { decryptJson, encryptJson } from "@zakura/core";
 import type { CloudAgentAttachment, CloudAgentSessionOrigin } from "@zakura/shared";
 import { inboundFromSlack, inboundFromTeams, parseCloudAgentConfig } from "@zakura/shared";
@@ -9,6 +9,7 @@ import {
   agentChannelEvents,
   agentChannelThreads,
   newId,
+  tenants,
   type AgentChannelBinding,
 } from "../db/schema.js";
 import type { AgentService } from "./agents.js";
@@ -22,6 +23,18 @@ function readBindingConfig(secret: string, configEnc: string | null | undefined)
     return decryptJson<Record<string, unknown>>(secret, configEnc);
   } catch {
     return {};
+  }
+}
+
+function readBindingConfigForMutation(
+  secret: string,
+  configEnc: string | null | undefined,
+): Record<string, unknown> {
+  if (!configEnc?.trim()) return {};
+  try {
+    return decryptJson<Record<string, unknown>>(secret, configEnc);
+  } catch {
+    throw new Error("远程连接凭据无法解密，已拒绝覆盖");
   }
 }
 
@@ -189,6 +202,16 @@ export class RemoteAgentIngress {
     this.automation = automation;
   }
 
+  /** External channel traffic must stop for deleted or suspended tenants. */
+  async isTenantAvailable(tenantId: string): Promise<boolean> {
+    const rows = await this.db
+      .select({ id: tenants.id })
+      .from(tenants)
+      .where(and(eq(tenants.id, tenantId), isNull(tenants.suspendedAt)))
+      .limit(1);
+    return rows.length > 0;
+  }
+
   async listBindings(tenantId: string, platform?: string) {
     return this.db
       .select()
@@ -231,17 +254,29 @@ export class RemoteAgentIngress {
     bindingId: string,
     patch: Record<string, unknown>,
   ): Promise<void> {
-    const binding = await this.getBinding(tenantId, bindingId);
-    if (!binding) throw new Error("远程连接不存在");
-    const current = this.getBindingCredentials(binding);
-    const next = { ...current.values, ...patch, __credentialsEnabled: current.enabled };
-    await this.db
-      .update(agentChannelBindings)
-      .set({
-        configEnc: encryptJson(this.appConfig.secret, next),
-        updatedAt: new Date(),
-      })
-      .where(eq(agentChannelBindings.id, binding.id));
+    for (let attempt = 0; attempt < 12; attempt++) {
+      const binding = await this.getBinding(tenantId, bindingId);
+      if (!binding) throw new Error("远程连接不存在");
+      const decoded = readBindingConfigForMutation(this.appConfig.secret, binding.configEnc);
+      const { __credentialsEnabled, ...currentValues } = decoded;
+      const next = { ...currentValues, ...patch, __credentialsEnabled };
+      const updated = await this.db
+        .update(agentChannelBindings)
+        .set({
+          configEnc: encryptJson(this.appConfig.secret, next),
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(agentChannelBindings.id, binding.id),
+            eq(agentChannelBindings.tenantId, tenantId),
+            eq(agentChannelBindings.configEnc, binding.configEnc),
+          ),
+        )
+        .returning({ id: agentChannelBindings.id });
+      if (updated.length) return;
+    }
+    throw new Error("远程连接凭据并发更新过多，请重试");
   }
 
   toBindingView(binding: AgentChannelBinding | null): RemoteBindingView | null {
@@ -630,6 +665,9 @@ export class RemoteAgentIngress {
   }
 
   async handleInbound(input: RemoteInboundMessage): Promise<RemoteInboundResult> {
+    if (!(await this.isTenantAvailable(input.tenantId))) {
+      return { accepted: false, reason: "disabled" };
+    }
     const binding = await this.getBinding(input.tenantId, input.bindingId);
     if (!binding || binding.platform !== input.platform || !binding.enabled) {
       return { accepted: false, reason: "disabled" };

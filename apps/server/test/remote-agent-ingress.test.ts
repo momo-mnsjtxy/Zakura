@@ -7,6 +7,7 @@ import {
   agentChannelBindings,
   agentChannelEvents,
   agentChannelThreads,
+  tenants,
 } from "../src/db/schema.js";
 import { platformEvents } from "../src/services/platform-events.js";
 import { closeRedis } from "../src/services/redis.js";
@@ -52,6 +53,7 @@ class FakeDb {
     ],
     [agentChannelThreads, []],
     [agentChannelEvents, []],
+    [tenants, [{ id: "tenant-1", suspendedAt: null }]],
   ]);
 
   select() {

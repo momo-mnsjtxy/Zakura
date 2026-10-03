@@ -33,6 +33,9 @@ export class AdminMembershipService {
   constructor(
     private readonly db: any,
     schema: { tenantMemberships: unknown },
+    private readonly lifecycle?: {
+      notifyMemberAccessRevoked?: (tenantId: string, userId: string) => Promise<void>;
+    },
   ) {
     this.memberships = schema.tenantMemberships;
   }
@@ -92,7 +95,7 @@ export class AdminMembershipService {
     }
     if (!role && !status) throw new SaasAdminError("没有可更新的成员字段", 400);
 
-    return this.db.transaction(async (tx: any) => {
+    const result = await this.db.transaction(async (tx: any) => {
       await this.lockOwners(tx, tenantId);
       const membership = await this.find(tx, tenantId, membershipId);
       if (!membership) throw new SaasAdminError("Not found", 404);
@@ -114,12 +117,22 @@ export class AdminMembershipService {
         )
         .returning();
       if (!updated) throw new SaasAdminError("Not found", 404);
-      return updated;
+      return {
+        updated,
+        revokedUserId:
+          membership.status === "active" && updated.status === "suspended"
+            ? String(membership.userId)
+            : null,
+      };
     });
+    if (result.revokedUserId) {
+      await this.lifecycle?.notifyMemberAccessRevoked?.(tenantId, result.revokedUserId);
+    }
+    return result.updated;
   }
 
   async remove(tenantId: string, membershipId: string): Promise<void> {
-    await this.db.transaction(async (tx: any) => {
+    const removedUserId = await this.db.transaction(async (tx: any) => {
       await this.lockOwners(tx, tenantId);
       const membership = await this.find(tx, tenantId, membershipId);
       if (!membership) throw new SaasAdminError("Not found", 404);
@@ -132,8 +145,10 @@ export class AdminMembershipService {
             eq(this.memberships.tenantId, tenantId),
           ),
         )
-        .returning({ id: this.memberships.id });
+        .returning();
       if (!deleted.length) throw new SaasAdminError("Not found", 404);
+      return String(membership.userId);
     });
+    await this.lifecycle?.notifyMemberAccessRevoked?.(tenantId, removedUserId);
   }
 }

@@ -131,6 +131,24 @@ function makeRoute(slug: string): ResolvedRoute {
 describe("executeWithFallback", () => {
   registerBuiltinModelAdapters();
 
+  it("skips an unsupported first provider and invokes the next route", async () => {
+    const unsupported = makeRoute("unsupported");
+    unsupported.upstream.protocol = "bailian";
+    const calls: string[] = [];
+    const { result, route } = await executeWithFallback(
+      [unsupported, makeRoute("second")],
+      "chat",
+      async (_adapter, candidate) => {
+        calls.push(candidate.routeSlug);
+        return "ok";
+      },
+      { baseDelayMs: 0 },
+    );
+    assert.equal(result, "ok");
+    assert.equal(route.routeSlug, "second");
+    assert.deepEqual(calls, ["second"]);
+  });
+
   it("retries a transient error on the same route before failing over", async () => {
     const calls: string[] = [];
     const { result, route } = await executeWithFallback(
@@ -148,7 +166,7 @@ describe("executeWithFallback", () => {
     assert.deepEqual(calls, ["r1", "r1", "r2"]);
   });
 
-  it("does not retry non-retryable errors on the same route", async () => {
+  it("refreshes auth once for 401 but does not apply transport retries", async () => {
     const calls: string[] = [];
     const { result } = await executeWithFallback(
       [makeRoute("r1"), makeRoute("r2")],
@@ -160,7 +178,7 @@ describe("executeWithFallback", () => {
       },
     );
     assert.equal(result, "ok");
-    assert.deepEqual(calls, ["r1", "r2"]);
+    assert.deepEqual(calls, ["r1", "r1", "r2"]);
   });
 
   it("marks the aggregate error retryable when any failure was transient", async () => {

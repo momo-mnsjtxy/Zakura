@@ -51,6 +51,7 @@ import { BUILTIN_SKILLS, builtinToPackage, getBuiltinSkill } from "./builtin.js"
 import { fetchSkillPackages, hydratePackage, probeRepoEtag } from "./fetch.js";
 import {
   CACHE_FULL_BYTES,
+  REPO_CACHE_TTL_MS,
   REPO_REFRESH_BATCH,
   REPO_REFRESH_INTERVAL_MS,
   SkillRepoCache,
@@ -213,6 +214,11 @@ export class SkillsService {
   private readonly builtinBackfilled = new Map<string, number>();
   /** 正在抓取的仓库，防止同一仓库被并发重复拉 */
   private readonly inflight = new Map<string, Promise<CachedRepo | null>>();
+  /** Private repository content is cached only inside its credential-owning tenant. */
+  private readonly privateRepoCache = new Map<
+    string,
+    { expiresAt: number; value: CachedRepo & { token?: string | undefined } }
+  >();
   /** Concurrent installs of the same package into the same workspace share one commit. */
   private readonly installInflight = new Map<string, Promise<AgentSkillRecord>>();
   /** 正在后台补齐捆绑文件的仓库 */
@@ -223,6 +229,12 @@ export class SkillsService {
   private maintenanceCursor = 0;
   private refreshTimer: ReturnType<typeof setInterval> | null = null;
   private readonly promptSummaryCache = new TtlCache<string>(PROMPT_SUMMARY_TTL_MS);
+
+  private assertAgentTenant(tenantId: string, agent: AgentWithSpace): void {
+    if (!tenantId || agent.tenantId !== tenantId) {
+      throw new SkillSourceError("Agent 不属于当前租户");
+    }
+  }
 
   constructor(deps: SkillsServiceDeps) {
     this.db = deps.db;
@@ -470,9 +482,10 @@ export class SkillsService {
     const repoKey = repoKeyOf(source);
     if (!repoKey) {
       // 直链之类无法按仓库缓存，照旧直抓
-      const token = await this.tokens.platformToken();
+      const provider = source.kind === "gitlab" ? "gitlab" : "github";
+      const token = await this.tokens.platformToken(provider);
       return fetchSkillPackages(source, {
-        githubToken: token,
+        ...(provider === "gitlab" ? { gitlabToken: token } : { githubToken: token }),
         ...(opts.manifestOnly ? { manifestOnly: true } : {}),
       });
     }
@@ -498,7 +511,12 @@ export class SkillsService {
       : await Promise.all(
           wanted.map((pkg) =>
             pkg.assets?.length
-              ? hydratePackage(pkg, { githubToken: cached.token })
+              ? hydratePackage(
+                  pkg,
+                  pkg.source.kind === "gitlab"
+                    ? { gitlabToken: cached.token }
+                    : { githubToken: cached.token },
+                )
               : Promise.resolve(pkg),
           ),
         );
@@ -515,22 +533,30 @@ export class SkillsService {
     source: SkillSource,
     tenantId?: string,
   ): Promise<(CachedRepo & { token?: string | undefined }) | null> {
+    const tenantRepoKey = tenantId ? `${tenantId}:${repoKey}` : null;
+    if (tenantRepoKey) {
+      const privateHit = this.privateRepoCache.get(tenantRepoKey);
+      if (privateHit && privateHit.expiresAt > Date.now()) return privateHit.value;
+      if (privateHit) this.privateRepoCache.delete(tenantRepoKey);
+    }
     const cached = await this.cache.read(repoKey);
     if (cached?.fresh && cached.packages.length) return cached;
 
-    const pending = this.inflight.get(repoKey);
+    // Tenant credential fallback must never join another tenant's in-flight request.
+    const inflightKey = tenantId ? `tenant:${tenantId}:${repoKey}` : `platform:${repoKey}`;
+    const pending = this.inflight.get(inflightKey);
     if (pending) {
       const done = await pending;
       if (done) return done;
     }
 
     const task = this.refreshRepo(repoKey, source, tenantId, cached);
-    this.inflight.set(repoKey, task);
+    this.inflight.set(inflightKey, task);
     try {
       const fresh = await task;
       if (fresh) return fresh;
     } finally {
-      this.inflight.delete(repoKey);
+      if (this.inflight.get(inflightKey) === task) this.inflight.delete(inflightKey);
     }
     // 抓取失败但有旧内容时降级使用，避免一次网络抖动让所有租户装不了
     return cached?.packages.length ? cached : null;
@@ -543,7 +569,8 @@ export class SkillsService {
     cached: CachedRepo | null,
   ): Promise<CachedRepo | null> {
     const scope = cacheScopeSource(source);
-    const platformToken = await this.tokens.platformToken();
+    const provider = source.kind === "gitlab" ? "gitlab" : "github";
+    const platformToken = await this.tokens.platformToken(provider);
 
     // 有旧内容先探一次 ETag：codeload 的 HEAD 不计 GitHub API 配额
     if (cached?.packages.length && cached.row.upstreamEtag) {
@@ -565,12 +592,19 @@ export class SkillsService {
       if (usedTenantToken) {
         // 私有仓库内容不进共享缓存，只回给当前租户
         const hydrated = await this.hydrateAll(packages, token);
-        return {
+        const privateValue = {
           row: cached?.row ?? ({} as CachedRepo["row"]),
           packages: hydrated,
           warnings,
           fresh: true,
         };
+        if (tenantId) {
+          this.privateRepoCache.set(`${tenantId}:${repoKey}`, {
+            expiresAt: Date.now() + REPO_CACHE_TTL_MS,
+            value: privateValue,
+          });
+        }
+        return privateValue;
       }
 
       // 先把清单写进缓存让预览立刻可用，捆绑文件在后台补——
@@ -601,7 +635,9 @@ export class SkillsService {
   ): Promise<SkillPackage[]> {
     return Promise.all(
       packages.map((p) =>
-        p.assets?.length ? hydratePackage(p, { githubToken: token }) : Promise.resolve(p),
+        p.assets?.length
+          ? hydratePackage(p, p.source.kind === "gitlab" ? { gitlabToken: token } : { githubToken: token })
+          : Promise.resolve(p),
       ),
     );
   }
@@ -662,23 +698,22 @@ export class SkillsService {
     usedTenantToken: boolean;
     token: string | undefined;
   }> {
+    const provider = source.kind === "gitlab" ? "gitlab" : "github";
+    const fetchOptions = (token: string | undefined) => ({
+      ...(provider === "gitlab" ? { gitlabToken: token } : { githubToken: token }),
+      manifestOnly: true as const,
+    });
     try {
-      const res = await fetchSkillPackages(source, {
-        githubToken: platformToken,
-        manifestOnly: true,
-      });
-      if (platformToken) void this.tokens.markUsed(PLATFORM_SCOPE, "github");
+      const res = await fetchSkillPackages(source, fetchOptions(platformToken));
+      if (platformToken) void this.tokens.markUsed(PLATFORM_SCOPE, provider);
       return { ...res, usedTenantToken: false, token: platformToken };
     } catch (err) {
       const code = err instanceof SkillSourceError ? err.code : "http";
       if (!tenantId || (code !== "not_found" && code !== "forbidden")) throw err;
-      const tenantToken = await this.tokens.tenantToken(tenantId);
+      const tenantToken = await this.tokens.tenantToken(tenantId, provider);
       if (!tenantToken) throw err;
-      const res = await fetchSkillPackages(source, {
-        githubToken: tenantToken,
-        manifestOnly: true,
-      });
-      void this.tokens.markUsed(tenantId, "github");
+      const res = await fetchSkillPackages(source, fetchOptions(tenantToken));
+      void this.tokens.markUsed(tenantId, provider);
       return { ...res, usedTenantToken: true, token: tenantToken };
     }
   }
@@ -1293,6 +1328,7 @@ export class SkillsService {
     skills: Array<{ name: string; description: string; path: string }>;
     warnings: string[];
   }> {
+    this.assertAgentTenant(agent.tenantId, agent);
     if (!isValidProjectSlug(slug)) throw new SkillSourceError("无效的项目名");
     const fs = await this.fsForAgent(agent);
     const projectRoot = projectRelativePath(slug);
@@ -1577,10 +1613,13 @@ export class SkillsService {
           path: SKILLS_ROOT,
         });
       } catch (err) {
-        console.warn(
-          `[skills] 删除 ${row.path} 失败:`,
-          err instanceof Error ? err.message : err,
-        );
+        const message = err instanceof Error ? err.message : String(err);
+        await this.db
+          .update(agentSkills)
+          .set({ status: "error", error: `uninstall failed: ${message}`.slice(0, 500), updatedAt: new Date() })
+          .where(eq(agentSkills.id, row.id));
+        this.forgetPromptSummary(tenantId, agentId);
+        throw new SkillSourceError(`删除 ${row.path} 失败，安装记录已保留以便重试：${message}`);
       }
     }
     await this.db.delete(agentSkills).where(eq(agentSkills.id, row.id));
@@ -1616,7 +1655,10 @@ export class SkillsService {
       return this.reinstallEverywhere(tenantId, updated);
     }
 
-    const { packages } = await this.loadPackages({ ...source, skills: [row.name] });
+    const { packages } = await this.loadPackages(
+      { ...source, skills: [row.name] },
+      { tenantId },
+    );
     const pkg = packages.find((p) => p.name === row.name) ?? packages[0];
     if (!pkg) throw new SkillSourceError("来源中已找不到该技能");
     const updated = await this.upsertPackage(tenantId, { ...pkg, name: row.name }, false);
@@ -1655,6 +1697,7 @@ export class SkillsService {
     name: string,
     relPath?: string,
   ): Promise<{ path: string; content: string } | null> {
+    this.assertAgentTenant(tenantId, agent);
     const normalized = normalizeSkillName(name);
     const rel = (relPath ?? SKILL_MANIFEST_FILE).replace(/\\/g, "/").replace(/^\/+/, "");
     const relParts = rel.split("/");
@@ -1693,6 +1736,7 @@ export class SkillsService {
     agent: AgentWithSpace,
     dirPath: string,
   ): Promise<SkillRecord> {
+    this.assertAgentTenant(tenantId, agent);
     const fs = await this.fsProvider.forAgentBinding({
       spaceId: agent.spaceId,
       tenantId: agent.tenantId,
@@ -1778,6 +1822,7 @@ export class SkillsService {
 
   /** 工作区里存在但未登记的技能目录（供 UI 提示"发现未注册技能"） */
   async discoverUnregistered(tenantId: string, agent: AgentWithSpace): Promise<string[]> {
+    this.assertAgentTenant(tenantId, agent);
     try {
       const fs: WorkspaceFs = await this.fsProvider.forAgentBinding({
         spaceId: agent.spaceId,

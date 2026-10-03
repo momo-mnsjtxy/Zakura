@@ -11,9 +11,16 @@ import type {
   ModelToolCall,
   ModelToolChoice,
 } from "@zakura/shared";
-import { apiError, buildHeaders, httpJson, httpSse } from "./http.js";
+import {
+  apiError,
+  buildHeaders,
+  httpJson,
+  httpSse,
+  providerStreamError,
+} from "./http.js";
 import {
   absorbChatStreamChunk,
+  assertCompleteToolCalls,
   buildOpenAIChatCompletion,
   createChatStreamState,
   toModelChatResult,
@@ -150,7 +157,18 @@ type ResponsesData = {
 };
 
 function responsesFailure(data: ResponsesData, status = data.status ?? "error"): Error {
-  return new Error(`responses ${status}: ${data.error?.message ?? data.incomplete_details?.reason ?? "upstream returned no text or function calls"}`);
+  if (data.error) {
+    return providerStreamError("responses", {
+      status,
+      error: data.error,
+    });
+  }
+  return new Error(
+    `responses ${status}: ${
+      data.incomplete_details?.reason ??
+      "upstream returned no text or function calls"
+    }`,
+  );
 }
 
 // Extract usable output independently of status: compatible gateways may keep
@@ -163,6 +181,7 @@ export function parseResponsesOutput(data: ResponsesData): {
   const output = Array.isArray(data.output) ? data.output : [];
   const textParts: string[] = [];
   const toolCalls: ModelToolCall[] = [];
+  let observedToolCalls = 0;
 
   for (const item of output) {
     if (!item || typeof item !== "object") continue;
@@ -185,6 +204,7 @@ export function parseResponsesOutput(data: ResponsesData): {
       continue;
     }
     if (type === "function_call") {
+      observedToolCalls += 1;
       const name = typeof item.name === "string" ? item.name : "";
       if (!name) continue;
       const callId =
@@ -205,12 +225,20 @@ export function parseResponsesOutput(data: ResponsesData): {
   }
 
   const content = textParts.length ? textParts.join("") : null;
+  const incompleteReason = data.incomplete_details?.reason;
+  const finishReason =
+    incompleteReason === "max_output_tokens"
+      ? "length"
+      : incompleteReason === "content_filter"
+        ? "content_filter"
+        : toolCalls.length
+          ? "tool_calls"
+          : "stop";
+  assertCompleteToolCalls(toolCalls, finishReason, observedToolCalls);
   return {
     content,
     ...(toolCalls.length ? { toolCalls } : {}),
-    finishReason: toolCalls.length
-      ? "tool_calls"
-      : data.incomplete_details?.reason === "max_output_tokens" ? "length" : "stop",
+    finishReason,
   };
 }
 
@@ -355,20 +383,21 @@ export async function responsesChatStream(
     },
   );
 
-  const toolCalls: ResponsesToolCallState[] = [
+  const observedToolCalls: ResponsesToolCallState[] = [
     ...state.toolCalls.values(),
     ...state.byItemId.values(),
     ...state.chat.toolCalls,
-  ].filter((t) => t.name.trim());
+  ];
   // Both Responses maps reference the same slots. Calls without IDs still
   // represent distinct Chat indices, even when they call the same function.
   const seen = new Set<string | ResponsesToolCallState>();
-  const unique = toolCalls.filter((t) => {
+  const uniqueObserved = observedToolCalls.filter((t) => {
     const key = t.id || t;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
   });
+  const unique = uniqueObserved.filter((toolCall) => toolCall.name.trim());
   const mappedCalls = unique.length
     ? unique.map((t, i) => ({
         id: t.id || `call_${i}`,
@@ -377,6 +406,12 @@ export async function responsesChatStream(
         function: { name: t.name, arguments: t.arguments || "{}" },
       }))
     : undefined;
+
+  assertCompleteToolCalls(
+    mappedCalls ?? [],
+    state.finishReason,
+    uniqueObserved.length,
+  );
 
   // [DONE] and clean EOF are normal endings for compatible gateways. Never
   // discard parsed calls/text just because response.completed was omitted.
@@ -433,8 +468,7 @@ function absorbResponsesStreamEvent(
   const type = typeof ev.type === "string" ? ev.type : "";
 
   if (ev.error || type === "error" || type === "response.error") {
-    const error = ev.error as ResponsesData["error"];
-    throw responsesFailure({ error: { message: error?.message ?? (typeof ev.message === "string" ? ev.message : "upstream stream error") } });
+    throw providerStreamError("responses(stream)", ev);
   }
   if (type === "response.failed" || type === "response.cancelled") {
     throw responsesFailure((ev.response ?? {}) as ResponsesData, type.slice("response.".length));

@@ -282,3 +282,74 @@ describe("技能来源令牌", () => {
     assert.ok(infos.some((i) => i.scope === "platform" && i.hint === "_env"));
   });
 });
+
+describe("私有技能仓库租户隔离", () => {
+  let dataDir = "";
+  let db: import("../src/db/client.js").Db;
+  let close: () => Promise<void>;
+
+  before(async () => {
+    dataDir = mkdtempSync(join(SCRATCH, "private-"));
+    const databaseUrl = `pglite:${join(dataDir, "pglite")}`;
+    const { runMigrations } = await import("../src/db/migrate.js");
+    await runMigrations(databaseUrl);
+    const { createDb } = await import("../src/db/client.js");
+    const opened = await createDb({ databaseUrl, dataDir });
+    db = opened.db;
+    close = opened.close;
+  });
+
+  after(async () => {
+    await close?.();
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  it("does not share private inflight/cache content between two tenants", async () => {
+    const { SkillsService } = await import("../src/services/skills/service.js");
+    const service = new SkillsService({
+      db, agentService: {} as never, fsProvider: {} as never,
+      secret: "private-skill-test-secret", backgroundRefresh: false,
+    });
+    await service.tokenStore.set({
+      scope: "tenant", tenantId: "tenant-a", provider: "github", token: "token-a",
+    });
+    await service.tokenStore.set({
+      scope: "tenant", tenantId: "tenant-b", provider: "github", token: "token-b",
+    });
+
+    const originalFetch = globalThis.fetch;
+    const treeHits = new Map<string, number>();
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const auth = new Headers(init?.headers).get("authorization") ?? "anonymous";
+      if (url.includes("api.github.com")) {
+        treeHits.set(auth, (treeHits.get(auth) ?? 0) + 1);
+        if (auth === "anonymous") return new Response("not found", { status: 404 });
+        const suffix = auth.endsWith("token-a") ? "a" : "b";
+        return Response.json({
+          sha: suffix.repeat(16),
+          tree: [{ path: "SKILL.md", type: "blob", size: 64, sha: suffix }],
+        });
+      }
+      if (url.includes("raw.githubusercontent.com")) {
+        const suffix = auth.endsWith("token-a") ? "a" : "b";
+        return new Response(`---\nname: private-${suffix}\ndescription: tenant ${suffix}\n---\n# ${suffix}\n`);
+      }
+      return new Response("", { status: 404 });
+    }) as typeof fetch;
+    try {
+      const source = "https://github.com/private-owner/private-repo";
+      const [a, b] = await Promise.all([
+        service.resolve("tenant-a", source),
+        service.resolve("tenant-b", source),
+      ]);
+      assert.equal(a.skills[0]?.name, "private-a");
+      assert.equal(b.skills[0]?.name, "private-b");
+      const before = treeHits.get("Bearer token-a");
+      assert.equal((await service.resolve("tenant-a", source)).skills[0]?.name, "private-a");
+      assert.equal(treeHits.get("Bearer token-a"), before, "tenant-private cache should be reused");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});

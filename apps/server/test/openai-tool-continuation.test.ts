@@ -245,6 +245,38 @@ describe("Responses gateway compatibility", () => {
     assert.equal(result.finishReason, "length");
   });
 
+  it("blocks truncated Responses tool arguments instead of executing them", async (t) => {
+    t.mock.method(globalThis, "fetch", async () => sse([
+      {
+        type: "response.output_item.added",
+        output_index: 2,
+        item: { ...call, arguments: "" },
+      },
+      {
+        type: "response.function_call_arguments.delta",
+        output_index: 2,
+        delta: '{"path":',
+      },
+      {
+        type: "response.incomplete",
+        response: {
+          status: "incomplete",
+          incomplete_details: { reason: "max_output_tokens" },
+        },
+      },
+    ]));
+    await assert.rejects(
+      responsesChatStream(
+        route,
+        [{ role: "user", content: "Inspect" }],
+        [],
+        undefined,
+        {},
+      ),
+      /阻止执行/,
+    );
+  });
+
   it("merges terminal tool arguments without discarding other calls or their namespaces", async (t) => {
     const second = { ...call, id: "fc_2", call_id: "call_2", arguments: '{"path":"/b.txt"}' };
     const { namespace: _namespace, ...terminalCall } = call;

@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { CloudAgentQueuedMessage } from "@zakura/shared";
 import {
+  ConfiguredSessionQueuePersistence,
   MemorySessionQueuePersistence,
   SessionMessageQueue,
   type QueueCommit,
   type QueueSnapshot,
   type SessionQueuePersistence,
 } from "../src/services/cloud-agent/session-message-queue.js";
+import { isRedisEnabled } from "../src/services/redis.js";
 
 function item(
   messageId: string,
@@ -109,3 +111,28 @@ describe("SessionMessageQueue", () => {
     assert.equal(await queue.takeImmediate("session"), null);
   });
 });
+
+describe(
+  "SessionMessageQueue hosted Redis replicas",
+  { skip: !isRedisEnabled() ? "REDIS_URL=off" : false },
+  () => {
+    it("preserves concurrent writes from independent replicas", async () => {
+      const sessionId = `queue-cross-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const persistence = new ConfiguredSessionQueuePersistence();
+      const first = new SessionMessageQueue(persistence);
+      const second = new SessionMessageQueue(persistence);
+      try {
+        await Promise.all(
+          Array.from({ length: 40 }, (_, index) =>
+            (index % 2 === 0 ? first : second).enqueue(sessionId, item(`redis-${index}`)),
+          ),
+        );
+        const ids = (await first.list(sessionId)).map((entry) => entry.messageId);
+        assert.equal(ids.length, 40);
+        assert.equal(new Set(ids).size, 40);
+      } finally {
+        await first.clear(sessionId);
+      }
+    });
+  },
+);

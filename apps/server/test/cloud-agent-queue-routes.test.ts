@@ -146,6 +146,7 @@ describe("cloud agent queue routes", () => {
       },
       userId: "user",
       userName: "owner@example.test",
+      platformAdminAuthorized: false,
     });
   });
 
@@ -172,6 +173,7 @@ describe("cloud agent queue routes", () => {
       mode: "queue",
       userId: "user",
       userName: "owner@example.test",
+      platformAdminAuthorized: false,
     });
   });
 

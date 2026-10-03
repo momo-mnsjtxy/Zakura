@@ -1,4 +1,5 @@
 import { and, asc, eq, sql } from "drizzle-orm";
+import { decryptJson, encryptJson } from "@zakura/core";
 import {
   MEMORY_PROVIDER_KINDS,
   MEMORY_PROVIDER_KIND_META,
@@ -24,14 +25,50 @@ export function parseProviderConfig(raw: string): Record<string, unknown> {
   }
 }
 
-export function serializeMemoryProvider(row: MemoryProvider) {
+export const MEMORY_SECRET_KEEP_VALUE = "***";
+
+function decodeProviderConfig(raw: string, secret: string): Record<string, unknown> {
+  const stored = parseProviderConfig(raw);
+  const { apiKeyEnc, ...config } = stored;
+  if (typeof apiKeyEnc === "string" && apiKeyEnc) {
+    try {
+      config.apiKey = decryptJson<{ apiKey: string }>(secret, apiKeyEnc).apiKey ?? "";
+    } catch {
+      throw new Error("Memory provider credential cannot be decrypted; refusing to overwrite it");
+    }
+  }
+  return config;
+}
+
+function encodeProviderConfig(config: Record<string, unknown>, secret: string): string {
+  const { apiKey, apiKeyEnc: _ignored, ...stored } = config;
+  if (typeof apiKey === "string" && apiKey) {
+    stored.apiKeyEnc = encryptJson(secret, { apiKey });
+  }
+  return JSON.stringify(stored);
+}
+
+export function redactMemoryProviderConfig(config: Record<string, unknown>): Record<string, unknown> {
+  const { apiKeyEnc, ...publicConfig } = config;
+  const configured =
+    (typeof config.apiKey === "string" && config.apiKey.length > 0) ||
+    (typeof apiKeyEnc === "string" && apiKeyEnc.length > 0);
+  if (configured) publicConfig.apiKey = MEMORY_SECRET_KEEP_VALUE;
+  else delete publicConfig.apiKey;
+  return publicConfig;
+}
+
+export function serializeMemoryProvider(
+  row: MemoryProvider,
+  hydratedConfig: Record<string, unknown> = parseProviderConfig(row.configJson),
+) {
   return {
     id: row.id,
     tenantId: row.tenantId,
     name: row.name,
     slug: row.slug,
     kind: row.kind as MemoryProviderKind,
-    config: parseProviderConfig(row.configJson),
+    config: redactMemoryProviderConfig(hydratedConfig),
     isDefault: row.isDefault,
     status: row.status,
     lastError: row.lastError,
@@ -63,8 +100,34 @@ export type MemoryProviderInput = {
   isDefault?: boolean;
 };
 
+function transactionDb(value: unknown): Db {
+  return value as Db;
+}
+
 export class MemoryProvidersService {
-  constructor(private readonly db: Db) {}
+  private readonly secret: string;
+
+  constructor(private readonly db: Db, secret?: string) {
+    this.secret = secret ?? process.env.ZAKURA_SECRET ?? "zakura-dev-secret";
+  }
+
+  private async hydrateRow(row: MemoryProvider): Promise<MemoryProvider> {
+    const config = decodeProviderConfig(row.configJson, this.secret);
+    const stored = parseProviderConfig(row.configJson);
+    if (typeof stored.apiKey === "string" && stored.apiKey && !stored.apiKeyEnc) {
+      // Upgrade legacy plaintext lazily with a compare-and-swap so concurrent reads
+      // cannot overwrite a newer credential rotation.
+      await this.db
+        .update(memoryProviders)
+        .set({ configJson: encodeProviderConfig(config, this.secret), updatedAt: new Date() })
+        .where(and(eq(memoryProviders.id, row.id), eq(memoryProviders.configJson, row.configJson)));
+    }
+    return { ...row, configJson: JSON.stringify(config) };
+  }
+
+  private serialize(row: MemoryProvider) {
+    return serializeMemoryProvider(row, decodeProviderConfig(row.configJson, this.secret));
+  }
 
   kinds() {
     return MEMORY_PROVIDER_KINDS.map((kind) => ({
@@ -80,21 +143,26 @@ export class MemoryProvidersService {
       .from(memoryProviders)
       .where(eq(memoryProviders.tenantId, tenantId))
       .orderBy(asc(memoryProviders.createdAt));
-    return rows.map(serializeMemoryProvider);
+    return Promise.all(rows.map(async (row) => {
+      const hydrated = await this.hydrateRow(row);
+      return serializeMemoryProvider(hydrated, parseProviderConfig(hydrated.configJson));
+    }));
   }
 
   async get(tenantId: string, id: string) {
     const row = await this.db.query.memoryProviders.findFirst({
       where: and(eq(memoryProviders.id, id), eq(memoryProviders.tenantId, tenantId)),
     });
-    return row ? serializeMemoryProvider(row) : null;
+    if (!row) return null;
+    const hydrated = await this.hydrateRow(row);
+    return serializeMemoryProvider(hydrated, parseProviderConfig(hydrated.configJson));
   }
 
   async getRow(tenantId: string, id: string): Promise<MemoryProvider | null> {
     const row = await this.db.query.memoryProviders.findFirst({
       where: and(eq(memoryProviders.id, id), eq(memoryProviders.tenantId, tenantId)),
     });
-    return row ?? null;
+    return row ? await this.hydrateRow(row) : null;
   }
 
   async getDefault(tenantId: string): Promise<MemoryProvider | null> {
@@ -105,12 +173,12 @@ export class MemoryProvidersService {
         eq(memoryProviders.isDefault, true),
       ),
     });
-    if (row) return row;
+    if (row) return this.hydrateRow(row);
     const any = await this.db.query.memoryProviders.findFirst({
       where: eq(memoryProviders.tenantId, tenantId),
       orderBy: [asc(memoryProviders.createdAt)],
     });
-    return any ?? null;
+    return any ? await this.hydrateRow(any) : null;
   }
 
   /** Resolve provider for an agent: explicit binding → tenant default */
@@ -133,7 +201,7 @@ export class MemoryProvidersService {
           eq(memoryProviders.isDefault, true),
         ),
       });
-      if (def) return def;
+      if (def) return this.hydrateRow(def);
       const any = await this.db.query.memoryProviders.findFirst({
         where: eq(memoryProviders.tenantId, tenantId),
         orderBy: [asc(memoryProviders.createdAt)],
@@ -143,7 +211,7 @@ export class MemoryProvidersService {
         .update(memoryProviders)
         .set({ isDefault: true, updatedAt: new Date() })
         .where(eq(memoryProviders.id, any.id));
-      return { ...any, isDefault: true };
+      return this.hydrateRow({ ...any, isDefault: true });
     };
 
     const existing = await pickDefault();
@@ -169,7 +237,7 @@ export class MemoryProvidersService {
         target: [memoryProviders.tenantId, memoryProviders.slug],
       })
       .returning();
-    if (row) return row;
+    if (row) return this.hydrateRow(row);
 
     const raced = await pickDefault();
     if (raced) return raced;
@@ -206,25 +274,32 @@ export class MemoryProvidersService {
       .where(eq(memoryProviders.tenantId, tenantId));
     const isDefault = input.isDefault === true || (existingCount[0]?.n ?? 0) === 0;
 
-    if (isDefault) await this.clearDefault(tenantId);
-
     const now = new Date();
-    const [row] = await this.db
-      .insert(memoryProviders)
-      .values({
+    const values = {
         id: newId(),
         tenantId,
         name,
         slug,
         kind: input.kind,
-        configJson: JSON.stringify(config),
+        configJson: encodeProviderConfig(config, this.secret),
         isDefault,
         status: "ready",
         createdAt: now,
         updatedAt: now,
-      })
-      .returning();
-    return serializeMemoryProvider(row);
+      };
+    const insert = async (database: Db) => {
+      const [row] = await database.insert(memoryProviders).values(values).returning();
+      if (!row) throw new Error("Failed to create memory provider");
+      return row;
+    };
+    const row = isDefault
+      ? await this.db.transaction(async (tx) => {
+          const database = transactionDb(tx);
+          await this.clearDefault(tenantId, database);
+          return insert(database);
+        })
+      : await insert(this.db);
+    return this.serialize(row);
   }
 
   async update(
@@ -241,31 +316,43 @@ export class MemoryProvidersService {
     const existing = await this.getRow(tenantId, id);
     if (!existing) throw new Error("Memory provider not found");
 
-    if (patch.isDefault === true) {
-      await this.clearDefault(tenantId);
-    }
+    const currentConfig = parseProviderConfig(existing.configJson);
+    const patchConfig = patch.config ? { ...patch.config } : undefined;
+    if (patchConfig?.apiKey === MEMORY_SECRET_KEEP_VALUE) delete patchConfig.apiKey;
+    const nextConfig = patchConfig !== undefined
+      ? this.normalizeConfig(existing.kind as MemoryProviderKind, {
+          ...currentConfig,
+          ...patchConfig,
+        })
+      : undefined;
 
-    const nextConfig =
-      patch.config !== undefined
-        ? this.normalizeConfig(existing.kind as MemoryProviderKind, {
-            ...parseProviderConfig(existing.configJson),
-            ...patch.config,
-          })
-        : undefined;
-
-    const [row] = await this.db
-      .update(memoryProviders)
-      .set({
+    const values = {
         ...(patch.name !== undefined ? { name: patch.name.trim() } : {}),
-        ...(nextConfig !== undefined ? { configJson: JSON.stringify(nextConfig) } : {}),
+        ...(nextConfig !== undefined
+          ? { configJson: encodeProviderConfig(nextConfig, this.secret) }
+          : {}),
         ...(patch.isDefault === true ? { isDefault: true } : {}),
         ...(patch.status !== undefined ? { status: patch.status } : {}),
         ...(patch.lastError !== undefined ? { lastError: patch.lastError } : {}),
         updatedAt: new Date(),
-      })
-      .where(and(eq(memoryProviders.id, id), eq(memoryProviders.tenantId, tenantId)))
-      .returning();
-    return serializeMemoryProvider(row);
+      };
+    const mutate = async (database: Db) => {
+      const [row] = await database
+        .update(memoryProviders)
+        .set(values)
+        .where(and(eq(memoryProviders.id, id), eq(memoryProviders.tenantId, tenantId)))
+        .returning();
+      if (!row) throw new Error("Memory provider not found");
+      return row;
+    };
+    const row = patch.isDefault === true
+      ? await this.db.transaction(async (tx) => {
+          const database = transactionDb(tx);
+          await this.clearDefault(tenantId, database);
+          return mutate(database);
+        })
+      : await mutate(this.db);
+    return this.serialize(row);
   }
 
   async remove(tenantId: string, id: string) {
@@ -280,23 +367,25 @@ export class MemoryProvidersService {
       throw new Error("仍有 Agent 绑定此 Provider，请先在 Agent 记忆页更换");
     }
 
-    const wasDefault = existing.isDefault;
-    await this.db
-      .delete(memoryProviders)
-      .where(and(eq(memoryProviders.id, id), eq(memoryProviders.tenantId, tenantId)));
+    await this.db.transaction(async (tx) => {
+      const database = transactionDb(tx);
+      await database
+        .delete(memoryProviders)
+        .where(and(eq(memoryProviders.id, id), eq(memoryProviders.tenantId, tenantId)));
 
-    if (wasDefault) {
-      const next = await this.db.query.memoryProviders.findFirst({
-        where: eq(memoryProviders.tenantId, tenantId),
-        orderBy: [asc(memoryProviders.createdAt)],
-      });
-      if (next) {
-        await this.db
-          .update(memoryProviders)
-          .set({ isDefault: true, updatedAt: new Date() })
-          .where(eq(memoryProviders.id, next.id));
+      if (existing.isDefault) {
+        const next = await database.query.memoryProviders.findFirst({
+          where: eq(memoryProviders.tenantId, tenantId),
+          orderBy: [asc(memoryProviders.createdAt), asc(memoryProviders.id)],
+        });
+        if (next) {
+          await database
+            .update(memoryProviders)
+            .set({ isDefault: true, updatedAt: new Date() })
+            .where(eq(memoryProviders.id, next.id));
+        }
       }
-    }
+    });
     return { ok: true as const };
   }
 
@@ -317,7 +406,7 @@ export class MemoryProvidersService {
   async healthCheck(tenantId: string, id: string) {
     const row = await this.getRow(tenantId, id);
     if (!row) throw new Error("Memory provider not found");
-    const config = parseProviderConfig(row.configJson);
+    const config = decodeProviderConfig(row.configJson, this.secret);
     const kind = row.kind as MemoryProviderKind;
 
     if (kind === "builtin" || kind === "traditional") {
@@ -365,8 +454,8 @@ export class MemoryProvidersService {
     return { status: "unknown" as const, message: kind };
   }
 
-  private async clearDefault(tenantId: string) {
-    await this.db
+  private async clearDefault(tenantId: string, database: Db = this.db) {
+    await database
       .update(memoryProviders)
       .set({ isDefault: false, updatedAt: new Date() })
       .where(eq(memoryProviders.tenantId, tenantId));

@@ -948,23 +948,27 @@ export class CloudAgentSessionStore {
         tenantId: meta.tenantId,
         agentId: meta.agentId,
       };
-      void redis
-        .multi()
-        .rPush(REDIS_KEYS.pending(input.sessionId), JSON.stringify(pending))
-        .rPush(REDIS_KEYS.events(input.sessionId), JSON.stringify(event))
-        .lTrim(REDIS_KEYS.events(input.sessionId), -500, -1)
-        .expire(REDIS_KEYS.events(input.sessionId), 24 * 60 * 60)
-        .publish(
-          REDIS_KEYS.channel(input.sessionId),
-          JSON.stringify({ from: INSTANCE_ID, event } satisfies RedisFanoutMessage),
-        )
-        .exec()
-        .catch((err) =>
-          recordPlatformFault("cloud_agent.delta_fanout", err, {
-            subsystem: "cloud_agent",
-            dep: "redis",
-          }),
-        );
+      try {
+        // Do not let a rollback/tool/terminal append call flush before this
+        // delta is visible in pending. DeltaPublisher still batches without
+        // blocking provider reads, while drain() now observes this MULTI.
+        await redis
+          .multi()
+          .rPush(REDIS_KEYS.pending(input.sessionId), JSON.stringify(pending))
+          .rPush(REDIS_KEYS.events(input.sessionId), JSON.stringify(event))
+          .lTrim(REDIS_KEYS.events(input.sessionId), -500, -1)
+          .expire(REDIS_KEYS.events(input.sessionId), 24 * 60 * 60)
+          .publish(
+            REDIS_KEYS.channel(input.sessionId),
+            JSON.stringify({ from: INSTANCE_ID, event } satisfies RedisFanoutMessage),
+          )
+          .exec();
+      } catch (err) {
+        recordPlatformFault("cloud_agent.delta_fanout", err, {
+          subsystem: "cloud_agent",
+          dep: "redis",
+        });
+      }
       void writeSessionMeta(input.sessionId, {
         tenantId: meta.tenantId,
         agentId: meta.agentId,

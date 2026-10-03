@@ -34,6 +34,13 @@ function senderOf(session: { userId: string; email: string }) {
   return { userId: session.userId, userName: session.email };
 }
 
+function requestErrorStatus(error: unknown): 400 | 403 {
+  return error && typeof error === "object" && "status" in error &&
+    Number((error as { status?: unknown }).status) === 403
+    ? 403
+    : 400;
+}
+
 function sessionDto(row: {
   id: string;
   agentId: string;
@@ -399,6 +406,7 @@ export function registerCloudAgentRoutes(
 
     await agentService.update(session.tenantId, agent.id, {
       config: configJson,
+      platformAdminAuthorized: session.isPlatformAdmin === true,
     });
     platformEvents.publish(session.tenantId, {
       type: "agent_config_changed",
@@ -694,6 +702,7 @@ export function registerCloudAgentRoutes(
         ...(attachments.length ? { attachments } : {}),
         mode,
         ...senderOf(session),
+        platformAdminAuthorized: session.isPlatformAdmin === true,
       });
       return c.json({ queued: true, ...result }, 202);
     };
@@ -725,6 +734,7 @@ export function registerCloudAgentRoutes(
         ...(attachments.length ? { attachments } : {}),
         ...(options ? { options } : {}),
         ...senderOf(session),
+        platformAdminAuthorized: session.isPlatformAdmin === true,
       });
       return c.json(result, 202);
     } catch (err) {
@@ -734,10 +744,13 @@ export function registerCloudAgentRoutes(
         try {
           return await enqueue();
         } catch (e2) {
-          return c.json({ error: e2 instanceof Error ? e2.message : String(e2) }, 400);
+          return c.json(
+            { error: e2 instanceof Error ? e2.message : String(e2) },
+            requestErrorStatus(e2),
+          );
         }
       }
-      return c.json({ error: message }, 400);
+      return c.json({ error: message }, requestErrorStatus(err));
     }
   });
 
@@ -786,7 +799,10 @@ export function registerCloudAgentRoutes(
       });
       return c.json(result);
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
+      return c.json(
+        { error: err instanceof Error ? err.message : String(err) },
+        requestErrorStatus(err),
+      );
     }
   });
 
@@ -812,10 +828,14 @@ export function registerCloudAgentRoutes(
           ? { regenerateOfMessageId: body.messageId }
           : { retry: true }),
         ...(options ? { options } : {}),
+        platformAdminAuthorized: session.isPlatformAdmin === true,
       });
       return c.json(result, 202);
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
+      return c.json(
+        { error: err instanceof Error ? err.message : String(err) },
+        requestErrorStatus(err),
+      );
     }
   });
 
@@ -839,10 +859,14 @@ export function registerCloudAgentRoutes(
         sessionId: c.req.param("sid"),
         retry: true,
         ...(options ? { options } : {}),
+        platformAdminAuthorized: session.isPlatformAdmin === true,
       });
       return c.json(result, 202);
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
+      return c.json(
+        { error: err instanceof Error ? err.message : String(err) },
+        requestErrorStatus(err),
+      );
     }
   });
 
@@ -866,10 +890,14 @@ export function registerCloudAgentRoutes(
         sessionId: c.req.param("sid"),
         continue: true,
         ...(options ? { options } : {}),
+        platformAdminAuthorized: session.isPlatformAdmin === true,
       });
       return c.json(result, 202);
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
+      return c.json(
+        { error: err instanceof Error ? err.message : String(err) },
+        requestErrorStatus(err),
+      );
     }
   });
 

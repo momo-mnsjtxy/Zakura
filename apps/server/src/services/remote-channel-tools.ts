@@ -155,6 +155,13 @@ export class RemoteChannelSessionRegistry implements RemoteChannelToolPort {
   get(sessionId: string): RemoteChannelSessionHandle | undefined {
     return this.sessions.get(sessionId);
   }
+
+  /** Drop every live delivery handle owned by a stopped channel binding. */
+  unbindBinding(bindingId: string): void {
+    for (const [sessionId, handle] of this.sessions) {
+      if (handle.bindingId === bindingId) this.sessions.delete(sessionId);
+    }
+  }
 }
 
 const CARD_SCHEMA = {

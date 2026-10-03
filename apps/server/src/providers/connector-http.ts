@@ -18,7 +18,7 @@ export type ConnectorRetryOptions = {
 
 export type ConnectorRequestInit = Omit<RequestInit, "body"> & {
   json?: unknown;
-  body?: BodyInit | null;
+  body?: RequestInit["body"];
   authScheme?: ConnectorAuthScheme;
   timeoutMs?: number;
   retry?: ConnectorRetryOptions | false;
@@ -50,7 +50,11 @@ export class ConnectorHttpError extends Error {
 
 const inflight = new Map<string, Promise<unknown>>();
 
-function authHeaders(token: string, scheme: ConnectorAuthScheme, source?: HeadersInit): Headers {
+function authHeaders(
+  token: string,
+  scheme: ConnectorAuthScheme,
+  source?: RequestInit["headers"],
+): Headers {
   const headers = new Headers(source);
   if (scheme === "private-token") headers.set("PRIVATE-TOKEN", token);
   else if (scheme === "token") headers.set("Authorization", `Token ${token}`);

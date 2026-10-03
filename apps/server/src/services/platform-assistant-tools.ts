@@ -40,6 +40,7 @@ export type InstanceMigrationPort = {
 export type PlatformAssistantToolContext = {
   tenantId: string;
   agentId: string;
+  isPlatformAdmin?: boolean;
   connectionCatalog?: ConnectionCatalogService | null;
   integrations?: IntegrationCatalogService | null;
   runtimeNodes?: RuntimeNodeService | null;
@@ -209,6 +210,9 @@ export async function callPlatformAssistantTool(
   args: Record<string, unknown>,
   ctx: PlatformAssistantToolContext,
 ): Promise<McpToolResult> {
+  if (ctx.isPlatformAdmin !== true) {
+    return textResult("Platform assistant tools require platform admin authorization", true);
+  }
   try {
     switch (name) {
       case "search_connections": {

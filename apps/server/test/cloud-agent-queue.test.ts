@@ -5,7 +5,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { CloudAgentSessionStore } from "../src/services/cloud-agent-session.js";
-import { runAgentLoop } from "../src/services/cloud-agent-runtime.js";
+import { CloudAgentRuntime, runAgentLoop } from "../src/services/cloud-agent-runtime.js";
 import type { CloudAgentQueuedMessage } from "@zakura/shared";
 
 function withRedisOff<T>(fn: () => Promise<T>): Promise<T> {
@@ -201,5 +201,85 @@ describe("runAgentLoop steer injection from session queue", () => {
       const end = events.find((e) => e.type === "run_end");
       assert.equal((end!.payload as { status?: string }).status, "completed");
     });
+  });
+});
+
+describe("immediate queue reservation races", () => {
+  it("starts a reserved item when the observed active run finishes during the claim", async () => {
+    let reads = 0;
+    let starts = 0;
+    let cancels = 0;
+    const store = {
+      async getSession() {
+        reads += 1;
+        return { activeRunId: reads === 1 ? "old-run" : null };
+      },
+      async claimQueuedForImmediate() {
+        return item("immediate", "now", "queue");
+      },
+      async requestCancel() {
+        cancels += 1;
+        return false;
+      },
+    };
+    const runtime = new CloudAgentRuntime({
+      store: store as never,
+      agentService: {} as never,
+      gateway: {} as never,
+      modelRouter: {} as never,
+    });
+    runtime.startNextQueued = async () => {
+      starts += 1;
+    };
+
+    assert.deepEqual(
+      await runtime.interruptWithQueued({
+        tenantId: "tenant",
+        agentId: "agent",
+        sessionId: "session",
+        messageId: "immediate",
+      }),
+      { ok: true },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(reads, 2);
+    assert.equal(cancels, 0);
+    assert.equal(starts, 1);
+  });
+
+  it("starts a reserved item when cancellation loses the run-completion race", async () => {
+    let starts = 0;
+    let cancels = 0;
+    const store = {
+      async getSession() {
+        return { activeRunId: "run" };
+      },
+      async claimQueuedForImmediate() {
+        return item("immediate", "now", "queue");
+      },
+      async requestCancel() {
+        cancels += 1;
+        return false;
+      },
+    };
+    const runtime = new CloudAgentRuntime({
+      store: store as never,
+      agentService: {} as never,
+      gateway: {} as never,
+      modelRouter: {} as never,
+    });
+    runtime.startNextQueued = async () => {
+      starts += 1;
+    };
+
+    await runtime.interruptWithQueued({
+      tenantId: "tenant",
+      agentId: "agent",
+      sessionId: "session",
+      messageId: "immediate",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(cancels, 1);
+    assert.equal(starts, 1);
   });
 });

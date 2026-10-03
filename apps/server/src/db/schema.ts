@@ -1,4 +1,5 @@
 import { createId } from "@paralleldrive/cuid2";
+import { sql } from "drizzle-orm";
 import {
   boolean,
   index,
@@ -425,6 +426,9 @@ export const memoryProviders = pgTable(
   },
   (t) => [
     uniqueIndex("memory_providers_tenant_slug").on(t.tenantId, t.slug),
+    uniqueIndex("memory_providers_one_default")
+      .on(t.tenantId)
+      .where(sql`${t.isDefault} = true`),
     index("memory_providers_tenant").on(t.tenantId),
   ],
 );
@@ -1307,6 +1311,13 @@ export const memoryEdges = pgTable(
     index("memory_edges_from").on(t.fromMemoryId),
     index("memory_edges_to").on(t.toMemoryId),
     uniqueIndex("memory_edges_pair_rel").on(t.fromMemoryId, t.toMemoryId, t.relation),
+    uniqueIndex("memory_edges_tenant_agent_pair_rel").on(
+      t.tenantId,
+      t.agentId,
+      t.fromMemoryId,
+      t.toMemoryId,
+      t.relation,
+    ),
   ],
 );
 

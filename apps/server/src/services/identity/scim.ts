@@ -1,4 +1,4 @@
-import { and, asc, eq, isNull, sql } from "drizzle-orm";
+import { and, asc, eq, isNull, ne, sql } from "drizzle-orm";
 import type { Db } from "../../db/client.js";
 import {
   newId,
@@ -10,11 +10,18 @@ import {
 } from "../../db/schema.js";
 import { hashToken, newSecretToken, parseJsonObject } from "./util.js";
 import { inviteRole } from "./tenant-policy.js";
+import type { TenantLifecycleNotifier } from "../tenants.js";
 
 const USER_SCHEMA = "urn:ietf:params:scim:schemas:core:2.0:User";
 const GROUP_SCHEMA = "urn:ietf:params:scim:schemas:core:2.0:Group";
 const LIST_SCHEMA = "urn:ietf:params:scim:api:messages:2.0:ListResponse";
 const ERROR_SCHEMA = "urn:ietf:params:scim:api:messages:2.0:Error";
+
+// drizzle's PGlite/Postgres transaction callback types do not distribute over
+// the Db union, although both executors expose the same schema/query contract.
+function transactionDb(value: unknown): Db {
+  return value as Db;
+}
 
 export class ScimError extends Error {
   constructor(
@@ -106,7 +113,7 @@ export async function revokeScimToken(db: Db, tenantId: string, tokenId: string)
         isNull(tenantScimTokens.revokedAt),
       ),
     )
-    .returning({ id: tenantScimTokens.id });
+    .returning();
   if (!rows.length) throw new ScimError("SCIM token not found", 404);
 }
 
@@ -126,7 +133,7 @@ export async function patchScimTokenMap(
         isNull(tenantScimTokens.revokedAt),
       ),
     )
-    .returning({ id: tenantScimTokens.id });
+    .returning();
   if (!rows.length) throw new ScimError("SCIM token not found", 404);
 }
 
@@ -179,6 +186,28 @@ async function loadMappedUser(db: Db, tenantId: string, mappingId: string) {
     where: and(eq(tenantMemberships.tenantId, tenantId), eq(tenantMemberships.userId, user.id)),
   });
   return { mapping, user, membership };
+}
+
+async function assertGlobalProfileMutable(
+  db: Db,
+  tenantId: string,
+  user: { id: string; email: string; name: string | null },
+  next: { email: string; name: string | null },
+): Promise<void> {
+  if (user.email === next.email && user.name === next.name) return;
+  const otherMembership = await db.query.tenantMemberships.findFirst({
+    where: and(
+      eq(tenantMemberships.userId, user.id),
+      ne(tenantMemberships.tenantId, tenantId),
+    ),
+  });
+  if (otherMembership) {
+    throw new ScimError(
+      "SCIM cannot change the global profile of a user shared with another tenant",
+      409,
+      "mutability",
+    );
+  }
 }
 
 export async function scimGetUser(db: Db, tenantId: string, id: string) {
@@ -275,11 +304,17 @@ export function readScimUserPayload(body: Record<string, unknown>) {
   return { email, name, active, externalId };
 }
 
-export async function scimCreateUser(db: Db, tenantId: string, body: Record<string, unknown>, defaultRole = "member") {
+export async function scimCreateUser(
+  db: Db,
+  tenantId: string,
+  body: Record<string, unknown>,
+  defaultRole = "member",
+  lifecycle?: TenantLifecycleNotifier,
+) {
   const payload = readScimUserPayload(body);
   try {
-    return await db.transaction(async (tx) => {
-      const database = tx as Db;
+    const result = await db.transaction(async (tx) => {
+      const database = transactionDb(tx);
       const existingMap = await database.query.scimUserMappings.findFirst({
         where: and(
           eq(scimUserMappings.tenantId, tenantId),
@@ -320,6 +355,7 @@ export async function scimCreateUser(db: Db, tenantId: string, body: Record<stri
       let membership = await database.query.tenantMemberships.findFirst({
         where: and(eq(tenantMemberships.tenantId, tenantId), eq(tenantMemberships.userId, user.id)),
       });
+      const membershipWasActive = membership?.status === "active";
       if (membership?.role === "owner" && !payload.active) {
         throw new ScimError("SCIM cannot deactivate a tenant owner", 409, "mutability");
       }
@@ -359,14 +395,22 @@ export async function scimCreateUser(db: Db, tenantId: string, body: Record<stri
           createdAt: now,
         })
         .returning();
-      return toScimUser({
-        mappingId: mapping.id,
-        externalId: mapping.externalId,
-        email: user.email,
-        name: user.name,
-        active: membership.status === "active" && !user.suspendedAt,
-      });
+      return {
+        user: toScimUser({
+          mappingId: mapping.id,
+          externalId: mapping.externalId,
+          email: user.email,
+          name: user.name,
+          active: membership.status === "active" && !user.suspendedAt,
+        }),
+        revokedUserId:
+          membershipWasActive && membership.status === "suspended" ? user.id : null,
+      };
     });
+    if (result.revokedUserId) {
+      await lifecycle?.notifyMemberAccessRevoked(tenantId, result.revokedUserId);
+    }
+    return result.user;
   } catch (error) {
     if (error instanceof ScimError) throw error;
     if (isUniqueViolation(error)) {
@@ -376,91 +420,149 @@ export async function scimCreateUser(db: Db, tenantId: string, body: Record<stri
   }
 }
 
-export async function scimReplaceUser(db: Db, tenantId: string, id: string, body: Record<string, unknown>) {
-  const { mapping, user, membership } = await loadMappedUser(db, tenantId, id);
+export async function scimReplaceUser(
+  db: Db,
+  tenantId: string,
+  id: string,
+  body: Record<string, unknown>,
+  lifecycle?: TenantLifecycleNotifier,
+) {
   const payload = readScimUserPayload(body);
-  if (membership?.role === "owner" && !payload.active) {
-    throw new ScimError("SCIM cannot deactivate a tenant owner", 409, "mutability");
-  }
-  await db
-    .update(users)
-    .set({ name: payload.name, email: payload.email, updatedAt: new Date() })
-    .where(eq(users.id, user.id));
-  if (membership) {
-    await db
-      .update(tenantMemberships)
-      .set({ status: membershipStatusFromScimActive(payload.active), updatedAt: new Date() })
-      .where(eq(tenantMemberships.id, membership.id));
-  }
-  if (payload.externalId !== mapping.externalId) {
-    await db
-      .update(scimUserMappings)
-      .set({ externalId: payload.externalId })
-      .where(eq(scimUserMappings.id, mapping.id));
-  }
-  return toScimUser({
-    mappingId: mapping.id,
-    externalId: payload.externalId,
-    email: payload.email,
-    name: payload.name,
-    active: payload.active,
-  });
-}
-
-export async function scimPatchUser(db: Db, tenantId: string, id: string, body: Record<string, unknown>) {
-  const ops = (body.Operations ?? body.operations) as Array<{ op?: string; path?: string; value?: unknown }> | undefined;
-  if (!Array.isArray(ops)) return scimReplaceUser(db, tenantId, id, body);
-  const { mapping, user, membership } = await loadMappedUser(db, tenantId, id);
-  let active = membership?.status === "active";
-  let name = user.name;
-  let email = user.email;
-  for (const op of ops) {
-    const operation = (op.op ?? "replace").toLowerCase();
-    const path = (op.path ?? "").toLowerCase();
-    if ((operation === "replace" || operation === "add") && (path === "active" || !path)) {
-      if (path === "active") active = Boolean(op.value);
-      else if (op.value && typeof op.value === "object") {
-        const value = op.value as Record<string, unknown>;
-        if ("active" in value) active = Boolean(value.active);
-        if (typeof value.displayName === "string") name = value.displayName;
-        if (typeof value.userName === "string") email = value.userName.toLowerCase();
-      }
-    } else if ((operation === "replace" || operation === "add") && path === "displayname") {
-      name = typeof op.value === "string" ? op.value : name;
-    } else if ((operation === "replace" || operation === "add") && path === "username") {
-      email = typeof op.value === "string" ? op.value.trim().toLowerCase() : email;
+  const result = await db.transaction(async (tx) => {
+    const database = transactionDb(tx);
+    const { mapping, user, membership } = await loadMappedUser(database, tenantId, id);
+    if (membership?.role === "owner" && !payload.active) {
+      throw new ScimError("SCIM cannot deactivate a tenant owner", 409, "mutability");
     }
-  }
-  if (!email.includes("@")) throw new ScimError("Valid userName required", 400, "invalidValue");
-  if (membership?.role === "owner" && !active) {
-    throw new ScimError("SCIM cannot deactivate a tenant owner", 409, "mutability");
-  }
-  await db.update(users).set({ name, email, updatedAt: new Date() }).where(eq(users.id, user.id));
-  if (membership) {
-    await db
-      .update(tenantMemberships)
-      .set({ status: membershipStatusFromScimActive(active), updatedAt: new Date() })
-      .where(eq(tenantMemberships.id, membership.id));
-  }
-  return toScimUser({
-    mappingId: mapping.id,
-    externalId: mapping.externalId,
-    email,
-    name,
-    active,
+    await assertGlobalProfileMutable(database, tenantId, user, {
+      email: payload.email,
+      name: payload.name,
+    });
+    await database
+      .update(users)
+      .set({ name: payload.name, email: payload.email, updatedAt: new Date() })
+      .where(eq(users.id, user.id));
+    if (membership) {
+      await database
+        .update(tenantMemberships)
+        .set({ status: membershipStatusFromScimActive(payload.active), updatedAt: new Date() })
+        .where(
+          and(eq(tenantMemberships.id, membership.id), eq(tenantMemberships.tenantId, tenantId)),
+        );
+    }
+    if (payload.externalId !== mapping.externalId) {
+      await database
+        .update(scimUserMappings)
+        .set({ externalId: payload.externalId })
+        .where(
+          and(eq(scimUserMappings.id, mapping.id), eq(scimUserMappings.tenantId, tenantId)),
+        );
+    }
+    return {
+      user: toScimUser({
+        mappingId: mapping.id,
+        externalId: payload.externalId,
+        email: payload.email,
+        name: payload.name,
+        active: payload.active,
+      }),
+      revokedUserId: membership?.status === "active" && !payload.active ? user.id : null,
+    };
   });
+  if (result.revokedUserId) {
+    await lifecycle?.notifyMemberAccessRevoked(tenantId, result.revokedUserId);
+  }
+  return result.user;
 }
 
-export async function scimDeleteUser(db: Db, tenantId: string, id: string) {
-  const { membership } = await loadMappedUser(db, tenantId, id);
-  if (membership) {
+export async function scimPatchUser(
+  db: Db,
+  tenantId: string,
+  id: string,
+  body: Record<string, unknown>,
+  lifecycle?: TenantLifecycleNotifier,
+) {
+  const ops = (body.Operations ?? body.operations) as Array<{ op?: string; path?: string; value?: unknown }> | undefined;
+  if (!Array.isArray(ops)) return scimReplaceUser(db, tenantId, id, body, lifecycle);
+  const result = await db.transaction(async (tx) => {
+    const database = transactionDb(tx);
+    const { mapping, user, membership } = await loadMappedUser(database, tenantId, id);
+    let active = membership?.status === "active";
+    let name = user.name;
+    let email = user.email;
+    for (const op of ops) {
+      const operation = (op.op ?? "replace").toLowerCase();
+      const path = (op.path ?? "").toLowerCase();
+      if ((operation === "replace" || operation === "add") && (path === "active" || !path)) {
+        if (path === "active") active = Boolean(op.value);
+        else if (op.value && typeof op.value === "object") {
+          const value = op.value as Record<string, unknown>;
+          if ("active" in value) active = Boolean(value.active);
+          if (typeof value.displayName === "string") name = value.displayName;
+          if (typeof value.userName === "string") email = value.userName.toLowerCase();
+        }
+      } else if ((operation === "replace" || operation === "add") && path === "displayname") {
+        name = typeof op.value === "string" ? op.value : name;
+      } else if ((operation === "replace" || operation === "add") && path === "username") {
+        email = typeof op.value === "string" ? op.value.trim().toLowerCase() : email;
+      }
+    }
+    if (!email.includes("@")) throw new ScimError("Valid userName required", 400, "invalidValue");
+    if (membership?.role === "owner" && !active) {
+      throw new ScimError("SCIM cannot deactivate a tenant owner", 409, "mutability");
+    }
+    await assertGlobalProfileMutable(database, tenantId, user, { email, name });
+    await database
+      .update(users)
+      .set({ name, email, updatedAt: new Date() })
+      .where(eq(users.id, user.id));
+    if (membership) {
+      await database
+        .update(tenantMemberships)
+        .set({ status: membershipStatusFromScimActive(active), updatedAt: new Date() })
+        .where(
+          and(eq(tenantMemberships.id, membership.id), eq(tenantMemberships.tenantId, tenantId)),
+        );
+    }
+    return {
+      user: toScimUser({
+        mappingId: mapping.id,
+        externalId: mapping.externalId,
+        email,
+        name,
+        active,
+      }),
+      revokedUserId: membership?.status === "active" && !active ? user.id : null,
+    };
+  });
+  if (result.revokedUserId) {
+    await lifecycle?.notifyMemberAccessRevoked(tenantId, result.revokedUserId);
+  }
+  return result.user;
+}
+
+export async function scimDeleteUser(
+  db: Db,
+  tenantId: string,
+  id: string,
+  lifecycle?: TenantLifecycleNotifier,
+) {
+  const revokedUserId = await db.transaction(async (tx) => {
+    const database = transactionDb(tx);
+    const { user, membership } = await loadMappedUser(database, tenantId, id);
+    if (!membership) return null;
     if (membership.role === "owner") {
       throw new ScimError("SCIM cannot deactivate a tenant owner", 409, "mutability");
     }
-    await db
+    if (membership.status !== "active") return null;
+    await database
       .update(tenantMemberships)
       .set({ status: membershipStatusFromScimActive(false), updatedAt: new Date() })
       .where(and(eq(tenantMemberships.id, membership.id), eq(tenantMemberships.tenantId, tenantId)));
+    return user.id;
+  });
+  if (revokedUserId) {
+    await lifecycle?.notifyMemberAccessRevoked(tenantId, revokedUserId);
   }
 }
 

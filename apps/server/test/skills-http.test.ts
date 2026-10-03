@@ -3,6 +3,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { after, before, describe, it } from "node:test";
 import { fetchSkillSource } from "../src/services/skills/http.js";
+import { fetchSkillPackages } from "../src/services/skills/fetch.js";
 
 describe("skill source HTTP boundary", () => {
   let server: Server;
@@ -65,3 +66,57 @@ describe("skill source HTTP boundary", () => {
   });
 });
 
+describe("authenticated skill source isolation", () => {
+  it("uses GitLab PRIVATE-TOKEN for discovery and file hydration", async () => {
+    const originalFetch = globalThis.fetch;
+    const seen: Array<{ url: string; token: string | null }> = [];
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const headers = new Headers(init?.headers);
+      seen.push({ url, token: headers.get("private-token") });
+      if (url.includes("/repository/tree")) {
+        return Response.json([{ path: "skill/SKILL.md", type: "blob", name: "SKILL.md" }]);
+      }
+      return new Response("---\nname: private-gitlab\ndescription: private\n---\n# Private\n");
+    }) as typeof fetch;
+    try {
+      const result = await fetchSkillPackages(
+        { kind: "gitlab", owner: "acme", repo: "private", path: "skill" },
+        { gitlabToken: "glpat-private" },
+      );
+      assert.equal(result.packages[0]?.name, "private-gitlab");
+      assert.ok(seen.length >= 2);
+      assert.ok(seen.every((request) => request.token === "glpat-private"));
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("does not share GitHub tree cache entries across credentials", async () => {
+    const originalFetch = globalThis.fetch;
+    let treeHits = 0;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const auth = new Headers(init?.headers).get("authorization") ?? "";
+      if (url.includes("api.github.com")) {
+        treeHits++;
+        return Response.json({
+          sha: auth.includes("token-a") ? "aaaaaaaaaaaa1111" : "bbbbbbbbbbbb2222",
+          tree: [{ path: "SKILL.md", type: "blob", size: 64, sha: "blob" }],
+        });
+      }
+      return new Response("---\nname: credential-cache\ndescription: isolated\n---\n# Cache\n");
+    }) as typeof fetch;
+    try {
+      const source = { kind: "github", owner: "credential-test", repo: "private-cache" } as const;
+      const [a, b] = await Promise.all([
+        fetchSkillPackages(source, { githubToken: "token-a", manifestOnly: true }),
+        fetchSkillPackages(source, { githubToken: "token-b", manifestOnly: true }),
+      ]);
+      assert.equal(treeHits, 2);
+      assert.notEqual(a.packages[0]?.version, b.packages[0]?.version);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});

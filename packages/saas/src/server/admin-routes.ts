@@ -100,10 +100,18 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
   const oauthIdentities = deps.schema.oauthIdentities as AnyDb;
   const newId = deps.schema.newId;
   const tenantService = deps.tenants;
-  const adminMemberships = new AdminMembershipService(db, deps.schema);
+  const adminMemberships = new AdminMembershipService(db, deps.schema, tenantService);
 
   const bumpUser = (id: string) => deps.invalidateSuspension?.("user", id);
   const bumpTenant = (id: string) => deps.invalidateSuspension?.("tenant", id);
+  const deleteTenantAggregate = async (tenantId: string) => {
+    if (tenantService.deleteTenantAsPlatformAdmin) {
+      await tenantService.deleteTenantAsPlatformAdmin(tenantId);
+      return;
+    }
+    // Compatibility for older hosts; the Zakura server injects the aggregate method.
+    await db.delete(tenants).where(eq(tenants.id, tenantId));
+  };
 
   /** 平台至少保留一个未封禁的管理员 */
   async function otherActiveAdminCount(excludeUserId: string): Promise<number> {
@@ -485,6 +493,36 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
     }
     if (target.suspendedAt) return c.json({ error: "该用户已被封禁" }, 409);
 
+    const targetMemberships = (await db
+      .select({
+        tenantId: tenantMemberships.tenantId,
+        role: tenantMemberships.role,
+        status: tenantMemberships.status,
+      })
+      .from(tenantMemberships)
+      .where(eq(tenantMemberships.userId, target.id))) as Array<{
+      tenantId: string;
+      role: string;
+      status: string;
+    }>;
+    for (const membership of targetMemberships) {
+      if (membership.role !== "owner" || membership.status !== "active") continue;
+      const [otherOwner] = await db
+        .select({ n: count() })
+        .from(tenantMemberships)
+        .where(
+          and(
+            eq(tenantMemberships.tenantId, membership.tenantId),
+            eq(tenantMemberships.role, "owner"),
+            eq(tenantMemberships.status, "active"),
+            ne(tenantMemberships.userId, target.id),
+          ),
+        );
+      if (Number(otherOwner?.n ?? 0) === 0) {
+        return c.json({ error: "请先为团队指定另一位活跃 owner" }, 400);
+      }
+    }
+
     const now = new Date();
     const [updated] = await db
       .update(users)
@@ -498,6 +536,13 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
       .returning();
 
     bumpUser(target.id);
+    await Promise.all(
+      targetMemberships
+        .filter((membership) => membership.status === "active")
+        .map((membership) =>
+          tenantService.notifyMemberAccessRevoked?.(membership.tenantId, target.id),
+        ),
+    );
     return c.json({ user: { id: updated.id, ...mapSuspension(updated) } });
   });
 
@@ -531,14 +576,23 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
       return c.json({ error: "至少保留一个平台管理员" }, 400);
     }
 
-    // 该用户独占（唯一 owner 且无其他成员）的团队一并删除，否则会留下无人可管的孤儿团队
-    const owned = await db
-      .select({ tenantId: tenantMemberships.tenantId })
+    const userMemberships = (await db
+      .select({
+        tenantId: tenantMemberships.tenantId,
+        role: tenantMemberships.role,
+        status: tenantMemberships.status,
+      })
       .from(tenantMemberships)
-      .where(and(eq(tenantMemberships.userId, id), eq(tenantMemberships.role, "owner")));
+      .where(eq(tenantMemberships.userId, id))) as Array<{
+      tenantId: string;
+      role: string;
+      status: string;
+    }>;
 
     const orphanTenantIds: string[] = [];
-    for (const row of owned as Array<{ tenantId: string }>) {
+    for (const row of userMemberships.filter(
+      (membership) => membership.role === "owner" && membership.status === "active",
+    )) {
       const [other] = await db
         .select({ n: count() })
         .from(tenantMemberships)
@@ -548,16 +602,33 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
             ne(tenantMemberships.userId, id),
           ),
         );
+      const [otherOwner] = await db
+        .select({ n: count() })
+        .from(tenantMemberships)
+        .where(
+          and(
+            eq(tenantMemberships.tenantId, row.tenantId),
+            eq(tenantMemberships.role, "owner"),
+            eq(tenantMemberships.status, "active"),
+            ne(tenantMemberships.userId, id),
+          ),
+        );
+      if (Number(otherOwner?.n ?? 0) > 0) continue;
       if (Number(other?.n ?? 0) === 0) orphanTenantIds.push(row.tenantId);
+      else return c.json({ error: "请先为团队指定另一位活跃 owner" }, 400);
     }
 
-    await db.delete(users).where(eq(users.id, id));
-    if (orphanTenantIds.length) {
-      await db
-        .delete(tenants)
-        .where(and(inArray(tenants.id, orphanTenantIds), eq(tenants.isDefault, false)));
-      for (const tid of orphanTenantIds) bumpTenant(tid);
+    for (const tenantId of orphanTenantIds) {
+      await deleteTenantAggregate(tenantId);
     }
+    await db.delete(users).where(eq(users.id, id));
+    const orphanSet = new Set(orphanTenantIds);
+    await Promise.all(
+      userMemberships
+        .filter((membership) => !orphanSet.has(membership.tenantId))
+        .map((membership) => tenantService.notifyMemberAccessRevoked?.(membership.tenantId, id)),
+    );
+    for (const tid of orphanTenantIds) bumpTenant(tid);
 
     bumpUser(id);
     return c.json({ ok: true, deletedTenants: orphanTenantIds.length });
@@ -781,6 +852,7 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
       .returning();
 
     bumpTenant(id);
+    await tenantService.notifyTenantSuspended?.(id);
     return c.json({ tenant: { id: updated.id, ...mapSuspension(updated) } });
   });
 
@@ -813,7 +885,7 @@ export function registerAdminResourceRoutes(app: SaasApp, deps: AdminRoutesDeps)
     if (tenant.id === session.tenantId) {
       return c.json({ error: "不能删除自己当前所在的团队" }, 400);
     }
-    await db.delete(tenants).where(eq(tenants.id, id));
+    await deleteTenantAggregate(id);
     bumpTenant(id);
     return c.json({ ok: true });
   });
