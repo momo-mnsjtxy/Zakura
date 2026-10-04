@@ -45,24 +45,18 @@ try {
   }
   await page.screenshot({ path: `${screenshots}/agents-dashboard.png`, fullPage: true });
 
-  const verifyPage = async (path) => {
+  const verifyPage = async (path, expectedHeading, expectedPath = path) => {
     const before = errors.length;
     const response = await page.goto(`${base}${path}`, { waitUntil: "domcontentloaded" });
     if (!response?.ok()) errors.push(`${path} navigation returned ${response?.status() ?? "no response"}`);
     try {
-      await page.waitForFunction(
-        () => {
-          const busy = document.querySelector('[role="progressbar"][aria-busy="true"]');
-          const main = document.querySelector("main");
-          return !busy && Boolean(main?.textContent?.trim());
-        },
-        undefined,
-        { timeout: 15_000 },
-      );
+      await page.locator("h1").filter({ hasText: expectedHeading }).first().waitFor({
+        state: "visible",
+        timeout: 15_000,
+      });
     } catch {
-      errors.push(`${path} did not finish rendering meaningful content`);
+      errors.push(`${path} did not render heading ${JSON.stringify(expectedHeading)}`);
     }
-    const expectedPath = path === "/dashboard/mcp" ? "/dashboard/agents" : path;
     if (new URL(page.url()).pathname !== expectedPath) {
       errors.push(`${path} unexpectedly navigated to ${new URL(page.url()).pathname}`);
     }
@@ -78,23 +72,23 @@ try {
 
   // Exercise the preserved frontend's highest-value platform/runtime callers,
   // rather than treating one successful dashboard navigation as compatibility.
-  for (const path of [
-    "/dashboard/settings/account",
-    "/dashboard/settings/team",
-    "/dashboard/settings/identity",
-    "/dashboard/settings/usage",
-    "/dashboard/settings/oauth-clients",
-    "/dashboard/keys",
-    "/dashboard/admin/users",
-    "/dashboard/admin/tenants",
-    "/dashboard/admin/runners",
-    "/dashboard/admin/auth",
-    "/dashboard/admin/platform",
-    "/dashboard/admin/agent-defaults",
-    "/dashboard/models",
-    "/dashboard/mcp",
-    "/dashboard/connections",
-  ]) await verifyPage(path);
+  for (const [path, heading, renderedPath] of [
+    ["/dashboard/settings/account", "账户"],
+    ["/dashboard/settings/team", "团队设置"],
+    ["/dashboard/settings/identity", "身份"],
+    ["/dashboard/settings/usage", "成员用量"],
+    ["/dashboard/settings/oauth-clients", "OAuth 客户端"],
+    ["/dashboard/keys", "API Keys"],
+    ["/dashboard/admin/users", "用户"],
+    ["/dashboard/admin/tenants", "团队"],
+    ["/dashboard/admin/runners", "共享 Runner"],
+    ["/dashboard/admin/auth", "登录与认证"],
+    ["/dashboard/admin/platform", "平台服务"],
+    ["/dashboard/admin/agent-defaults", "Agent 默认网页工具"],
+    ["/dashboard/models", "模型"],
+    ["/dashboard/mcp", "Agents", "/dashboard/agents"],
+    ["/dashboard/connections", "Agents", "/dashboard/agents"],
+  ]) await verifyPage(path, heading, renderedPath);
 
   const agent = await page.evaluate(async () => {
     const token = localStorage.getItem("zakura_session");
@@ -103,12 +97,12 @@ try {
     return Array.isArray(rows) ? rows[0] ?? null : null;
   });
   if (!agent?.id) throw new Error("onboarding did not leave a browser-visible default agent");
-  for (const path of [
-    `/dashboard/agents/${encodeURIComponent(agent.id)}/overview`,
-    `/dashboard/agents/${encodeURIComponent(agent.id)}/settings`,
-    `/dashboard/agents/${encodeURIComponent(agent.id)}/memory`,
-    `/dashboard/spaces/${encodeURIComponent(agent.spaceId)}/settings/gateway`,
-  ]) await verifyPage(path);
+  for (const [path, heading] of [
+    [`/dashboard/agents/${encodeURIComponent(agent.id)}/overview`, agent.name],
+    [`/dashboard/agents/${encodeURIComponent(agent.id)}/settings`, "设置"],
+    [`/dashboard/agents/${encodeURIComponent(agent.id)}/memory`, "记忆"],
+    [`/dashboard/spaces/${encodeURIComponent(agent.spaceId)}/settings/gateway`, "AI Gateway"],
+  ]) await verifyPage(path, heading);
 
   if (errors.length) throw new Error(errors.join("\n"));
   console.log("preserved frontend setup, onboarding, admin/settings, runtime, realtime and agent-detail flows passed");
