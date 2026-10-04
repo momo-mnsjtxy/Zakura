@@ -118,6 +118,7 @@ jobs:
       - run: cd .. && pnpm install --frozen-lockfile
       - run: cd .. && pnpm exec playwright install --with-deps chromium
       - run: go build -trimpath -o bin/zakura-server ./cmd/zakura-server
+      - run: cd .. && pnpm --filter @zakura/shared build
       - run: cd ../apps/web && ZAKURA_API_URL=http://127.0.0.1:8787 pnpm build
       - name: Browser contract
         env:

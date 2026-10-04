@@ -155,7 +155,39 @@ func ensureAdditiveCompatibility(ctx context.Context, db *sql.DB, dialect string
 		statements = append(statements, `UPDATE tenant_invites SET invited_by=invited_by_user_id WHERE invited_by IS NULL`)
 	}
 	if ok, _ := columnExists(ctx, db, dialect, rebind, "user_usage_events", "created_at"); ok {
-		statements = append(statements, `UPDATE user_usage_events SET occurred_at=created_at WHERE occurred_at IS NULL`, `UPDATE user_usage_events SET created_at=occurred_at WHERE created_at IS NULL`)
+		if dialect == "postgres" {
+			// A fresh native schema stores occurred_at as portable TEXT, while
+			// the additive compatibility column is TIMESTAMPTZ. A pinned
+			// Drizzle schema can have both as TIMESTAMPTZ. Cast to the actual
+			// target type because PostgreSQL does not implicitly coerce these
+			// types during UPDATE assignment.
+			occurredType, err := postgresColumnType(ctx, db, rebind, "user_usage_events", "occurred_at")
+			if err != nil {
+				return err
+			}
+			createdType, err := postgresColumnType(ctx, db, rebind, "user_usage_events", "created_at")
+			if err != nil {
+				return err
+			}
+			toOccurred := "created_at"
+			if occurredType == "text" {
+				toOccurred = "CAST(created_at AS TEXT)"
+			} else if strings.Contains(occurredType, "timestamp") {
+				toOccurred = "CAST(created_at AS TIMESTAMPTZ)"
+			}
+			toCreated := "occurred_at"
+			if createdType == "text" {
+				toCreated = "CAST(occurred_at AS TEXT)"
+			} else if strings.Contains(createdType, "timestamp") {
+				toCreated = "CAST(occurred_at AS TIMESTAMPTZ)"
+			}
+			statements = append(statements,
+				`UPDATE user_usage_events SET occurred_at=`+toOccurred+` WHERE occurred_at IS NULL`,
+				`UPDATE user_usage_events SET created_at=`+toCreated+` WHERE created_at IS NULL`,
+			)
+		} else {
+			statements = append(statements, `UPDATE user_usage_events SET occurred_at=created_at WHERE occurred_at IS NULL`, `UPDATE user_usage_events SET created_at=occurred_at WHERE created_at IS NULL`)
+		}
 	}
 	if ok, _ := tableExists(ctx, db, dialect, rebind, "user_sessions"); ok {
 		statements = append(statements, `CREATE UNIQUE INDEX IF NOT EXISTS user_sessions_token_hash_idx ON user_sessions(token_hash)`)
@@ -172,6 +204,12 @@ func ensureAdditiveCompatibility(ctx context.Context, db *sql.DB, dialect string
 		}
 	}
 	return nil
+}
+
+func postgresColumnType(ctx context.Context, db *sql.DB, rebind func(string) string, table, column string) (string, error) {
+	var dataType string
+	err := db.QueryRowContext(ctx, rebind(`SELECT data_type FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=? AND column_name=?`), table, column).Scan(&dataType)
+	return strings.ToLower(dataType), err
 }
 
 func relaxSQLiteLegacyComponents(ctx context.Context, db *sql.DB) error {
