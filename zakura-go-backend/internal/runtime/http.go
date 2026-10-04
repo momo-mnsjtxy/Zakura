@@ -1008,7 +1008,7 @@ func (h *handler) memoryOverview(w http.ResponseWriter, r *http.Request) {
 	rows.Close()
 	byLayer := map[string]int{}
 	var total, pinned int
-	statRows, e := h.deps.DB.QueryContext(r.Context(), h.store.q(`SELECT layer,COUNT(*),SUM(CASE WHEN pinned=TRUE THEN 1 ELSE 0 END) FROM memories WHERE tenant_id=? AND agent_id=? GROUP BY layer`), p.TenantID, agent.ID)
+	statRows, e := h.deps.DB.QueryContext(r.Context(), h.store.q(`SELECT layer,COUNT(*),SUM(CASE WHEN pinned<>0 THEN 1 ELSE 0 END) FROM memories WHERE tenant_id=? AND agent_id=? GROUP BY layer`), p.TenantID, agent.ID)
 	if e == nil {
 		for statRows.Next() {
 			var layer string

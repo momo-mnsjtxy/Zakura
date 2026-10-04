@@ -18,6 +18,18 @@ func (h *handler) patchMemory(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, 400, "invalid JSON")
 		return
 	}
+	if value, ok := m["pinned"]; ok {
+		pinned, valid := value.(bool)
+		if !valid {
+			httpx.Error(w, 400, "pinned must be a boolean")
+			return
+		}
+		if pinned {
+			m["pinned"] = 1
+		} else {
+			m["pinned"] = 0
+		}
+	}
 	sets := []string{}
 	args := []any{}
 	for k, col := range map[string]string{"content": "content", "layer": "layer", "pinned": "pinned", "importance": "importance", "tags": "tags_json", "metadata": "metadata_json"} {

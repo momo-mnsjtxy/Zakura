@@ -845,10 +845,12 @@ func (s *Store) ListMemories(ctx context.Context, tenant, agent, q, layer string
 	for rows.Next() {
 		var x Memory
 		var tags, meta string
+		var pinned int
 		var c, u flexibleTime
-		if e := rows.Scan(&x.ID, &x.AgentID, &x.ProviderID, &x.Layer, &x.Content, &tags, &x.Pinned, &x.Importance, &x.Source, &meta, &c, &u); e != nil {
+		if e := rows.Scan(&x.ID, &x.AgentID, &x.ProviderID, &x.Layer, &x.Content, &tags, &pinned, &x.Importance, &x.Source, &meta, &c, &u); e != nil {
 			return nil, e
 		}
+		x.Pinned = pinned != 0
 		x.Tags = json.RawMessage(tags)
 		x.Metadata = json.RawMessage(meta)
 		x.CreatedAt = c.Time
@@ -885,7 +887,11 @@ func (s *Store) CreateMemory(ctx context.Context, tenant, agent string, in Memor
 	in.AgentID = agent
 	in.CreatedAt = now
 	in.UpdatedAt = now
-	_, e := s.deps.DB.ExecContext(ctx, s.q(`INSERT INTO memories(id,tenant_id,agent_id,provider_id,layer,content,tags_json,pinned,importance,source,metadata_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`), in.ID, tenant, agent, in.ProviderID, in.Layer, in.Content, validJSON(in.Tags, "[]"), in.Pinned, in.Importance, in.Source, validJSON(in.Metadata, "{}"), now, now)
+	pinned := 0
+	if in.Pinned {
+		pinned = 1
+	}
+	_, e := s.deps.DB.ExecContext(ctx, s.q(`INSERT INTO memories(id,tenant_id,agent_id,provider_id,layer,content,tags_json,pinned,importance,source,metadata_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`), in.ID, tenant, agent, in.ProviderID, in.Layer, in.Content, validJSON(in.Tags, "[]"), pinned, in.Importance, in.Source, validJSON(in.Metadata, "{}"), now, now)
 	return in, e
 }
 func (s *Store) DeleteMemory(ctx context.Context, tenant, agent, id string) error {
