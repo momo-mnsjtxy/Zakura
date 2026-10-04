@@ -19,8 +19,10 @@ page.on("console", (message) => {
   }
 });
 page.on("response", (response) => {
-  if (response.url().includes("/api/") && response.status() >= 500) {
-    errors.push(`${response.status()} ${new URL(response.url()).pathname}`);
+  if (response.url().includes("/api/") && response.status() >= 400) {
+    const pathname = new URL(response.url()).pathname;
+    const expectedMissingAvatar = response.status() === 404 && /\/api\/users\/[^/]+\/avatar$/.test(pathname);
+    if (!expectedMissingAvatar) errors.push(`${response.status()} ${pathname}`);
   }
 });
 
@@ -47,10 +49,26 @@ try {
     const before = errors.length;
     const response = await page.goto(`${base}${path}`, { waitUntil: "domcontentloaded" });
     if (!response?.ok()) errors.push(`${path} navigation returned ${response?.status() ?? "no response"}`);
-    await page.waitForTimeout(1200);
+    try {
+      await page.waitForFunction(
+        () => {
+          const busy = document.querySelector('[role="progressbar"][aria-busy="true"]');
+          const main = document.querySelector("main");
+          return !busy && Boolean(main?.textContent?.trim());
+        },
+        undefined,
+        { timeout: 15_000 },
+      );
+    } catch {
+      errors.push(`${path} did not finish rendering meaningful content`);
+    }
+    const expectedPath = path === "/dashboard/mcp" ? "/dashboard/agents" : path;
+    if (new URL(page.url()).pathname !== expectedPath) {
+      errors.push(`${path} unexpectedly navigated to ${new URL(page.url()).pathname}`);
+    }
     const text = await page.locator("body").innerText();
     if (!text.trim()) errors.push(`${path} rendered an empty document`);
-    if (text.includes("Application error") || text.includes("环境准备失败") || text.includes("无法连接 API")) {
+    if (text.includes("Application error") || text.includes("环境准备失败") || text.includes("无法连接 API") || text.includes("加载失败") || text.includes("不存在或无权访问")) {
       errors.push(`${path} rendered the frontend error boundary`);
     }
     if (errors.length > before) throw new Error(errors.slice(before).join("\n"));
