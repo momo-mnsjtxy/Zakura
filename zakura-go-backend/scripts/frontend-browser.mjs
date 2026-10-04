@@ -19,7 +19,7 @@ try {
   await page.waitForURL("**/setup");
   await page.locator("#email").fill("browser-admin@example.test");
   await page.locator("#password").fill("browser-contract-password");
-  await page.locator("#name").fill("Browser Admin");
+  await page.locator("#adminName").fill("Browser Admin");
   await page.getByRole("button", { name: "开始使用" }).click();
   await page.waitForURL("**/onboarding");
   await page.getByText("开始使用", { exact: true }).waitFor();
