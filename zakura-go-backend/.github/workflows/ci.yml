@@ -66,18 +66,18 @@ jobs:
           containers=()
           cleanup() { for id in "${containers[@]}"; do docker rm -f "$id" >/dev/null 2>&1 || true; done; }
           trap cleanup EXIT
-          port=33100
           for item in "${images[@]}"; do
             image="${item%%|*}"
             command="${item#*|}"
-            id="$(docker run -d -p "${port}:3100" -e MCP_COMMAND="$command" "$image")"
+            id="$(docker run -d -p 127.0.0.1::3100 -e MCP_COMMAND="$command" "$image")"
             containers+=("$id")
+            port="$(docker port "$id" 3100/tcp | awk -F: 'NR == 1 { print $NF }')"
+            test -n "$port"
             for attempt in $(seq 1 30); do
               if curl --fail --silent "http://127.0.0.1:${port}/health" | grep -q '"ok":true'; then break; fi
               if [ "$attempt" = 30 ]; then docker logs "$id"; exit 1; fi
               sleep 1
             done
-            port=$((port + 1))
           done
 
   preserved-frontend:
