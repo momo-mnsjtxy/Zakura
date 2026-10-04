@@ -149,3 +149,9 @@ jobs:
             /tmp/zakura-server.log
             /tmp/zakura-web.log
           if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: go-backend-browser-screenshots
+          path: zakura-go-backend/artifacts/go-backend-browser
+          if-no-files-found: error

@@ -1,9 +1,12 @@
 import { chromium } from "@playwright/test";
+import { mkdir } from "node:fs/promises";
 
 const base = process.argv[2] ?? "http://127.0.0.1:3001";
 const browser = await chromium.launch({ headless: true });
 const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
 const errors = [];
+const screenshots = "artifacts/go-backend-browser";
+await mkdir(screenshots, { recursive: true });
 page.on("pageerror", (error) => errors.push(`pageerror: ${error.message}`));
 page.on("console", (message) => {
   const text = message.text();
@@ -38,6 +41,7 @@ try {
   if (body.includes("Application error") || body.includes("环境准备失败") || body.includes("无法连接 API")) {
     errors.push("frontend error boundary rendered");
   }
+  await page.screenshot({ path: `${screenshots}/agents-dashboard.png`, fullPage: true });
 
   const verifyPage = async (path) => {
     const before = errors.length;
@@ -50,6 +54,8 @@ try {
       errors.push(`${path} rendered the frontend error boundary`);
     }
     if (errors.length > before) throw new Error(errors.slice(before).join("\n"));
+    const file = path.replace(/^\//, "").replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-|-$/g, "");
+    await page.screenshot({ path: `${screenshots}/${file}.png`, fullPage: true });
   };
 
   // Exercise the preserved frontend's highest-value platform/runtime callers,
