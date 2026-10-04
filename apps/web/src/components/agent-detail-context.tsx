@@ -52,9 +52,12 @@ export function AgentDetailProvider({
           fetchAgent(id),
           withList ? fetchAgents() : Promise.resolve(null),
         ]);
-        if (!loadGate.current.isCurrent(requestId)) return null;
-        setAgent(detail);
-        if (rows) setList(rows);
+        // Concurrent child-page refreshes still need the fetched detail even
+        // when a newer provider refresh owns the shared context state.
+        if (loadGate.current.isCurrent(requestId)) {
+          setAgent(detail);
+          if (rows) setList(rows);
+        }
         return detail;
       } catch (err) {
         toast.error(err instanceof Error ? err.message : String(err));
