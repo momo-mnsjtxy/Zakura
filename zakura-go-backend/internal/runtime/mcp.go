@@ -56,11 +56,40 @@ func (h *handler) protectMCPConfig(id string, raw json.RawMessage) (string, stri
 	return string(configRaw), string(stored), nil
 }
 
+func (h *handler) componentInstanceColumnExists(ctx context.Context, column string) bool {
+	if h.deps.Dialect == "postgres" {
+		var exists bool
+		err := h.deps.DB.QueryRowContext(ctx, h.store.q(`SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema=current_schema() AND table_name=? AND column_name=?
+		)`), "component_instances", column).Scan(&exists)
+		return err == nil && exists
+	}
+
+	rows, err := h.deps.DB.QueryContext(ctx, `PRAGMA table_info(component_instances)`)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey) == nil && name == column {
+			return true
+		}
+	}
+	return false
+}
+
 // migrateLegacyComponentConfigs converts the pinned Drizzle config_enc payload
-// into the native split representation.  The compatibility columns do not
-// exist on fresh databases, so an undefined-column error simply means there is
-// nothing to migrate.  Failed decryptions are deliberately left untouched.
+// into the native split representation. The compatibility column does not
+// exist on fresh databases, so inspect schema metadata before preparing any
+// statement that references it. Failed decryptions are deliberately untouched.
 func (h *handler) migrateLegacyComponentConfigs(ctx context.Context) {
+	if !h.componentInstanceColumnExists(ctx, "config_enc") {
+		return
+	}
 	rows, err := h.deps.DB.QueryContext(ctx, h.store.q(`SELECT id,config_enc FROM component_instances WHERE config_enc IS NOT NULL AND config_enc<>'' AND (config_json IS NULL OR config_json='{}')`))
 	if err != nil {
 		return

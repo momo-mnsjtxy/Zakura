@@ -48,6 +48,29 @@ func TestLegacyComponentConfigIsDecryptedAndSplit(t *testing.T) {
 	}
 }
 
+func TestLegacyComponentMigrationSkipsFreshSchema(t *testing.T) {
+	d := testDeps(t)
+	seedTenant(t, d, "tenant")
+	h := &handler{deps: d, store: NewStore(d)}
+	if h.componentInstanceColumnExists(context.Background(), "config_enc") {
+		t.Fatal("fresh component_instances unexpectedly has legacy config_enc column")
+	}
+
+	now := d.Clock()
+	_, err := d.DB.Exec(`INSERT INTO component_instances(id,tenant_id,agent_id,component_type,component_ref,name,config_json,secret_json,status,last_error,created_at,updated_at) VALUES('native','tenant',NULL,'mcp','generic','Native','{}','{}','ready',NULL,?,?)`, now, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.migrateLegacyComponentConfigs(context.Background())
+	var configRaw, secretRaw string
+	if err := d.DB.QueryRow(`SELECT config_json,secret_json FROM component_instances WHERE id='native'`).Scan(&configRaw, &secretRaw); err != nil {
+		t.Fatal(err)
+	}
+	if configRaw != "{}" || secretRaw != "{}" {
+		t.Fatalf("fresh component changed during legacy migration: config=%s secret=%s", configRaw, secretRaw)
+	}
+}
+
 func containsAll(value string, needles ...string) bool {
 	for _, needle := range needles {
 		if !strings.Contains(value, needle) {
