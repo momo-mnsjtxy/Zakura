@@ -266,6 +266,13 @@ func (h *handler) agentMCPCatalogTools(ctx context.Context, tenant, agentID, spa
 }
 
 func (h *handler) agentToolCatalog(ctx context.Context, tenant, agentID string) (catalog agentCatalog, err error) {
+	sandbox, policyErr := h.agentSandboxRequired(ctx, tenant, agentID)
+	if policyErr != nil {
+		return agentCatalog{}, policyErr
+	}
+	if sandbox {
+		return sandboxAgentCatalog(), nil
+	}
 	agent, err := h.store.GetAgent(ctx, tenant, agentID)
 	if err != nil {
 		return agentCatalog{}, err
@@ -308,9 +315,10 @@ func (h *handler) agentToolCatalog(ctx context.Context, tenant, agentID string) 
 				"path":    map[string]any{"type": "string"},
 				"content": map[string]any{"type": "string"},
 			}, "path", "content"),
-			directBuiltin("shell_exec", "Run a shell command in the workspace environment.", map[string]any{
-				"command":    map[string]any{"type": "string", "description": "Shell command to run in the workspace."},
-				"timeout_ms": map[string]any{"type": "integer", "description": "Deadline in ms. Default 60000, max 300000."},
+			directBuiltin("shell_exec", "Run a shell command. Host mode is UNSANDBOXED. Sandbox mode uses a restricted, read-only workspace with no network and requires a configured runner.", map[string]any{
+				"command":        map[string]any{"type": "string", "description": "Shell command to run in the workspace."},
+				"execution_mode": map[string]any{"type": "string", "enum": []string{"host", "sandbox"}, "description": "Explicitly select sandbox isolation or legacy UNSANDBOXED host execution. Runner enforcement cannot be disabled by this setting."},
+				"timeout_ms":     map[string]any{"type": "integer", "description": "Deadline in ms. Default 60000, max 300000."},
 			}, "command"),
 			directBuiltin("codemode", "Run JavaScript that calls the agent's other tools. The script runs as the body of an async function (top-level await and return allowed) inside the workspace. Call tools as async functions on the tools object, e.g. const r = await tools.mcp__github__search_issues({query: \"x\"}). Use text(value) to append output; return a value to finish. Compose calls and filter results so only what you need comes back.", map[string]any{
 				"code":       map[string]any{"type": "string", "description": "JavaScript source."},
@@ -474,6 +482,13 @@ type cachedCatalog struct {
 }
 
 func (h *handler) cachedAgentToolCatalog(ctx context.Context, tenant, agentID string) (agentCatalog, error) {
+	sandbox, policyErr := h.agentSandboxRequired(ctx, tenant, agentID)
+	if policyErr != nil {
+		return agentCatalog{}, policyErr
+	}
+	if sandbox {
+		return sandboxAgentCatalog(), nil
+	}
 	key := tenant + "/" + agentID
 	h.agentToolMu.Lock()
 	if h.agentToolCache != nil {
