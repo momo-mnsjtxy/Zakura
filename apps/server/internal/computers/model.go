@@ -1,0 +1,234 @@
+// Package computers defines execution identities independently of Space identity.
+// Provider implementations must never resolve an unavailable target to another host.
+package computers
+
+import (
+	"errors"
+	"fmt"
+	"time"
+)
+
+type Provider string
+
+const (
+	Server      Provider = "server"
+	RemoteAgent Provider = "remote_agent"
+	SSH         Provider = "ssh"
+	Temporary   Provider = "temporary"
+	E2B         Provider = "e2b"
+	Railway     Provider = "railway"
+)
+
+type Capability string
+
+const (
+	Commands           Capability = "commands"
+	Files              Capability = "files"
+	PTY                Capability = "pty"
+	Browser            Capability = "browser"
+	Desktop            Capability = "desktop"
+	Docker             Capability = "docker"
+	RestrictedCommands Capability = "restricted_commands"
+)
+
+// Role separates a Space's own computer from the computers attached to it.
+// Exactly one RoleServer computer exists per Space (a partial unique index
+// enforces it). It IS the Space workspace: its runtime node, workspace kind and
+// capabilities are read from the Space row, never from a stale copy, and it has
+// no computer_runtimes rows because the workspace lifecycle owns its container.
+type Role string
+
+const (
+	RoleServer   Role = "server"
+	RoleAttached Role = "attached"
+)
+
+type Computer struct {
+	ID                 string       `json:"id"`
+	TenantID           string       `json:"-"`
+	SpaceID            string       `json:"spaceId"`
+	Name               string       `json:"name"`
+	Provider           Provider     `json:"provider"`
+	Role               Role         `json:"role"`
+	RuntimeNodeID      string       `json:"runtimeNodeId,omitempty"`
+	SecretRef          string       `json:"-"`
+	Capabilities       []Capability `json:"capabilities"`
+	IdleSeconds        int          `json:"idleSeconds"`
+	MaxLifetimeSeconds int          `json:"maxLifetimeSeconds"`
+	// WorkspaceKind is the server computer's workspace transport: "container",
+	// "host", or "local" when the Space has no runtime node. Attached computers
+	// leave it empty.
+	WorkspaceKind string `json:"workspaceKind,omitempty"`
+}
+
+func (c Computer) Has(cap Capability) bool {
+	for _, v := range c.Capabilities {
+		if v == cap {
+			return true
+		}
+	}
+	return false
+}
+
+// IsServer reports whether c is its Space's server computer (the workspace).
+func (c Computer) IsServer() bool { return c.Role == RoleServer }
+
+// SupportsACP reports whether ACP adapters may run on c. The server computer
+// hosts them through its workspace once the Space has a runtime node; an
+// attached server-provider computer needs Docker for its sidecar container.
+func (c Computer) SupportsACP() bool {
+	if c.IsServer() {
+		return c.RuntimeNodeID != ""
+	}
+	return c.Provider == Server && c.RuntimeNodeID != "" && c.Has(Docker)
+}
+func (c Computer) SessionScoped() bool { return c.Provider == Temporary || c.Provider == E2B }
+func (c Computer) Scope(sessionID string) (string, error) {
+	if !c.SessionScoped() {
+		return "", nil
+	}
+	if sessionID == "" {
+		return "", errors.New("temporary computer requires a session")
+	}
+	return sessionID, nil
+}
+func (c Computer) Validate() error {
+	if c.ID == "" || c.TenantID == "" || c.SpaceID == "" || c.Name == "" {
+		return errors.New("computer identity is incomplete")
+	}
+	switch c.Role {
+	case RoleServer:
+		if c.Provider != Server {
+			return errors.New("a space server computer must use the server provider")
+		}
+	case "", RoleAttached:
+	default:
+		return errors.New("unsupported computer role")
+	}
+	switch c.Provider {
+	case Server, RemoteAgent:
+		// The server computer follows its Space, which may not have a node yet.
+		if c.RuntimeNodeID == "" && !c.IsServer() {
+			return errors.New("agent computer requires a runtime node")
+		}
+	case Temporary, E2B, SSH, Railway:
+	default:
+		return errors.New("unsupported computer provider")
+	}
+	if c.IdleSeconds <= 0 || c.MaxLifetimeSeconds < c.IdleSeconds {
+		return errors.New("invalid computer lifetime policy")
+	}
+	return nil
+}
+
+type State string
+
+const (
+	PendingApproval State = "pending_approval"
+	Creating        State = "creating"
+	Ready           State = "ready"
+	Disconnected    State = "disconnected"
+	Stopping        State = "stopping"
+	Expired         State = "expired"
+	Destroyed       State = "destroyed"
+	Failed          State = "failed"
+	Unknown         State = "unknown"
+)
+
+// Unknown retains the active slot: an ambiguous create/delete response is NOT
+// permission to retry provisioning. Reconcile using CreateOperationID first.
+func CanTransition(from, to State) bool {
+	switch from {
+	case PendingApproval:
+		return to == Creating || to == Failed
+	case Creating:
+		return to == Ready || to == Failed || to == Unknown
+	case Ready:
+		return to == Disconnected || to == Stopping || to == Expired || to == Unknown
+	case Disconnected:
+		return to == Ready || to == Stopping || to == Expired || to == Unknown
+	case Stopping:
+		return to == Destroyed || to == Expired || to == Unknown
+	case Unknown:
+		return to == Ready || to == Disconnected || to == Stopping || to == Destroyed || to == Expired || to == Failed
+	default:
+		return false
+	}
+}
+
+type Runtime struct {
+	ID                string
+	ComputerID        string
+	TenantID          string
+	SpaceID           string
+	SessionScope      string
+	Incarnation       string
+	CreateOperationID string
+	ExternalID        string
+	// RootPath is the computer's workspace root on its runtime node (server
+	// provider only). Empty for providers without a node-hosted directory.
+	RootPath string
+	// AccessTokenEnc is provider-issued access material (E2B envd token) as a
+	// sealed computer-v1 envelope bound to the computer identity as AAD. Empty
+	// when the provider issues none; it is an internal field, never JSON-exposed.
+	AccessTokenEnc string
+	// ManifestJSON is the provider-issued manifest (Railway box identity, preview
+	// URL, claim link, deadline) kept verbatim for display. Empty or "{}" when the
+	// provider issued none. It never drives execution.
+	ManifestJSON string
+	State        State
+	ExpiresAt    time.Time
+	IdleDeadline time.Time
+}
+
+type Target struct {
+	TenantID    string `json:"-"`
+	SpaceID     string `json:"spaceId"`
+	ComputerID  string `json:"computerId"`
+	RuntimeID   string `json:"runtimeId"`
+	Incarnation string `json:"incarnation"`
+}
+
+// CheckIdentity validates a pinned target even after disconnection or expiration.
+// Follow-up job reads/cancellation must use the persisted target, never a new default.
+// This is not execution authorization: callers must also check membership and job ownership.
+func CheckIdentity(t Target, c Computer, r Runtime, sessionID string) error {
+	if t.TenantID == "" || t.SpaceID == "" || t.ComputerID == "" || t.RuntimeID == "" || t.Incarnation == "" {
+		return errors.New("execution target is incomplete")
+	}
+	if t.TenantID != c.TenantID || t.SpaceID != c.SpaceID || t.ComputerID != c.ID ||
+		t.TenantID != r.TenantID || t.SpaceID != r.SpaceID || t.ComputerID != r.ComputerID || t.RuntimeID != r.ID || t.Incarnation != r.Incarnation {
+		return errors.New("execution target mismatch")
+	}
+	scope, err := c.Scope(sessionID)
+	if err != nil {
+		return err
+	}
+	if scope != r.SessionScope {
+		return errors.New("runtime belongs to a different session")
+	}
+	return nil
+}
+
+// CheckTarget additionally gates new execution, including files and PTY access.
+func CheckTarget(t Target, c Computer, r Runtime, sessionID string, cap Capability, restricted bool, now time.Time) error {
+	if err := CheckIdentity(t, c, r, sessionID); err != nil {
+		return err
+	}
+	if r.State != Ready {
+		return fmt.Errorf("computer runtime is %s", r.State)
+	}
+	if c.SessionScoped() && (r.ExpiresAt.IsZero() || r.IdleDeadline.IsZero() || r.IdleDeadline.After(r.ExpiresAt)) {
+		return errors.New("temporary runtime has invalid lifetime")
+	}
+	if (!r.ExpiresAt.IsZero() && !now.Before(r.ExpiresAt)) || (!r.IdleDeadline.IsZero() && !now.Before(r.IdleDeadline)) {
+		return errors.New("computer runtime expired")
+	}
+	if !c.Has(cap) {
+		return fmt.Errorf("computer does not support %s", cap)
+	}
+	if restricted && (cap != Commands || !c.Has(RestrictedCommands) || (c.Provider != Server && c.Provider != RemoteAgent)) {
+		return errors.New("computer cannot enforce restricted execution")
+	}
+	return nil
+}

@@ -1,0 +1,21 @@
+# Zakura — 本地源码构建 overlay（与 docker-compose.yml 配合使用）：
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: docker/server/Dockerfile
+    image: ${ZAKURA_SERVER_IMAGE:-sunwuyuan/zakura-server:latest}
+
+  node:
+    build:
+      context: .
+      dockerfile: docker/agent/Dockerfile
+    image: ${ZAKURA_NODE_IMAGE:-sunwuyuan/zakura-agent:latest}
+
+  web:
+    build:
+      context: .
+      dockerfile: docker/web/Dockerfile
+    image: ${ZAKURA_WEB_IMAGE:-sunwuyuan/zakura-web:latest}

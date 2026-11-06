@@ -23,7 +23,7 @@ import (
 
 type loginProviderDef struct{ Name, AuthorizeURL, TokenURL, UserinfoURL, Scope string }
 
-var loginProviders = map[string]loginProviderDef{"google": {"Google", "https://accounts.google.com/o/oauth2/v2/auth", "https://oauth2.googleapis.com/token", "https://openidconnect.googleapis.com/v1/userinfo", "openid email profile"}, "github": {"GitHub", "https://github.com/login/oauth/authorize", "https://github.com/login/oauth/access_token", "https://api.github.com/user", "read:user user:email"}, "microsoft": {"Microsoft", "https://login.microsoftonline.com/common/oauth2/v2.0/authorize", "https://login.microsoftonline.com/common/oauth2/v2.0/token", "https://graph.microsoft.com/v1.0/me", "openid profile email User.Read"}, "zerocat": {"ZeroCat", "https://api.zcservice.houlang.cloud/oauth/authorize", "https://api.zcservice.houlang.cloud/oauth/token", "https://api.zcservice.houlang.cloud/oauth/userinfo", "user:read"}}
+var loginProviders = map[string]loginProviderDef{"google": {"Google", "https://accounts.google.com/o/oauth2/v2/auth", "https://oauth2.googleapis.com/token", "https://openidconnect.googleapis.com/userinfo", "openid email profile"}, "github": {"GitHub", "https://github.com/login/oauth/authorize", "https://github.com/login/oauth/access_token", "https://api.github.com/user", "read:user user:email"}, "microsoft": {"Microsoft", "https://login.microsoftonline.com/common/oauth2/v2.0/authorize", "https://login.microsoftonline.com/common/oauth2/v2.0/token", "https://graph.microsoft.com/v1.0/me", "openid profile email User.Read"}, "zerocat": {"ZeroCat", "https://api.zcservice.houlang.cloud/oauth/authorize", "https://api.zcservice.houlang.cloud/oauth/token", "https://api.zcservice.houlang.cloud/oauth/userinfo", "user:read"}}
 
 type loginProviderConfig struct {
 	Enabled           bool   `json:"enabled"`
@@ -240,7 +240,7 @@ func normalizeSocialProfile(provider string, profile map[string]any) (subject, e
 			email = safe + "@zerocat.oauth"
 		}
 		verified, _ = profile["email_verified"].(bool)
-		verified = verified && !strings.HasSuffix(email, "@zerocat.oauth")
+		verified = verified && !isSyntheticEmail(email)
 		name = firstText(stringAny(profile["nickname"]), username, strings.Split(email, "@")[0], "ZeroCat User")
 	case "google":
 		subject = strings.TrimSpace(stringAny(profile["sub"]))
@@ -318,7 +318,7 @@ func (s *Service) linkSocialIdentity(ctx context.Context, provider, subject, ema
 	var identity models.OauthIdentity
 	err := s.gdb(ctx).Select("user_id").Where("provider = ? AND provider_user_id = ?", provider, subject).Take(&identity).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		if verified {
+		if !isSyntheticEmail(email) {
 			var existing models.User
 			if s.gdb(ctx).Select("id").Where("email = ?", email).Take(&existing).Error == nil {
 				uid = derefString(existing.ID)
@@ -385,35 +385,24 @@ func (s *Service) linkSocialIdentity(ctx context.Context, provider, subject, ema
 	return u, t, role, nil
 }
 func (s *Service) socialAuthResult(ctx context.Context, u User, t Tenant, role, ip, ua string) (map[string]any, error) {
-	var totpUser models.User
-	var policyTenant models.Tenant
-	var passkeys int64
-	_ = s.gdb(ctx).Select("totp_enabled_at").Where("id = ?", u.ID).Take(&totpUser).Error
-	_ = s.gdb(ctx).Model(&models.UserWebauthnCredential{}).Where("user_id = ?", u.ID).Count(&passkeys).Error
-	_ = s.gdb(ctx).Select("mfa_policy").Where("id = ?", t.ID).Take(&policyTenant).Error
-	totpEnabled := totpUser.TotpEnabledAt != nil
-	policy := policyTenant.MfaPolicy
-	methods := []string{}
-	if totpEnabled {
-		methods = append(methods, "totp", "recovery")
+	methods, mfaEnabled, required, err := s.mfaDecision(ctx, u.ID, role)
+	if err != nil {
+		return nil, err
 	}
-	if passkeys > 0 {
-		methods = append(methods, "webauthn")
-	}
-	required := policy == "all" || (policy == "admins" && (role == "owner" || role == "admin"))
+	next := map[bool]string{true: "/chat", false: "/onboarding"}[t.OnboardingCompleted]
 	if required && len(methods) == 0 {
 		ticket, e := s.issueAuthToken(ctx, "mfa_enrollment", u.ID, map[string]any{"tenantId": t.ID, "role": role})
 		return map[string]any{"mfaEnrollmentRequired": true, "mfaEnrollmentTicket": ticket, "methods": []string{"totp"}, "code": "mfa_enrollment_required"}, e
 	}
-	if len(methods) > 0 {
+	if (required || mfaEnabled) && len(methods) > 0 {
 		ticket, e := s.issueAuthToken(ctx, "mfa_login", u.ID, map[string]any{"tenantId": t.ID, "role": role})
-		return map[string]any{"mfaRequired": true, "mfaTicket": ticket, "methods": methods, "user": u, "tenant": t, "next": map[bool]string{true: "/dashboard/agents", false: "/onboarding"}[t.OnboardingCompleted]}, e
+		return map[string]any{"mfaRequired": true, "mfaTicket": ticket, "methods": methods, "user": u, "tenant": t, "next": next}, e
 	}
 	token, e := s.issueSession(ctx, u, t, role, ip, ua)
 	if e == nil {
 		s.recordLoginUsage(ctx, t.ID, u.ID, "oauth")
 	}
-	return map[string]any{"session": token, "user": u, "tenant": t, "next": map[bool]string{true: "/dashboard/agents", false: "/onboarding"}[t.OnboardingCompleted]}, e
+	return map[string]any{"session": token, "user": u, "tenant": t, "next": next}, e
 }
 func stringAny(v any) string {
 	switch x := v.(type) {
@@ -433,4 +422,7 @@ func firstText(values ...string) string {
 		}
 	}
 	return ""
+}
+func isSyntheticEmail(email string) bool {
+	return strings.HasSuffix(strings.ToLower(strings.TrimSpace(email)), ".oauth")
 }

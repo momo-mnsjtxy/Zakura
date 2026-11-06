@@ -39,7 +39,9 @@ const KIND_LABELS: Record<AuthKind, string> = {
 /** SaaS 平台管理员：管理命名认证档案，并向引用它的连接器提供整站配置。 */
 export function PlatformConnectorProvisionPanel() {
   const [profiles, setProfiles] = useState<Profile[]>([]);
-  const [redirectUri, setRedirectUri] = useState("");
+  const [redirectUri] = useState(() =>
+    typeof window === "undefined" ? "" : window.location.origin + "/console/connectors/oauth/callback",
+  );
   const [loading, setLoading] = useState(true);
   const [q, setQ] = useState("");
   const [openKey, setOpenKey] = useState<string | null>(null);
@@ -54,12 +56,15 @@ export function PlatformConnectorProvisionPanel() {
   const load = useCallback(async (selectKey?: string) => {
     setLoading(true);
     try {
-      const [profileRes, connectorRes] = await Promise.all([
-        api<{ profiles: Profile[] }>("/api/connectors/profiles?scope=platform"),
-        api<{ redirectUri: string }>("/api/connectors?scope=platform"),
-      ]);
-      setProfiles(profileRes.profiles);
-      setRedirectUri(connectorRes.redirectUri);
+      const profileRes = await api<{ profiles?: Array<Profile & { profileKey?: string }> }>(
+        "/api/connectors/profiles?scope=platform",
+      );
+      setProfiles(
+        (profileRes.profiles ?? []).map((p) => ({
+          ...p,
+          key: (p as { profileKey?: string }).profileKey ?? p.key,
+        })),
+      );
       if (selectKey) setOpenKey(selectKey);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
@@ -98,7 +103,7 @@ export function PlatformConnectorProvisionPanel() {
     try {
       await api(`/api/connectors/profiles/${encodeURIComponent(key)}?scope=platform`, {
         method: "PUT",
-        json: { kind: newKind, label: newLabel.trim() || key, enabled: false, values: {} },
+        json: { kind: newKind, label: newLabel.trim() || key, enabled: false, config: {} },
       });
       setNewKey("");
       setNewLabel("");
@@ -115,15 +120,13 @@ export function PlatformConnectorProvisionPanel() {
     if (!selected) return;
     setSaving(true);
     try {
-      const result = await api<{ profile: Profile }>(
+      await api(
         `/api/connectors/profiles/${encodeURIComponent(selected.key)}?scope=platform`,
-        { method: "PUT", json: { enabled, values: draft } },
-      );
-      setProfiles((current) =>
-        current.map((profile) => (profile.key === selected.key ? result.profile : profile)),
+        { method: "PUT", json: { kind: selected.kind, label: selected.label, enabled, config: draft } },
       );
       setDraft({});
       toast.success(`${selected.label} 已保存`);
+      await load(selected.key);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {

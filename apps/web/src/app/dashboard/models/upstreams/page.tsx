@@ -133,7 +133,7 @@ export default function ModelUpstreamsPage() {
   const protocolItems = useMemo(() => {
     const items = protocols.map((p) => ({
       value: p.protocol,
-      label: p.group === "agent" ? `订阅 · ${p.name}` : p.name,
+      label: p.protocol === "typesafe" ? "Jev" : p.group === "agent" ? `订阅 · ${p.name}` : p.name,
       keywords: [...(p.keywords ?? []), ...(p.group === "agent" ? ["agent", "订阅"] : [])],
       group: p.group,
     }));
@@ -184,6 +184,12 @@ export default function ModelUpstreamsPage() {
 
   useEffect(() => {
     void load();
+    if (new URLSearchParams(window.location.search).get("provider") === "typesafe") {
+      setProtocol("typesafe");
+      setName("Jev");
+      setBaseUrl(defaultBaseUrlFor("typesafe"));
+      setOpen(true);
+    }
   }, [load]);
 
   function resetForm(u?: Upstream | null) {
@@ -211,6 +217,9 @@ export default function ModelUpstreamsPage() {
 
   function openCreate() {
     resetForm(null);
+    if (new URLSearchParams(window.location.search).get("provider") === "typesafe") {
+      setProtocol("typesafe"); setName("Jev"); setBaseUrl(defaultBaseUrlFor("typesafe"));
+    }
     setOpen(true);
   }
 
@@ -271,9 +280,9 @@ export default function ModelUpstreamsPage() {
         if (modelCheck?.status === "unhealthy") {
           toast.error(`上游检查失败：${modelCheck.message ?? "无法获取模型列表"}`);
         } else if (modelCheck?.status === "empty") {
-          toast.warning("上游当前没有返回可用模型，旧模型已移除");
+          toast.warning("上游连接正常，但没有返回可用模型");
         } else if (modelCheck && modelCheck.removed > 0) {
-          toast.message(modelCheck.message ?? "已移除不再提供的模型");
+          toast.message(modelCheck.message ?? "上游不再提供的模型已保留，可手动删除");
         }
         await load();
         const refreshed = await api<Upstream>(`/api/model-upstreams/${edit.id}`);
@@ -423,7 +432,7 @@ export default function ModelUpstreamsPage() {
                 <div className="text-[11px] text-muted-foreground">{u.slug}</div>
               </TableCell>
               <TableCell>
-                <Badge variant="outline">{u.meta?.name ?? u.protocol}</Badge>
+                <Badge variant="outline">{u.protocol === "typesafe" ? "Jev" : u.meta?.name ?? u.protocol}</Badge>
               </TableCell>
               <TableCell className="max-w-xs truncate text-sm">
                 {String(u.resolvedConfig?.baseUrl ?? u.config.baseUrl ?? "—")}
@@ -512,6 +521,7 @@ export default function ModelUpstreamsPage() {
                       onValueChange={(v) => {
                         if (!v) return;
                         setProtocol(v);
+                        if (v === "typesafe" && !name.trim()) setName("Jev");
                         setBaseUrl(defaultBaseUrlFor(v, region));
                       }}
                       placeholder="选择提供商"
@@ -523,7 +533,7 @@ export default function ModelUpstreamsPage() {
                 <div>
                   <Label>类型</Label>
                   <p className="mt-1 text-sm text-muted-foreground">
-                    {edit.meta?.name ?? edit.protocol}
+                    {edit.protocol === "typesafe" ? "Jev" : edit.meta?.name ?? edit.protocol}
                   </p>
                 </div>
               )}
@@ -575,7 +585,7 @@ export default function ModelUpstreamsPage() {
                     type="password"
                     value={apiKey}
                     onChange={(e) => setApiKey(e.target.value)}
-                    placeholder={edit ? "留空则保持原值" : undefined}
+                    placeholder={edit?.config.hasApiKey ? "已配置；留空保持不变" : edit ? "留空则保持原值" : undefined}
                   />
                 </div>
               ) : null}
@@ -650,7 +660,7 @@ export default function ModelUpstreamsPage() {
 
             {edit ? (
               <div className="space-y-3 border-t border-border pt-4">
-                <UpstreamModelSetup upstreamId={edit.id} syncKey={syncKey} />
+                <UpstreamModelSetup upstreamId={edit.id} protocol={edit.protocol} syncKey={syncKey} />
               </div>
             ) : null}
           </div>

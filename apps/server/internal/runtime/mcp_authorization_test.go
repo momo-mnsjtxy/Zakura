@@ -93,16 +93,32 @@ func TestMCPSpaceAuthorizationAndScopes(t *testing.T) {
 			t.Fatalf("space-scoped tools (%+v): %d %#v", p, code, listed)
 		}
 		tools := listed["result"].(map[string]any)["tools"].([]any)
-		if len(tools) != 2 {
-			t.Fatalf("space tool count (%+v): %d %#v", p, code, listed)
+		names := map[string]bool{}
+		for _, raw := range tools {
+			names[raw.(map[string]any)["name"].(string)] = true
+		}
+		if !names["tool_search"] || !names["tool_execute"] || !names["list_computers"] || !names["read_skill"] {
+			t.Fatalf("compact tool entry points missing (%+v): %#v", p, tools)
+		}
+		code, legacy := call(p, "/mcp/spaces/"+space.Slug, "tools/call", "re_alpha-tools__echo")
+		if code != http.StatusOK || legacy["error"] != nil {
+			t.Fatalf("legacy re_ tool call (%+v): %d %#v", p, code, legacy)
+		}
+		code, bare := call(p, "/mcp/spaces/"+space.Slug, "tools/call", "alpha-tools__echo")
+		if code != http.StatusOK || bare["error"] != nil {
+			t.Fatalf("bare tool call (%+v): %d %#v", p, code, bare)
 		}
 		code, aliasListed := call(p, "/mcp/agents/"+a.Slug, "tools/list", "")
 		if code != http.StatusOK {
 			t.Fatalf("agent alias tools (%+v): %d %#v", p, code, aliasListed)
 		}
 		aliasTools := aliasListed["result"].(map[string]any)["tools"].([]any)
-		if len(aliasTools) != 2 {
-			t.Fatalf("agent alias tool count (%+v): %#v", p, aliasListed)
+		aliasNames := map[string]bool{}
+		for _, tool := range aliasTools {
+			aliasNames[tool.(map[string]any)["name"].(string)] = true
+		}
+		if !aliasNames["tool_search"] || !aliasNames["tool_execute"] || !aliasNames["list_computers"] || !aliasNames["read_skill"] {
+			t.Fatalf("agent alias native tools missing (%+v): %#v", p, aliasListed)
 		}
 		code, denied := call(p, "/mcp/spaces/"+space.Slug, "tools/call", "inst-x:echo")
 		if code != http.StatusOK || denied["error"] == nil {
@@ -129,6 +145,10 @@ func TestGatewayRequiresBoundScopedAPIKey(t *testing.T) {
 	seedTenant(t, d, "tenant")
 	h := &handler{deps: d, store: NewStore(d)}
 	h.service = NewService(h.store)
+	space, err := h.store.CreateSpace(context.Background(), "tenant", Space{Name: "Gateway", WorkspaceKind: "local"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	request := func(p httpx.Principal) (int, map[string]any) {
 		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 		req = req.WithContext(httpx.WithPrincipal(req.Context(), p))
@@ -147,7 +167,7 @@ func TestGatewayRequiresBoundScopedAPIKey(t *testing.T) {
 			t.Fatalf("gateway principal should be denied (%+v): %d %#v", principal, code, body)
 		}
 	}
-	if code, body := request(httpx.Principal{TenantID: "tenant", APIKey: true, AgentID: "agent", APIKeyScopes: `["gateway:models"]`}); code != http.StatusOK || body["object"] != "list" {
+	if code, body := request(httpx.Principal{TenantID: "tenant", APIKey: true, SpaceID: space.ID, APIKeyScopes: `["gateway:models"]`}); code != http.StatusOK || body["object"] != "list" {
 		t.Fatalf("scoped gateway key: %d %#v", code, body)
 	}
 }

@@ -167,3 +167,95 @@ func TestSandboxCancellationUsesIndependentCleanupContext(t *testing.T) {
 		t.Fatal("cancel did not stop job")
 	}
 }
+
+func TestRuntimeExecutionClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name, workspace, requested, reported string
+		reportedIsolation                    bool
+		expected                             string
+		isolated, restricted, wantError      bool
+	}{
+		{name: "legacy host", workspace: "host", expected: "host"},
+		{name: "legacy workspace container", workspace: "container", expected: "workspace-container", isolated: true},
+		{name: "workspace container cannot claim restricted policy", workspace: "container", reported: "sandbox", reportedIsolation: true, expected: "workspace-container", isolated: true},
+		{name: "restricted sandbox", workspace: "host", requested: "sandbox", reported: "sandbox", reportedIsolation: true, expected: "sandbox", isolated: true, restricted: true},
+		{name: "operator enforced sandbox", workspace: "host", reported: "sandbox", reportedIsolation: true, expected: "sandbox", isolated: true, restricted: true},
+		{name: "missing sandbox isolation", workspace: "host", requested: "sandbox", reported: "sandbox", wantError: true},
+		{name: "container is not restricted sandbox", workspace: "host", requested: "sandbox", reported: "workspace-container", reportedIsolation: true, wantError: true},
+		{name: "operator sandbox missing isolation", workspace: "host", reported: "sandbox", wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDeps(t)
+			seedTenant(t, d, "tenant")
+			store := NewStore(d)
+			node := "node"
+			space, err := store.CreateSpace(context.Background(), "tenant", Space{Name: "S", RuntimeNodeID: &node, WorkspaceKind: tc.workspace})
+			if err != nil {
+				t.Fatal(err)
+			}
+			agent, err := store.CreateAgent(context.Background(), "tenant", Agent{Name: "A", SpaceID: space.ID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := builtinToolHarness(t, d, "rnr_classification", func(method string, p map[string]any) (any, error) {
+				switch method {
+				case "sys.info":
+					return map[string]any{"version": "test", "kind": "computer", "storageRoot": "/srv/zakura", "capabilities": map[string]any{}, "hostInfo": map[string]any{}}, nil
+				case "sandbox.policy":
+					return map[string]any{"sandbox": map[string]any{"enabled": true}}, nil
+				case "docker.list":
+					return []map[string]any{{"dockerId": "workspace", "labels": map[string]string{"zakura.purpose": "workspace"}}}, nil
+				case "host.exec", "host.exec.start", "docker.exec":
+					expectedMethod := "host.exec"
+					if tc.workspace != "host" {
+						expectedMethod = "docker.exec"
+					} else if tc.requested == "sandbox" {
+						expectedMethod = "host.exec.start"
+					}
+					if method != expectedMethod {
+						t.Errorf("expected %s, got %s", expectedMethod, method)
+					}
+					result := map[string]any{"id": "job", "running": false, "exitCode": 0, "stdout": "ok", "stderr": ""}
+					if tc.reported != "" {
+						result["executionMode"] = tc.reported
+						result["isolated"] = tc.reportedIsolation
+					}
+					return result, nil
+				case "host.exec.kill":
+					return map[string]any{"running": false, "executionMode": "sandbox", "isolated": true}, nil
+				default:
+					t.Errorf("unexpected RPC: %s", method)
+					return nil, nil
+				}
+			})
+			result, err := h.runtimeExecWithMode(context.Background(), "tenant", agent.ID, tc.requested, "true")
+			if tc.wantError {
+				if err == nil {
+					t.Fatalf("unconfirmed sandbox accepted: %#v", result)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result["executionMode"] != tc.expected || result["isolated"] != tc.isolated || result["restrictedPolicyApplied"] != tc.restricted {
+				t.Fatalf("incorrect classification: %#v", result)
+			}
+			args := map[string]any{"command": "true"}
+			if tc.requested != "" {
+				args["execution_mode"] = tc.requested
+			}
+			raw, err := h.runShellExec(context.Background(), "tenant", agent.ID, args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var toolResult map[string]any
+			if err := json.Unmarshal(raw, &toolResult); err != nil {
+				t.Fatal(err)
+			}
+			if toolResult["executionMode"] != tc.expected || toolResult["isolated"] != tc.isolated || toolResult["restrictedPolicyApplied"] != tc.restricted {
+				t.Fatalf("tool output lost execution classification: %s", raw)
+			}
+		})
+	}
+}

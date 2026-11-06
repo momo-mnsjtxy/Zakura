@@ -7,6 +7,11 @@ import { toast } from "sonner";
 import { ChevronDown, Loader2, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { api } from "@/lib/api";
 import {
+  modelCatalogRefreshSummary,
+  modelCatalogUnmatchedReason,
+  type ModelCatalogRefreshResult,
+} from "@/lib/model-catalog";
+import {
   listModelsByCapability,
   type ChatModelOption,
   type ModelCapabilityFilter,
@@ -85,12 +90,6 @@ type LogicalModel = {
   capability: string;
   isDefault: boolean;
   deployments: Deployment[];
-};
-
-type ModelMatchFailure = {
-  nativeModel: string;
-  displayName?: string;
-  canonicalModel: string;
 };
 
 const CAPABILITY_LABEL: Record<string, string> = {
@@ -188,13 +187,6 @@ function normalizeReasoningPreset(value?: string): ReasoningPreset {
   return "default";
 }
 
-function formatUnmatchedModels(models?: ModelMatchFailure[]): string | null {
-  if (!models?.length) return null;
-  return `以下模型仍匹配失败，需要手动选数据：${models
-    .map((model) => model.nativeModel)
-    .join("、")}`;
-}
-
 export default function ModelRoutesPage() {
   return (
     <Suspense fallback={<PageLoading />}>
@@ -213,6 +205,7 @@ function ModelRoutesPageInner() {
     () => searchParams.get("capability") ?? "all",
   );
   const [refreshingMeta, setRefreshingMeta] = useState(false);
+  const [metadataRefresh, setMetadataRefresh] = useState<ModelCatalogRefreshResult | null>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [metaOpen, setMetaOpen] = useState(false);
   const [editDep, setEditDep] = useState<Deployment | null>(null);
@@ -254,7 +247,7 @@ function ModelRoutesPageInner() {
   const rows = useMemo<FlatRow[]>(
     () =>
       groups.flatMap((g) =>
-        g.deployments.map((d) => ({
+        (g.deployments ?? []).map((d) => ({
           ...d,
           groupDisplayName: g.displayName || g.canonicalModel,
         })),
@@ -315,20 +308,21 @@ function ModelRoutesPageInner() {
   async function refreshMeta() {
     setRefreshingMeta(true);
     try {
-      const res = await api<{
-        imported: number;
-        renamed?: number;
-        rematched?: number;
-        unmatchedModels?: ModelMatchFailure[];
-        message?: string;
-      }>("/api/model-catalog/refresh", { method: "POST", json: {} });
-      toast.success(
-        `元数据已刷新（导入 ${res.imported} 条${
-          res.renamed != null ? `，重命名 ${res.renamed}` : ""
-        }）`,
-      );
-      const unmatchedText = formatUnmatchedModels(res.unmatchedModels);
-      if (unmatchedText) toast.message(unmatchedText);
+      const res = await api<ModelCatalogRefreshResult>("/api/model-catalog/refresh", { method: "POST", json: {} });
+      setMetadataRefresh(res);
+      const failures = Object.entries(res.failed ?? {});
+      const summary = modelCatalogRefreshSummary(res);
+      if (failures.length > 0) {
+        toast.warning(summary, {
+          description: failures.map(([source, error]) => `${source}: ${error}`).join("；"),
+        });
+      } else if (res.unmatched > 0 || res.matched === 0) {
+        toast.warning(summary);
+      } else if (res.updated === 0) {
+        toast.info(summary);
+      } else {
+        toast.success(summary);
+      }
       await load();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
@@ -488,18 +482,16 @@ function ModelRoutesPageInner() {
       toast.error("未找到该模型");
       return;
     }
-    const targetId =
-      routeId ||
-      item.providers[0]?.id ||
-      null;
-    if (!targetId) {
-      toast.error("该模型没有可用部署");
-      return;
-    }
+    const effectiveRouteId =
+      routeId || item.defaultRouteId || item.providers[0]?.id || null;
     try {
-      await api(`/api/upstream-models/${targetId}`, {
-        method: "PATCH",
-        json: { isDefault: true },
+      await api(`/api/model-routes/default`, {
+        method: "PUT",
+        json: {
+          capability,
+          modelId: alias,
+          ...(effectiveRouteId ? { routeId: effectiveRouteId } : {}),
+        },
       });
       toast.success(`已将 ${item.name} 设为${CAPABILITY_LABEL[capability] ?? capability}默认`);
       await load();
@@ -618,6 +610,24 @@ function ModelRoutesPageInner() {
           </SelectContent>
         </Select>
       </div>
+
+      {metadataRefresh?.unmatchedModels && metadataRefresh.unmatchedModels.length > 0 && (
+        <details className="rounded-md border border-border p-3 text-sm">
+          <summary className="cursor-pointer text-muted-foreground">
+            查看 {metadataRefresh.unmatchedModels.length} 个未匹配模型及原因
+          </summary>
+          <ul className="mt-3 max-h-64 space-y-2 overflow-y-auto">
+            {metadataRefresh.unmatchedModels.map((model) => (
+              <li key={model.id} className="flex flex-wrap justify-between gap-x-4 gap-y-1">
+                <code className="break-all text-xs">{model.nativeModel}</code>
+                <span className="text-xs text-muted-foreground">
+                  {modelCatalogUnmatchedReason(model.reason)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
 
       {rows.length === 0 ? (
         <div className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">

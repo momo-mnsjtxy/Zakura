@@ -398,6 +398,7 @@ func (h *handler) authenticateRealtime(ctx context.Context, raw string) (httpx.P
 	}
 	str := func(k string) string { v, _ := claims[k].(string); return v }
 	p := httpx.Principal{UserID: str("sub"), TenantID: str("tenantId"), Email: str("email"), Role: str("role"), SessionID: str("sid")}
+	p.IsPlatformAdmin, _ = claims["isPlatformAdmin"].(bool)
 	var count int64
 	e = h.deps.Gorm.WithContext(ctx).Model(&models.UserSession{}).Where("id=? AND user_id=? AND tenant_id=? AND revoked_at IS NULL AND expires_at>?", p.SessionID, p.UserID, p.TenantID, runtimeTimeString(h.store.now())).Count(&count).Error
 	if e != nil || count == 0 {
@@ -414,6 +415,10 @@ func (c *realtimeClient) subscribeSession(payload map[string]any, ack func(any))
 	}
 	if agent == "" || sid == "" {
 		ack(map[string]any{"ok": false, "error": "agentId and sessionId required"})
+		return nil
+	}
+	if space, gateway := gatewaySpace(agent); gateway && httpx.AuthorizeResource(c.h.deps.RunContext(), c.h.deps, c.principal, space, "") != nil {
+		ack(map[string]any{"ok": false, "error": "Not found"})
 		return nil
 	}
 	if _, e := c.h.store.GetSession(c.h.deps.RunContext(), c.principal.TenantID, agent, sid); e != nil {
@@ -506,9 +511,26 @@ func broadcastTenant(tenant, event string, payload any, except string) {
 		_ = c.emit(event, payload)
 	}
 }
+func broadcastPlatform(event string, payload any) {
+	realtimeHub.Lock()
+	clients := []*realtimeClient{}
+	for _, c := range realtimeHub.clients {
+		if c.authed && (c.principal.IsPlatformAdmin || (c.principal.Role == "owner" || c.principal.Role == "admin")) {
+			clients = append(clients, c)
+		}
+	}
+	realtimeHub.Unlock()
+	for _, c := range clients {
+		_ = c.emit(event, payload)
+	}
+}
 func (c *realtimeClient) syncSubscribe(payload map[string]any, ack func(any)) error {
 	agent, _ := payload["agentId"].(string)
 	sid, _ := payload["sessionId"].(string)
+	if space, gateway := gatewaySpace(agent); gateway && httpx.AuthorizeResource(c.h.deps.RunContext(), c.h.deps, c.principal, space, "") != nil {
+		ack(map[string]any{"ok": false, "error": "Not found"})
+		return nil
+	}
 	if _, e := c.h.store.GetSession(c.h.deps.RunContext(), c.principal.TenantID, agent, sid); e != nil {
 		ack(map[string]any{"ok": false, "error": "Not found"})
 		return nil

@@ -24,16 +24,118 @@ var compatibilitySQL string
 //go:embed sql/0004_space_mcp.sql
 var spaceMCPSQL string
 
+//go:embed sql/0005_computers.sql
+var computersSQL string
+
+//go:embed sql/0006_computer_roots.sql
+var computerRootsSQL string
+
+//go:embed sql/0007_computer_tokens.sql
+var computerTokensSQL string
+
+//go:embed sql/0008_computer_manifest.sql
+var computerManifestSQL string
+
+//go:embed sql/0009_space_server_computers.sql
+var spaceServerComputersSQL string
+
+//go:embed sql/0010_computer_cleanup.sql
+var computerCleanupSQL string
+
+//go:embed sql/0010_computer_cleanup.postgres.sql
+var computerCleanupPostgresSQL string
+
+//go:embed sql/0011_workspace_recovery.sql
+var workspaceRecoverySQL string
+
+//go:embed sql/0012_space_skills.sql
+var spaceSkillsSQL string
+
+//go:embed sql/0013_runtime_connection_tickets.sql
+var runtimeConnectionTicketsSQL string
+
+//go:embed sql/0014_space_integrations.sql
+var spaceIntegrationsSQL string
+
+//go:embed sql/0016_acp_device_auth.sql
+var acpDeviceAuthSQL string
+
+//go:embed sql/0017_owner_cleanup.sql
+var ownerCleanupSQL string
+
+//go:embed sql/0018_acp_auth_recovery.sql
+var acpAuthRecoverySQL string
+
+//go:embed sql/0019_tool_approvals.sql
+var toolApprovalsSQL string
+
+//go:embed sql/0020_workspace_create_operations.sql
+var workspaceCreateOperationsSQL string
+
+//go:embed sql/0021_workspace_connections.sql
+var workspaceConnectionsSQL string
+
+//go:embed sql/0022_computer_terminal_connections.sql
+var computerTerminalConnectionsSQL string
+
+//go:embed sql/0023_gateway_conversations.sql
+var gatewayConversationsSQL string
+
+//go:embed sql/0024_automation_approvals.sql
+var automationApprovalsSQL string
+
+//go:embed sql/0025_context_history_indexes.sql
+var contextHistoryIndexesSQL string
+
+//go:embed sql/0026_workspace_storage.sql
+var workspaceStorageSQL string
+
+//go:embed sql/0027_node_installations.sql
+var nodeInstallationsSQL string
+
+//go:embed sql/0028_workspace_auth_targets.sql
+var workspaceAuthTargetsSQL string
+
+//go:embed sql/0029_workspace_node_removal.sql
+var workspaceNodeRemovalSQL string
+
+// postgres replaces sql on PostgreSQL when the dialects need different
+// statements rather than the textual type substitutions of postgresSchema.
 type migration struct {
-	version   int
-	name, sql string
+	version             int
+	name, sql, postgres string
 }
 
 var ordered = []migration{
-	{1, "platform", platformSQL},
-	{2, "runtime", runtimeSQL},
-	{3, "compatibility", compatibilitySQL},
-	{4, "space_mcp", spaceMCPSQL},
+	{1, "platform", platformSQL, ""},
+	{2, "runtime", runtimeSQL, ""},
+	{3, "compatibility", compatibilitySQL, ""},
+	{4, "space_mcp", spaceMCPSQL, ""},
+	{5, "computers", computersSQL, ""},
+	{6, "computer_roots", computerRootsSQL, ""},
+	{7, "computer_tokens", computerTokensSQL, ""},
+	{8, "computer_manifest", computerManifestSQL, ""},
+	{9, "space_server_computers", spaceServerComputersSQL, ""},
+	{10, "computer_cleanup", computerCleanupSQL, computerCleanupPostgresSQL},
+	{11, "workspace_recovery", workspaceRecoverySQL, ""},
+	{12, "space_skills", spaceSkillsSQL, ""},
+	{13, "runtime_connection_tickets", runtimeConnectionTicketsSQL, ""},
+	{14, "space_integrations", spaceIntegrationsSQL, ""},
+	{15, "channel_reply_routing", "", ""},
+	{16, "acp_device_auth", acpDeviceAuthSQL, ""},
+	{17, "owner_cleanup", ownerCleanupSQL, ""},
+	{18, "acp_auth_recovery", acpAuthRecoverySQL, ""},
+	{19, "tool_approvals", toolApprovalsSQL, ""},
+	{20, "workspace_create_operations", workspaceCreateOperationsSQL, ""},
+	{21, "workspace_connections", workspaceConnectionsSQL, ""},
+	{22, "computer_terminal_connections", computerTerminalConnectionsSQL, ""},
+	{23, "gateway_conversations", gatewayConversationsSQL, ""},
+	{24, "automation_approvals", automationApprovalsSQL, "ALTER TABLE agent_schedules ADD COLUMN bypass_tool_approval BOOLEAN NOT NULL DEFAULT FALSE;"},
+	{25, "context_history_indexes", contextHistoryIndexesSQL, ""},
+	{26, "workspace_storage", workspaceStorageSQL, ""},
+	{27, "node_installations", nodeInstallationsSQL, ""},
+	{28, "workspace_auth_targets", workspaceAuthTargetsSQL, ""},
+	{29, "workspace_node_removal", workspaceNodeRemovalSQL, ""},
 }
 
 func Apply(ctx context.Context, db *sql.DB, dialect string, rebind func(string) string) error {
@@ -56,9 +158,18 @@ func Apply(ctx context.Context, db *sql.DB, dialect string, rebind func(string) 
 		if count != 0 {
 			continue
 		}
+		if m.name == "channel_reply_routing" {
+			if err := migrateChannelRouting(ctx, db, dialect, rebind, m); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := appdeps.InTx(ctx, db, func(tx *sql.Tx) error {
 			migrationSQL := m.sql
 			if dialect == "postgres" {
+				if m.postgres != "" {
+					migrationSQL = m.postgres
+				}
 				migrationSQL = postgresSchema(migrationSQL)
 			}
 			for _, statement := range strings.Split(migrationSQL, "-- statement-breakpoint") {
@@ -87,7 +198,7 @@ func ensureAdditiveCompatibility(ctx context.Context, db *sql.DB, dialect string
 	}
 	specs := []columnSpec{
 		{"platform_meta", "singleton", "INTEGER", "INTEGER"}, {"platform_meta", "settings_json", "TEXT NOT NULL DEFAULT '{}'", "TEXT NOT NULL DEFAULT '{}'"},
-		{"users", "status", "TEXT NOT NULL DEFAULT 'active'", "TEXT NOT NULL DEFAULT 'active'"}, {"users", "avatar_mime", "TEXT", "TEXT"}, {"users", "avatar_data", "BLOB", "BYTEA"}, {"users", "totp_secret", "TEXT", "TEXT"}, {"users", "totp_pending_secret", "TEXT", "TEXT"}, {"users", "recovery_codes_json", "TEXT NOT NULL DEFAULT '[]'", "TEXT NOT NULL DEFAULT '[]'"}, {"users", "suspended_reason", "TEXT", "TEXT"}, {"users", "suspended_by_user_id", "TEXT", "TEXT"},
+		{"users", "status", "TEXT NOT NULL DEFAULT 'active'", "TEXT NOT NULL DEFAULT 'active'"}, {"users", "avatar_mime", "TEXT", "TEXT"}, {"users", "avatar_data", "BLOB", "BYTEA"}, {"users", "totp_secret", "TEXT", "TEXT"}, {"users", "totp_pending_secret", "TEXT", "TEXT"}, {"users", "recovery_codes_json", "TEXT NOT NULL DEFAULT '[]'", "TEXT NOT NULL DEFAULT '[]'"}, {"users", "mfa_enabled", "INTEGER NOT NULL DEFAULT 0", "BOOLEAN NOT NULL DEFAULT FALSE"}, {"users", "email_mfa_enabled_at", "TIMESTAMP", "TIMESTAMPTZ"}, {"users", "suspended_reason", "TEXT", "TEXT"}, {"users", "suspended_by_user_id", "TEXT", "TEXT"},
 		{"tenants", "status", "TEXT NOT NULL DEFAULT 'active'", "TEXT NOT NULL DEFAULT 'active'"}, {"tenants", "mfa_policy", "TEXT NOT NULL DEFAULT 'optional'", "TEXT NOT NULL DEFAULT 'optional'"}, {"tenants", "audit_retention_days", "INTEGER NOT NULL DEFAULT 365", "INTEGER NOT NULL DEFAULT 365"}, {"tenants", "settings_json", "TEXT NOT NULL DEFAULT '{}'", "TEXT NOT NULL DEFAULT '{}'"}, {"tenants", "suspended_reason", "TEXT", "TEXT"}, {"tenants", "suspended_by_user_id", "TEXT", "TEXT"},
 		{"user_sessions", "token_hash", "TEXT", "TEXT"}, {"user_sessions", "last_seen_at", "TEXT", "TEXT"},
 		{"agents", "avatar_color", "TEXT", "TEXT"}, {"agents", "avatar_shape", "TEXT", "TEXT"}, {"agents", "avatar_url", "TEXT", "TEXT"},
@@ -314,7 +425,7 @@ func tableExists(ctx context.Context, db *sql.DB, dialect string, rebind func(st
 
 func postgresSchema(sqlText string) string {
 	sqlText = strings.ReplaceAll(sqlText, " BLOB", " BYTEA")
-	bools := []string{"setup_completed", "is_platform_admin", "can_use_local_runner", "is_default", "onboarding_completed", "enable_computer", "enable_memory", "cancel_requested", "enabled", "allow_multiple", "secret", "always_allow", "partial", "auto_update", "is_shared", "source_retained", "is_error", "builtin", "has_workspace", "jit_enabled", "enforce_sso", "exposure_enabled", "allow_desktop_exposure", "allow_public_exposure", "allow_tcp_exposure", "agents_can_expose", "require_user_approval", "require_tailscale_for_remote_runners"}
+	bools := []string{"setup_completed", "is_platform_admin", "can_use_local_runner", "mfa_enabled", "is_default", "onboarding_completed", "enable_computer", "enable_memory", "cancel_requested", "enabled", "allow_multiple", "secret", "always_allow", "partial", "auto_update", "is_shared", "source_retained", "is_error", "builtin", "has_workspace", "jit_enabled", "enforce_sso", "exposure_enabled", "allow_desktop_exposure", "allow_public_exposure", "allow_tcp_exposure", "agents_can_expose", "require_user_approval", "require_tailscale_for_remote_runners"}
 	for _, name := range bools {
 		sqlText = strings.ReplaceAll(sqlText, name+" INTEGER NOT NULL DEFAULT 0", name+" BOOLEAN NOT NULL DEFAULT FALSE")
 		sqlText = strings.ReplaceAll(sqlText, name+" INTEGER NOT NULL DEFAULT 1", name+" BOOLEAN NOT NULL DEFAULT TRUE")

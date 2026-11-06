@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"html"
 	"net"
 	"net/http"
 	"net/url"
@@ -21,6 +20,7 @@ import (
 
 	"github.com/Moonrend/Zakura/apps/server/internal/platform/appdeps"
 	"github.com/Moonrend/Zakura/apps/server/internal/platform/db/models"
+	"github.com/Moonrend/Zakura/apps/server/internal/platform/emailtmpl"
 	"github.com/Moonrend/Zakura/apps/server/internal/platform/httpx"
 )
 
@@ -57,23 +57,34 @@ func RegisterRoutes(r chi.Router, deps *appdeps.Dependencies) {
 	r.Post("/api/auth/sso/ticket", s.exchangeSSOTicket)
 	r.Post("/api/auth/mfa/complete", s.completeMFALogin)
 	r.Post("/api/auth/mfa/webauthn/options", s.beginWebAuthnLogin)
+	r.Post("/api/auth/mfa/email/send", s.sendLoginEmailCode)
+	r.Post("/api/auth/webauthn/login/options", s.beginWebAuthnPasswordlessLogin)
+	r.Post("/api/auth/webauthn/login", s.finishWebAuthnPasswordlessLogin)
 	r.Post("/api/auth/mfa/enrollment/totp/start", s.startTicketTOTP)
 	r.Post("/api/auth/mfa/enrollment/totp/complete", s.completeTicketTOTP)
 	r.Group(func(pr chi.Router) {
 		pr.Use(httpx.Auth(deps))
 		pr.Get("/api/me", currentHandler(s, deps))
 		pr.Get("/api/me/mfa", s.myMFA)
+		pr.Put("/api/me/mfa/enabled", s.setMFAEnabled)
 		pr.Post("/api/me/mfa/totp/start", s.startMyTOTP)
 		pr.Post("/api/me/mfa/totp/cancel", s.cancelMyTOTP)
 		pr.Post("/api/me/mfa/totp/enable", s.enableMyTOTP)
 		pr.Post("/api/me/mfa/totp/disable", s.disableMyTOTP)
 		pr.Post("/api/me/mfa/totp/recovery", s.rotateRecoveryCodes)
+		pr.Post("/api/me/mfa/email/start", s.startMyEmailMFA)
+		pr.Post("/api/me/mfa/email/enable", s.enableMyEmailMFA)
+		pr.Post("/api/me/mfa/email/disable", s.disableMyEmailMFA)
+		pr.Post("/api/me/mfa/email/challenge", s.challengeMyEmailMFA)
 		pr.Post("/api/me/mfa/webauthn/register/options", s.beginWebAuthnRegistration)
 		pr.Post("/api/me/mfa/webauthn/register", s.finishWebAuthnRegistration)
 		pr.Patch("/api/me/mfa/webauthn/{id}", s.renameWebAuthnCredential)
 		pr.Delete("/api/me/mfa/webauthn/{id}", s.deleteWebAuthnCredential)
 		pr.Patch("/api/me", patchMeHandler(s))
 		pr.Post("/api/me/password", changePasswordHandler(s))
+		pr.Post("/api/me/email", s.changeMyEmail)
+		pr.Get("/api/me/oauth-identities", s.listMyOAuthIdentities)
+		pr.Delete("/api/me/oauth-identities/{id}", s.unlinkMyOAuthIdentity)
 		pr.Get("/api/me/sessions", listSessionsHandler(s))
 		pr.Delete("/api/me/sessions/{id}", revokeSessionHandler(s))
 		pr.Post("/api/me/sessions/revoke-others", revokeOtherSessionsHandler(s))
@@ -219,11 +230,20 @@ func registerHandler(s *Service, deps *appdeps.Dependencies) http.HandlerFunc {
 			httpx.Error(w, 400, "email and password required")
 			return
 		}
-		if s.registrationBlockedBySSO(r.Context(), b.Email) {
+		join, err := s.resolveRegistrationJoin(r.Context(), b.Email)
+		if err != nil {
+			httpx.Error(w, 500, "registration failed")
+			return
+		}
+		if join.action == "sso_required" {
 			httpx.JSON(w, 403, map[string]any{"error": "This email must use company SSO", "code": "sso_required"})
 			return
 		}
-		res, err := s.Register(r.Context(), b.Email, b.Password, b.Name, b.TenantName, requestIP(r), r.UserAgent())
+		var joinTarget *registrationJoin
+		if join.action == "auto_join" {
+			joinTarget = &join
+		}
+		res, err := s.Register(r.Context(), b.Email, b.Password, b.Name, b.TenantName, requestIP(r), r.UserAgent(), joinTarget)
 		if err != nil {
 			status := 400
 			if strings.Contains(err.Error(), "registered") {
@@ -324,8 +344,8 @@ func changePasswordHandler(s *Service) http.HandlerFunc {
 			Current string `json:"currentPassword"`
 			New     string `json:"newPassword"`
 		}
-		if httpx.DecodeJSON(r, &b) != nil || len(b.New) < 10 {
-			httpx.Error(w, 400, "new password must contain at least 10 characters")
+		if httpx.DecodeJSON(r, &b) != nil || len(b.New) < 8 {
+			httpx.Error(w, 400, "new password must contain at least 8 characters")
 			return
 		}
 		var dbUser models.User
@@ -368,7 +388,7 @@ func listSessionsHandler(s *Service) http.HandlerFunc {
 			ExpiresAt  string `gorm:"column:expires_at"`
 		}
 		if err := s.gdb(r.Context()).Table("user_sessions").
-			Select("id,COALESCE(ip,'') AS ip,COALESCE(user_agent,'') AS user_agent,COALESCE(last_seen_at,created_at) AS last_seen_at,created_at,expires_at").
+			Select("id,COALESCE(ip,'') AS ip,COALESCE(user_agent,'') AS user_agent,COALESCE(CAST(last_seen_at AS TEXT),CAST(created_at AS TEXT)) AS last_seen_at,CAST(created_at AS TEXT) AS created_at,CAST(expires_at AS TEXT) AS expires_at").
 			Where("user_id = ? AND revoked_at IS NULL", p.UserID).
 			Order("created_at DESC").Find(&sessions).Error; err != nil {
 			httpx.Error(w, 500, "query failed")
@@ -458,6 +478,9 @@ func createTenantHandler(s *Service) http.HandlerFunc {
 		if err != nil {
 			httpx.Error(w, 400, err.Error())
 			return
+		}
+		if s.deps.OnTenantCreated != nil {
+			s.deps.OnTenantCreated(r.Context(), res.Tenant.ID)
 		}
 		httpx.JSON(w, 201, map[string]any{"tenant": res.Tenant, "session": res.Session})
 	}
@@ -881,10 +904,10 @@ func createInviteHandler(s *Service) http.HandlerFunc {
 		}
 		emailed := false
 		if s.deps.SendTransactionalEmail != nil {
-			safeTeam, safeURL := html.EscapeString(tenantName), html.EscapeString(acceptURL)
-			htmlBody := `<p>You were invited to join ` + safeTeam + ` in Zakura.</p><p><a href="` + safeURL + `">Accept invitation</a></p>`
-			textBody := "You were invited to join " + tenantName + " in Zakura.\n\n" + acceptURL
-			emailed = s.deps.SendTransactionalEmail(r.Context(), strings.ToLower(strings.TrimSpace(b.Email)), "邀请加入 "+tenantName, htmlBody, textBody) == nil
+			htmlBody, textBody, renderErr := emailtmpl.Render(emailtmpl.Invite, emailtmpl.InviteData{TenantName: tenantName, AcceptURL: acceptURL, Role: b.Role})
+			if renderErr == nil {
+				emailed = s.deps.SendTransactionalEmail(r.Context(), strings.ToLower(strings.TrimSpace(b.Email)), "邀请加入 "+tenantName, htmlBody, textBody) == nil
+			}
 		}
 		httpx.JSON(w, 201, map[string]any{"invite": map[string]any{"id": id, "email": b.Email, "role": b.Role, "expiresAt": expires}, "token": token, "acceptUrl": acceptURL, "emailed": emailed})
 	}
@@ -905,19 +928,30 @@ func inspectInviteHandler(s *Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		h := sha256.Sum256([]byte(httpx.Param(r, "token")))
 		var row struct {
-			Email      string `gorm:"column:email"`
-			Role       string `gorm:"column:role"`
-			TenantName string `gorm:"column:tenant_name"`
-			TenantSlug string `gorm:"column:tenant_slug"`
-			ExpiresAt  string `gorm:"column:expires_at"`
+			Email      string  `gorm:"column:email"`
+			Role       string  `gorm:"column:role"`
+			TenantName string  `gorm:"column:tenant_name"`
+			TenantSlug string  `gorm:"column:tenant_slug"`
+			ExpiresAt  string  `gorm:"column:expires_at"`
+			AcceptedAt *string `gorm:"column:accepted_at"`
 		}
 		err := s.gdb(r.Context()).Table("tenant_invites AS i").
-			Select("i.email,i.role,t.name AS tenant_name,t.slug AS tenant_slug,i.expires_at").
+			Select("i.email,i.role,t.name AS tenant_name,t.slug AS tenant_slug,i.expires_at,i.accepted_at").
 			Joins("JOIN tenants t ON t.id = i.tenant_id").
-			Where("i.token_hash = ? AND i.accepted_at IS NULL AND i.expires_at > ?", hex.EncodeToString(h[:]), s.now()).
+			Where("i.token_hash = ?", hex.EncodeToString(h[:])).
 			Take(&row).Error
 		if err != nil {
-			httpx.Error(w, 404, "invite not found or expired")
+			httpx.Error(w, 404, "invalid invite")
+			return
+		}
+		if row.AcceptedAt != nil {
+			httpx.Error(w, 400, "invite already used")
+			return
+		}
+		expires, expiresErr := time.Parse(time.RFC3339Nano, row.ExpiresAt)
+		now, nowErr := time.Parse(time.RFC3339Nano, s.now())
+		if expiresErr != nil || nowErr != nil || !expires.After(now) {
+			httpx.Error(w, 400, "invite expired")
 			return
 		}
 		httpx.JSON(w, 200, map[string]any{"email": row.Email, "role": row.Role, "expiresAt": row.ExpiresAt, "tenant": map[string]any{"name": row.TenantName, "slug": row.TenantSlug}})
@@ -1148,7 +1182,7 @@ func forgotPasswordHandler(s *Service) http.HandlerFunc {
 			return
 		}
 		var dbUser models.User
-		if s.gdb(r.Context()).Where("email = ? AND status = 'active'", strings.ToLower(strings.TrimSpace(b.Email))).Take(&dbUser).Error == nil && derefString(dbUser.PasswordHash) != "" {
+		if s.gdb(r.Context()).Where("email = ? AND status = 'active'", strings.ToLower(strings.TrimSpace(b.Email))).Take(&dbUser).Error == nil {
 			userID, email := derefString(dbUser.ID), dbUser.Email
 			token, _ := randomToken(32)
 			h := sha256.Sum256([]byte(token))
@@ -1156,8 +1190,15 @@ func forgotPasswordHandler(s *Service) http.HandlerFunc {
 			_ = s.gdb(r.Context()).Create(&models.AuthToken{ID: &tokenID, UserID: &userID, Kind: "password_reset", TokenHash: hex.EncodeToString(h[:]), ExpiresAt: s.deps.Clock().UTC().Add(time.Hour).Format(time.RFC3339Nano), CreatedAt: s.now()}).Error
 			if s.deps.SendTransactionalEmail != nil {
 				resetURL := s.deps.WebURL + "/reset-password?token=" + url.QueryEscape(token)
-				htmlBody := `<p>Reset your Zakura password:</p><p><a href="` + html.EscapeString(resetURL) + `">Reset password</a></p>`
-				_ = s.deps.SendTransactionalEmail(r.Context(), email, "重置 Zakura 密码", htmlBody, "Reset your Zakura password:\n\n"+resetURL)
+				setPassword := derefString(dbUser.PasswordHash) == ""
+				htmlBody, textBody, renderErr := emailtmpl.Render(emailtmpl.ResetPassword, emailtmpl.ResetPasswordData{ResetURL: resetURL, SetPassword: setPassword})
+				if renderErr == nil {
+					subject := "重置 Zakura 密码"
+					if setPassword {
+						subject = "设置 Zakura 密码"
+					}
+					_ = s.deps.SendTransactionalEmail(r.Context(), email, subject, htmlBody, textBody)
+				}
 			}
 		}
 		httpx.JSON(w, 200, map[string]any{"sent": true})
@@ -1186,8 +1227,11 @@ func (s *Service) sendVerificationEmail(ctx context.Context, userID, email strin
 		return false, err
 	}
 	verifyURL := s.deps.WebURL + "/verify-email?token=" + url.QueryEscape(token)
-	htmlBody := `<p>Verify your Zakura email:</p><p><a href="` + html.EscapeString(verifyURL) + `">Verify email</a></p>`
-	if err = s.deps.SendTransactionalEmail(ctx, email, "验证你的 Zakura 邮箱", htmlBody, "Verify your Zakura email:\n\n"+verifyURL); err != nil {
+	htmlBody, textBody, renderErr := emailtmpl.Render(emailtmpl.VerifyEmail, emailtmpl.VerifyEmailData{VerifyURL: verifyURL})
+	if renderErr != nil {
+		return false, renderErr
+	}
+	if err = s.deps.SendTransactionalEmail(ctx, email, "验证你的 Zakura 邮箱", htmlBody, textBody); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -1198,8 +1242,12 @@ func resetPasswordHandler(s *Service) http.HandlerFunc {
 			Token    string `json:"token"`
 			Password string `json:"password"`
 		}
-		if httpx.DecodeJSON(r, &b) != nil || len(b.Password) < 10 {
-			httpx.Error(w, 400, "invalid token or password")
+		if httpx.DecodeJSON(r, &b) != nil || b.Token == "" {
+			httpx.Error(w, 400, "invalid or expired token")
+			return
+		}
+		if len(b.Password) < 10 {
+			httpx.Error(w, 400, "password must contain at least 10 characters")
 			return
 		}
 		h := sha256.Sum256([]byte(b.Token))

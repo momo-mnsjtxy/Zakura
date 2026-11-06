@@ -143,6 +143,18 @@ func (s *Service) discoverSSO(w http.ResponseWriter, r *http.Request) {
 		httpx.JSON(w, 200, map[string]any{"sso": false})
 		return
 	}
+	email := strings.ToLower(strings.TrimSpace(b.Email))
+	var account struct {
+		PasswordHash *string `gorm:"column:password_hash"`
+	}
+	hasAccount := s.gdb(r.Context()).Table("users").Select("password_hash").Where("email = ? AND status = 'active'", email).Take(&account).Error == nil
+	hasPassword := hasAccount && account.PasswordHash != nil && *account.PasswordHash != ""
+	withPassword := func(body map[string]any) map[string]any {
+		if hasAccount {
+			body["hasPassword"] = hasPassword
+		}
+		return body
+	}
 	domain := strings.ToLower(strings.TrimSpace(strings.SplitN(b.Email, "@", 2)[1]))
 	var row struct {
 		Slug     string `gorm:"column:slug"`
@@ -156,10 +168,10 @@ func (s *Service) discoverSSO(w http.ResponseWriter, r *http.Request) {
 		Where("d.domain = ? AND d.verified_at IS NOT NULL AND c.enabled = ? AND t.status = ?", domain, true, "active").
 		Take(&row).Error
 	if err != nil {
-		httpx.JSON(w, 200, map[string]any{"sso": false})
+		httpx.JSON(w, 200, withPassword(map[string]any{"sso": false}))
 		return
 	}
-	httpx.JSON(w, 200, map[string]any{"sso": true, "required": row.Required, "protocol": row.Protocol, "tenantSlug": row.Slug})
+	httpx.JSON(w, 200, withPassword(map[string]any{"sso": true, "required": row.Required, "protocol": row.Protocol, "tenantSlug": row.Slug}))
 }
 func (s *Service) startSSO(w http.ResponseWriter, r *http.Request) {
 	protocol := httpx.Param(r, "protocol")
@@ -439,22 +451,10 @@ func (s *Service) ssoLoginResult(ctx context.Context, cfg ssoConfig, email, name
 	}
 	t := Tenant{ID: cfg.TenantID, Slug: cfg.TenantSlug, Name: cfg.TenantName}
 	u := User{ID: uid, Email: email, Name: name, IsPlatformAdmin: admin}
-	var totpUser models.User
-	var policyTenant models.Tenant
-	var passkeys int64
-	_ = s.gdb(ctx).Select("totp_enabled_at").Where("id = ?", uid).Take(&totpUser).Error
-	_ = s.gdb(ctx).Model(&models.UserWebauthnCredential{}).Where("user_id = ?", uid).Count(&passkeys).Error
-	_ = s.gdb(ctx).Select("mfa_policy").Where("id = ?", cfg.TenantID).Take(&policyTenant).Error
-	totpEnabled := totpUser.TotpEnabledAt != nil
-	policy := policyTenant.MfaPolicy
-	methods := []string{}
-	if totpEnabled {
-		methods = append(methods, "totp", "recovery")
+	methods, mfaEnabled, required, decisionErr := s.mfaDecision(ctx, uid, role)
+	if decisionErr != nil {
+		return nil, decisionErr
 	}
-	if passkeys > 0 {
-		methods = append(methods, "webauthn")
-	}
-	required := policy == "all" || (policy == "admins" && (role == "owner" || role == "admin"))
 	if required && len(methods) == 0 {
 		ticket, e := s.issueAuthToken(ctx, "mfa_enrollment", uid, map[string]any{"tenantId": cfg.TenantID, "role": role})
 		if e != nil {
@@ -462,7 +462,7 @@ func (s *Service) ssoLoginResult(ctx context.Context, cfg ssoConfig, email, name
 		}
 		return map[string]any{"mfaEnrollmentRequired": true, "mfaEnrollmentTicket": ticket, "methods": []string{"totp"}, "code": "mfa_enrollment_required", "tenant": t, "_userId": uid}, nil
 	}
-	if len(methods) > 0 {
+	if (required || mfaEnabled) && len(methods) > 0 {
 		ticket, e := s.issueAuthToken(ctx, "mfa_login", uid, map[string]any{"tenantId": cfg.TenantID, "role": role})
 		if e != nil {
 			return nil, e
@@ -596,7 +596,7 @@ func (s *Service) samlACS(w http.ResponseWriter, r *http.Request) {
 	}
 	uid, _ := result["_userId"].(string)
 	delete(result, "_userId")
-	result["next"] = "/dashboard/agents"
+	result["next"] = "/chat"
 	ticket, err := s.issueAuthToken(r.Context(), "sso_exchange", uid, result)
 	if err != nil {
 		s.samlFailure(w, r, errors.New("SSO ticket issue failed"))

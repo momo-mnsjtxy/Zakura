@@ -9,6 +9,13 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { PageLoading } from "@/components/ui/progress-linear";
+import { cn } from "@/lib/utils";
+
+const MFA_OPTIONS: Array<{ value: string; label: string; description: string }> = [
+  { value: "optional", label: "自愿启用", description: "由成员自己在账号设置中开启" },
+  { value: "admins", label: "管理员必须", description: "owner 与 admin 需要启用" },
+  { value: "all", label: "全员必须", description: "所有成员登录时都必须完成两步验证" },
+];
 
 type Domain = {
   id: string;
@@ -17,6 +24,12 @@ type Domain = {
   verified: boolean;
   txtHost: string;
   txtToken: string;
+};
+
+const JOIN_MODE_LABELS: Record<string, string> = {
+  auto_join: "自动加入",
+  sso_required: "需要 SSO",
+  invite_only: "仅邀请",
 };
 
 type Sso = {
@@ -45,18 +58,33 @@ export default function IdentitySettingsPage() {
   const [clientSecret, setClientSecret] = useState("");
   const [idpCert, setIdpCert] = useState("");
   const [newToken, setNewToken] = useState<string | null>(null);
+  const [mfaPolicy, setMfaPolicy] = useState<string>("");
 
   const load = useCallback(async () => {
     if (!admin) return;
-    const [d, s, c] = await Promise.all([
+    const [d, s, c, m] = await Promise.all([
       api<{ domains: Domain[] }>("/api/tenant/identity/domains"),
       api<{ sso: Sso }>("/api/tenant/identity/sso"),
       api<{ endpoint: string; tokens: Array<{ id: string; name: string; tokenPrefix: string }> }>("/api/tenant/identity/scim"),
+      api<{ policy: string }>("/api/tenant/identity/mfa"),
     ]);
     setDomains(d.domains);
     setSso(s.sso);
     setScim(c);
+    setMfaPolicy(m.policy);
   }, [admin]);
+
+  async function updateMfaPolicy(policy: string) {
+    const prev = mfaPolicy;
+    setMfaPolicy(policy);
+    try {
+      await api("/api/tenant/identity/mfa", { method: "PUT", json: { policy } });
+      toast.success("策略已更新");
+    } catch (err) {
+      setMfaPolicy(prev);
+      toast.error(err instanceof Error ? err.message : String(err));
+    }
+  }
 
   useEffect(() => {
     void load().catch((err) => toast.error(err instanceof Error ? err.message : String(err)));
@@ -81,7 +109,7 @@ export default function IdentitySettingsPage() {
             <div key={row.id} className="space-y-1 rounded-lg border p-3 text-sm">
               <div className="flex items-center justify-between">
                 <span className="font-medium">{row.domain}</span>
-                <span className="text-xs text-muted-foreground">{row.verified ? "已验证" : "未验证"} · {row.joinMode}</span>
+                <span className="text-xs text-muted-foreground">{row.verified ? "已验证" : "未验证"} · {JOIN_MODE_LABELS[row.joinMode] ?? row.joinMode}</span>
               </div>
               <p className="text-xs text-muted-foreground">TXT {row.txtHost} = {row.txtToken}</p>
               <div className="flex flex-wrap gap-2">
@@ -94,14 +122,28 @@ export default function IdentitySettingsPage() {
                     toast.error(err instanceof Error ? err.message : String(err));
                   }
                 }}>验证 DNS</Button>
-                <Button size="sm" variant="outline" onClick={async () => {
-                  const next = row.joinMode === "auto_join" ? "sso_required" : row.joinMode === "sso_required" ? "invite_only" : "auto_join";
-                  await api(`/api/tenant/identity/domains/${row.id}`, { method: "PATCH", json: { joinMode: next } });
-                  await load();
-                }}>加入方式：{row.joinMode}</Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={!row.verified}
+                  title={row.verified ? undefined : "验证域名后可切换加入方式"}
+                  onClick={async () => {
+                    const next = row.joinMode === "auto_join" ? "sso_required" : row.joinMode === "sso_required" ? "invite_only" : "auto_join";
+                    try {
+                      await api(`/api/tenant/identity/domains/${row.id}`, { method: "PATCH", json: { joinMode: next } });
+                      await load();
+                    } catch (err) {
+                      toast.error(err instanceof Error ? err.message : String(err));
+                    }
+                  }}
+                >加入方式：{JOIN_MODE_LABELS[row.joinMode] ?? row.joinMode}</Button>
                 <Button size="sm" variant="ghost" onClick={async () => {
-                  await api(`/api/tenant/identity/domains/${row.id}`, { method: "DELETE" });
-                  await load();
+                  try {
+                    await api(`/api/tenant/identity/domains/${row.id}`, { method: "DELETE" });
+                    await load();
+                  } catch (err) {
+                    toast.error(err instanceof Error ? err.message : String(err));
+                  }
                 }}>删除</Button>
               </div>
             </div>
@@ -202,6 +244,27 @@ export default function IdentitySettingsPage() {
           await load();
           toast.success("请立即复制 token，只显示一次");
         }}>生成 token</Button>
+      </SettingsSection>
+
+      <SettingsSection title="两步验证策略" description="控制在登录时是否强制成员完成两步验证。">
+        <div className="space-y-2">
+          {MFA_OPTIONS.map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              onClick={() => void updateMfaPolicy(option.value)}
+              className={cn(
+                "w-full rounded-lg border px-3 py-2.5 text-left transition-colors",
+                mfaPolicy === option.value
+                  ? "border-foreground/40 bg-muted/60"
+                  : "border-border/60 hover:bg-muted/30",
+              )}
+            >
+              <div className="text-sm font-medium">{option.label}</div>
+              <div className="mt-0.5 text-xs text-muted-foreground">{option.description}</div>
+            </button>
+          ))}
+        </div>
       </SettingsSection>
     </div>
   );

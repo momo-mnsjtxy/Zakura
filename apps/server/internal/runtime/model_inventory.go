@@ -10,11 +10,14 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Moonrend/Zakura/apps/server/internal/platform/db/models"
 	"github.com/Moonrend/Zakura/apps/server/internal/platform/httpx"
 	"github.com/go-chi/chi/v5"
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
@@ -25,7 +28,7 @@ type UpstreamModel struct {
 	CanonicalModel string          `json:"canonicalModel"`
 	DisplayName    *string         `json:"displayName"`
 	Capability     string          `json:"capability"`
-	Weight         string          `json:"weight"`
+	Weight         float64         `json:"weight"`
 	IsDefault      bool            `json:"isDefault"`
 	Options        json.RawMessage `json:"options"`
 	Meta           json.RawMessage `json:"meta"`
@@ -34,6 +37,118 @@ type UpstreamModel struct {
 	SyncedAt       *string         `json:"syncedAt"`
 	CreatedAt      string          `json:"createdAt"`
 	UpdatedAt      string          `json:"updatedAt"`
+}
+
+type LogicalModel struct {
+	CanonicalModel string          `json:"canonicalModel"`
+	DisplayName    string          `json:"displayName"`
+	Capability     string          `json:"capability"`
+	IsDefault      bool            `json:"isDefault"`
+	Deployments    []UpstreamModel `json:"deployments"`
+}
+
+type remoteModel struct {
+	ID         string `json:"id"`
+	Name       string `json:"name,omitempty"`
+	OwnedBy    string `json:"ownedBy,omitempty"`
+	Capability string `json:"capability,omitempty"`
+}
+
+type modelItem struct {
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	Model        string `json:"model"`
+	ModelID      string `json:"modelId"`
+	DisplayName  string `json:"display_name"`
+	OwnedBySnake string `json:"owned_by"`
+	OwnedByCamel string `json:"ownedBy"`
+}
+
+func (h *handler) fetchUpstreamModelList(ctx context.Context, tenant string, u Upstream) ([]remoteModel, error) {
+	if u.Protocol == "typesafe" {
+		return []remoteModel{{ID: jevDefaultModel, Name: "Jev", OwnedBy: "jev", Capability: "evaluation"}}, nil
+	}
+	cfg, err := loadUpstreamConfig(h.store.deps.Secret, tenant, u)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.BaseURL == "" {
+		return nil, errors.New("baseUrl not configured")
+	}
+	target, e := safeProviderURL(cfg.BaseURL, "/v1/models")
+	if e != nil {
+		return nil, e
+	}
+	req, e := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+	if e != nil {
+		return nil, e
+	}
+	if cfg.APIKey != "" {
+		if u.Protocol == "anthropic" {
+			req.Header.Set("x-api-key", cfg.APIKey)
+			req.Header.Set("anthropic-version", "2023-06-01")
+		} else {
+			req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+		}
+	}
+	for k, v := range cfg.Headers {
+		if http.CanonicalHeaderKey(k) != "Host" {
+			req.Header.Set(k, v)
+		}
+	}
+	client := h.service.gateway.client
+	if cfg.Timeout > 0 {
+		clone := *client
+		clone.Timeout = time.Duration(cfg.Timeout) * time.Millisecond
+		client = &clone
+	}
+	resp, e := client.Do(req)
+	if e != nil {
+		return nil, e
+	}
+	defer resp.Body.Close()
+	raw, e := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	if e != nil {
+		return nil, e
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("model list status %d: %.300s", resp.StatusCode, raw)
+	}
+	var items []modelItem
+	if e := json.Unmarshal(raw, &items); e != nil {
+		var result struct {
+			Data   []modelItem `json:"data"`
+			Models []modelItem `json:"models"`
+		}
+		if e := json.Unmarshal(raw, &result); e != nil {
+			return nil, errors.New("invalid model catalog")
+		}
+		if len(result.Data) > 0 {
+			items = result.Data
+		} else {
+			items = result.Models
+		}
+	}
+	out := make([]remoteModel, 0, len(items))
+	for _, m := range items {
+		id := firstNonEmpty(m.ID, m.Name, m.Model, m.ModelID)
+		if id == "" {
+			continue
+		}
+		rm := remoteModel{ID: id, Capability: "chat"}
+		if m.Name != "" && m.Name != id {
+			rm.Name = m.Name
+		} else if m.DisplayName != "" && m.DisplayName != id {
+			rm.Name = m.DisplayName
+		}
+		if m.OwnedBySnake != "" {
+			rm.OwnedBy = m.OwnedBySnake
+		} else {
+			rm.OwnedBy = m.OwnedByCamel
+		}
+		out = append(out, rm)
+	}
+	return out, nil
 }
 
 func (h *handler) queryUpstreamModels(r *http.Request, upstream string) ([]UpstreamModel, error) {
@@ -63,9 +178,36 @@ func (h *handler) queryUpstreamModels(r *http.Request, upstream string) ([]Upstr
 	}
 	out := make([]UpstreamModel, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, UpstreamModel{ID: row.ID, UpstreamID: row.UpstreamID, NativeModel: row.NativeModel, CanonicalModel: row.CanonicalModel, DisplayName: row.DisplayName, Capability: row.Capability, Weight: row.Weight, IsDefault: row.IsDefault, Options: json.RawMessage(row.OptionsJSON), Meta: json.RawMessage(row.MetaJSON), Status: row.Status, LastError: row.LastError, SyncedAt: row.SyncedAt, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt})
+		weight, _ := strconv.ParseFloat(row.Weight, 64)
+		out = append(out, UpstreamModel{ID: row.ID, UpstreamID: row.UpstreamID, NativeModel: row.NativeModel, CanonicalModel: row.CanonicalModel, DisplayName: row.DisplayName, Capability: row.Capability, Weight: weight, IsDefault: row.IsDefault, Options: json.RawMessage(row.OptionsJSON), Meta: json.RawMessage(row.MetaJSON), Status: row.Status, LastError: row.LastError, SyncedAt: row.SyncedAt, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt})
 	}
 	return out, nil
+}
+func groupUpstreamModels(rows []UpstreamModel) []LogicalModel {
+	groups := make([]LogicalModel, 0)
+	index := map[string]int{}
+	for _, row := range rows {
+		key := row.CanonicalModel + "\x00" + row.Capability
+		i, ok := index[key]
+		if !ok {
+			groups = append(groups, LogicalModel{CanonicalModel: row.CanonicalModel, Capability: row.Capability, Deployments: []UpstreamModel{}})
+			i = len(groups) - 1
+			index[key] = i
+		}
+		if groups[i].DisplayName == "" && row.DisplayName != nil && strings.TrimSpace(*row.DisplayName) != "" {
+			groups[i].DisplayName = *row.DisplayName
+		}
+		if row.IsDefault {
+			groups[i].IsDefault = true
+		}
+		groups[i].Deployments = append(groups[i].Deployments, row)
+	}
+	for i := range groups {
+		if groups[i].DisplayName == "" {
+			groups[i].DisplayName = groups[i].CanonicalModel
+		}
+	}
+	return groups
 }
 func (h *handler) listUpstreamModels(w http.ResponseWriter, r *http.Request) {
 	x, e := h.queryUpstreamModels(r, r.URL.Query().Get("upstreamId"))
@@ -73,15 +215,24 @@ func (h *handler) listUpstreamModels(w http.ResponseWriter, r *http.Request) {
 		statusErr(w, e)
 		return
 	}
-	httpx.JSON(w, 200, map[string]any{"models": x, "capabilities": []map[string]any{{"id": "chat", "name": "Chat"}, {"id": "embedding", "name": "Embedding"}, {"id": "rerank", "name": "Rerank"}, {"id": "image", "name": "Image"}}})
+	models := any(x)
+	if r.URL.Query().Get("grouped") == "1" {
+		models = groupUpstreamModels(x)
+	}
+	httpx.JSON(w, 200, map[string]any{"models": models, "capabilities": []map[string]any{{"id": "chat", "name": "Chat"}, {"id": "embedding", "name": "Embedding"}, {"id": "rerank", "name": "Rerank"}, {"id": "image", "name": "Image"}, {"id": "evaluation", "name": "Evaluation"}}})
 }
 func (h *handler) modelsForUpstream(w http.ResponseWriter, r *http.Request) {
-	x, e := h.queryUpstreamModels(r, chi.URLParam(r, "id"))
+	u, e := h.store.GetUpstream(r.Context(), principal(r).TenantID, chi.URLParam(r, "id"))
 	if e != nil {
 		statusErr(w, e)
 		return
 	}
-	httpx.JSON(w, 200, map[string]any{"models": x})
+	list, e := h.fetchUpstreamModelList(r.Context(), principal(r).TenantID, u)
+	if e != nil {
+		httpx.Error(w, 502, e.Error())
+		return
+	}
+	httpx.JSON(w, 200, map[string]any{"models": list})
 }
 func (h *handler) createUpstreamModel(w http.ResponseWriter, r *http.Request) {
 	var x UpstreamModel
@@ -89,8 +240,16 @@ func (h *handler) createUpstreamModel(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, 400, "upstreamId and nativeModel required")
 		return
 	}
-	if _, e := h.store.GetUpstream(r.Context(), principal(r).TenantID, x.UpstreamID); e != nil {
+	u, e := h.store.GetUpstream(r.Context(), principal(r).TenantID, x.UpstreamID)
+	if e != nil {
 		statusErr(w, e)
+		return
+	}
+	if x.Capability == "" && u.Protocol == "typesafe" {
+		x.Capability = "evaluation"
+	}
+	if e := validateProviderCapability(u.Protocol, firstNonEmpty(x.Capability, "chat")); e != nil {
+		httpx.Error(w, 400, e.Error())
 		return
 	}
 	if x.CanonicalModel == "" {
@@ -99,15 +258,15 @@ func (h *handler) createUpstreamModel(w http.ResponseWriter, r *http.Request) {
 	if x.Capability == "" {
 		x.Capability = "chat"
 	}
-	if x.Weight == "" {
-		x.Weight = "100"
+	if x.Weight == 0 {
+		x.Weight = 100
 	}
 	if x.Status == "" {
 		x.Status = "ready"
 	}
 	now := runtimeTimeString(h.store.now())
 	x.ID = h.store.id()
-	e := h.deps.Gorm.WithContext(r.Context()).Table("upstream_models").Create(map[string]any{"id": x.ID, "tenant_id": principal(r).TenantID, "upstream_id": x.UpstreamID, "native_model": x.NativeModel, "canonical_model": x.CanonicalModel, "display_name": x.DisplayName, "capability": x.Capability, "weight": x.Weight, "is_default": x.IsDefault, "options_json": validJSON(x.Options, "{}"), "meta_json": validJSON(x.Meta, "{}"), "status": x.Status, "last_error": nil, "synced_at": now, "created_at": now, "updated_at": now}).Error
+	e = h.deps.Gorm.WithContext(r.Context()).Table("upstream_models").Create(map[string]any{"id": x.ID, "tenant_id": principal(r).TenantID, "upstream_id": x.UpstreamID, "native_model": x.NativeModel, "canonical_model": x.CanonicalModel, "display_name": x.DisplayName, "capability": x.Capability, "weight": strconv.FormatFloat(x.Weight, 'f', -1, 64), "is_default": x.IsDefault, "options_json": validJSON(x.Options, "{}"), "meta_json": validJSON(x.Meta, "{}"), "status": x.Status, "last_error": nil, "synced_at": now, "created_at": now, "updated_at": now}).Error
 	if e != nil {
 		statusErr(w, e)
 		return
@@ -118,6 +277,26 @@ func (h *handler) patchUpstreamModel(w http.ResponseWriter, r *http.Request) {
 	m, e := decodeMap(r)
 	if e != nil {
 		httpx.Error(w, 400, "invalid JSON")
+		return
+	}
+	var current struct {
+		UpstreamID string `gorm:"column:upstream_id"`
+		Capability string `gorm:"column:capability"`
+	}
+	if err := h.deps.Gorm.WithContext(r.Context()).Table("upstream_models").Select("upstream_id,capability").Where("tenant_id=? AND id=?", principal(r).TenantID, chi.URLParam(r, "id")).Take(&current).Error; err != nil {
+		statusErr(w, err)
+		return
+	}
+	if value, exists := m["capability"]; exists {
+		current.Capability, _ = value.(string)
+	}
+	upstream, err := h.store.GetUpstream(r.Context(), principal(r).TenantID, current.UpstreamID)
+	if err != nil {
+		statusErr(w, err)
+		return
+	}
+	if err := validateProviderCapability(upstream.Protocol, current.Capability); err != nil {
+		httpx.Error(w, 400, err.Error())
 		return
 	}
 	sets := []string{}
@@ -164,13 +343,21 @@ func (h *handler) patchUpstreamModel(w http.ResponseWriter, r *http.Request) {
 	statusErr(w, ErrNotFound)
 }
 func (h *handler) deleteUpstreamModel(w http.ResponseWriter, r *http.Request) {
-	res := h.deps.Gorm.WithContext(r.Context()).Where("tenant_id=? AND id=?", principal(r).TenantID, chi.URLParam(r, "id")).Delete(&models.UpstreamModel{})
-	if res.Error != nil {
-		statusErr(w, res.Error)
-		return
-	}
-	if res.RowsAffected == 0 {
-		statusErr(w, ErrNotFound)
+	tenant := principal(r).TenantID
+	id := chi.URLParam(r, "id")
+	e := h.deps.Gorm.WithContext(r.Context()).Transaction(func(tx *gorm.DB) error {
+		upstreamID, native, canonical, e := lookupUpstreamModelTx(tx, tenant, id)
+		if e != nil {
+			return e
+		}
+		if e := deleteRoutesForModelTx(tx, tenant, upstreamID, native, canonical); e != nil {
+			return e
+		}
+		res := tx.Where("tenant_id=? AND id=?", tenant, id).Delete(&models.UpstreamModel{})
+		return res.Error
+	})
+	if e != nil {
+		statusErr(w, e)
 		return
 	}
 	httpx.JSON(w, 200, map[string]any{"ok": true})
@@ -188,14 +375,31 @@ func (h *handler) batchDeleteUpstreamModels(w http.ResponseWriter, r *http.Reque
 		httpx.Error(w, 400, "ids required")
 		return
 	}
+	tenant := principal(r).TenantID
 	n := int64(0)
-	for _, id := range ids {
-		res := h.deps.Gorm.WithContext(r.Context()).Where("tenant_id=? AND id=?", principal(r).TenantID, id).Delete(&models.UpstreamModel{})
-		if res.Error != nil {
-			statusErr(w, res.Error)
-			return
+	e = h.deps.Gorm.WithContext(r.Context()).Transaction(func(tx *gorm.DB) error {
+		for _, id := range ids {
+			upstreamID, native, canonical, e := lookupUpstreamModelTx(tx, tenant, id)
+			if errors.Is(e, gorm.ErrRecordNotFound) {
+				continue
+			}
+			if e != nil {
+				return e
+			}
+			if e := deleteRoutesForModelTx(tx, tenant, upstreamID, native, canonical); e != nil {
+				return e
+			}
+			res := tx.Where("tenant_id=? AND id=?", tenant, id).Delete(&models.UpstreamModel{})
+			if res.Error != nil {
+				return res.Error
+			}
+			n += res.RowsAffected
 		}
-		n += res.RowsAffected
+		return nil
+	})
+	if e != nil {
+		statusErr(w, e)
+		return
 	}
 	httpx.JSON(w, 200, map[string]any{"deleted": n})
 }
@@ -205,74 +409,166 @@ func (h *handler) batchDeleteUpstreams(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, 400, "ids required")
 		return
 	}
+	tenant := principal(r).TenantID
 	n := int64(0)
-	for _, id := range ids {
-		res := h.deps.Gorm.WithContext(r.Context()).Where("tenant_id=? AND id=?", principal(r).TenantID, id).Delete(&models.ModelUpstream{})
-		if res.Error != nil {
-			statusErr(w, res.Error)
-			return
+	e = h.deps.Gorm.WithContext(r.Context()).Transaction(func(tx *gorm.DB) error {
+		for _, id := range ids {
+			if e := tx.Table("model_routes").Where("tenant_id=? AND upstream_id=?", tenant, id).Delete(nil).Error; e != nil {
+				return e
+			}
+			res := tx.Where("tenant_id=? AND id=?", tenant, id).Delete(&models.ModelUpstream{})
+			if res.Error != nil {
+				return res.Error
+			}
+			n += res.RowsAffected
 		}
-		n += res.RowsAffected
-	}
-	httpx.JSON(w, 200, map[string]any{"deleted": n})
-}
-func (h *handler) syncUpstreamModels(w http.ResponseWriter, r *http.Request) {
-	count, e := h.discoverUpstreamModels(r.Context(), principal(r).TenantID, chi.URLParam(r, "id"))
+		return nil
+	})
 	if e != nil {
 		statusErr(w, e)
 		return
 	}
-	httpx.JSON(w, 200, map[string]any{"synced": count})
+	httpx.JSON(w, 200, map[string]any{"deleted": n})
 }
+func (h *handler) syncUpstreamModels(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ModelIDs []string `json:"modelIds"`
+	}
+	_ = httpx.DecodeJSON(r, &body)
+	tenant := principal(r).TenantID
+	id := chi.URLParam(r, "id")
+	u, e := h.store.GetUpstream(r.Context(), tenant, id)
+	if e != nil {
+		statusErr(w, e)
+		return
+	}
+	if u.Protocol == "typesafe" {
+		if e := h.store.ensureJevPreset(r.Context(), tenant, u); e != nil {
+			statusErr(w, e)
+			return
+		}
+	}
+	list, e := h.fetchUpstreamModelList(r.Context(), tenant, u)
+	if e != nil {
+		httpx.Error(w, 502, e.Error())
+		return
+	}
+	found := map[string]bool{}
+	for _, m := range list {
+		found[m.ID] = true
+	}
+	targets := list
+	unmatched := []map[string]any{}
+	if body.ModelIDs != nil {
+		want := map[string]bool{}
+		for _, mid := range body.ModelIDs {
+			want[mid] = true
+		}
+		targets = make([]remoteModel, 0, len(body.ModelIDs))
+		for _, m := range list {
+			if want[m.ID] {
+				targets = append(targets, m)
+			}
+		}
+		for _, mid := range body.ModelIDs {
+			if !found[mid] {
+				unmatched = append(unmatched, map[string]any{"nativeModel": mid})
+			}
+		}
+	}
+	existing := []string{}
+	if e := h.deps.Gorm.WithContext(r.Context()).Table("upstream_models").Where("tenant_id = ? AND upstream_id = ?", tenant, id).Pluck("native_model", &existing).Error; e != nil {
+		statusErr(w, e)
+		return
+	}
+	known := map[string]bool{}
+	for _, m := range existing {
+		known[m] = true
+	}
+	now := runtimeTimeString(h.store.now())
+	created, updated := 0, 0
+	for _, m := range targets {
+		res := h.deps.Gorm.WithContext(r.Context()).
+			Clauses(clause.OnConflict{
+				Columns: []clause.Column{{Name: "tenant_id"}, {Name: "upstream_id"}, {Name: "native_model"}, {Name: "capability"}},
+				DoUpdates: clause.Assignments(map[string]any{
+					"display_name": nullString(m.Name), "synced_at": now, "updated_at": now,
+					"status": "ready", "last_error": nil,
+				}),
+			}).
+			Table("upstream_models").
+			Create(map[string]any{"id": h.store.id(), "tenant_id": tenant, "upstream_id": id, "native_model": m.ID, "canonical_model": m.ID, "display_name": nullString(m.Name), "capability": firstNonEmpty(m.Capability, "chat"), "weight": "100", "is_default": false, "options_json": "{}", "meta_json": "{}", "status": "ready", "last_error": nil, "synced_at": now, "created_at": now, "updated_at": now})
+		if res.Error != nil {
+			statusErr(w, res.Error)
+			return
+		}
+		if u.Protocol != "typesafe" {
+			if e := h.ensureAutoRoute(r.Context(), tenant, id, m.ID, m.Name); e != nil {
+				statusErr(w, e)
+				return
+			}
+		}
+		if known[m.ID] {
+			updated++
+		} else {
+			created++
+			known[m.ID] = true
+		}
+	}
+	httpx.JSON(w, 200, map[string]any{"synced": len(targets), "created": created, "updated": updated, "unmatchedModels": unmatched})
+}
+
+// ensureJevPreset is local-only and must never probe /v1/models. It creates no
+// default route and never merges providers by their URL, name, or credentials.
+func (s *Store) ensureJevPreset(ctx context.Context, tenant string, u Upstream) error {
+	if u.Protocol != "typesafe" {
+		return nil
+	}
+	return s.deps.Gorm.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		now := runtimeTimeString(s.now())
+		if err := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "tenant_id"}, {Name: "upstream_id"}, {Name: "native_model"}, {Name: "capability"}},
+			DoUpdates: clause.Assignments(map[string]any{"synced_at": now, "updated_at": now}),
+		}).Table("upstream_models").Create(map[string]any{"id": s.id(), "tenant_id": tenant, "upstream_id": u.ID, "native_model": jevDefaultModel, "canonical_model": jevDefaultModel, "display_name": "Jev", "capability": "evaluation", "weight": "100", "is_default": false, "options_json": "{}", "meta_json": "{}", "status": "ready", "last_error": nil, "synced_at": now, "created_at": now, "updated_at": now}).Error; err != nil {
+			return err
+		}
+		var existing struct {
+			ID    string  `gorm:"column:id"`
+			Alias *string `gorm:"column:alias"`
+		}
+		err := tx.Table("model_routes").Select("id,alias").Where("tenant_id=? AND upstream_id=? AND model=? AND capability=?", tenant, u.ID, jevDefaultModel, "evaluation").Order("id").Take(&existing).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		if err == nil && existing.Alias != nil && strings.TrimSpace(*existing.Alias) != "" {
+			return nil
+		}
+		alias := "jev-" + u.ID
+		if existing.ID != "" {
+			return tx.Table("model_routes").Where("tenant_id=? AND id=?", tenant, existing.ID).Updates(map[string]any{"alias": alias, "updated_at": now}).Error
+		}
+		return tx.Table("model_routes").Create(map[string]any{"id": s.id(), "tenant_id": tenant, "name": "Jev", "slug": alias, "capability": "evaluation", "alias": alias, "upstream_id": u.ID, "model": jevDefaultModel, "options_json": "{}", "priority": "100", "weight": "100", "is_default": false, "status": "ready", "last_error": nil, "created_at": now, "updated_at": now}).Error
+	})
+}
+
 func (h *handler) discoverUpstreamModels(ctx context.Context, tenant, id string) (int, error) {
 	u, e := h.store.GetUpstream(ctx, tenant, id)
 	if e != nil {
 		return 0, e
 	}
-	var cfg upstreamConfig
-	if json.Unmarshal(u.Config, &cfg) != nil || cfg.BaseURL == "" {
-		return 0, errors.New("baseUrl not configured")
+	if u.Protocol == "typesafe" {
+		if err := h.store.ensureJevPreset(ctx, tenant, u); err != nil {
+			return 0, err
+		}
+		return 1, nil
 	}
-	target, e := safeProviderURL(cfg.BaseURL, "/v1/models")
+	list, e := h.fetchUpstreamModelList(ctx, tenant, u)
 	if e != nil {
 		return 0, e
-	}
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
-	if cfg.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
-	}
-	resp, e := h.service.gateway.client.Do(req)
-	if e != nil {
-		return 0, e
-	}
-	defer resp.Body.Close()
-	raw, e := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
-	if e != nil {
-		return 0, e
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return 0, fmt.Errorf("model discovery status %d", resp.StatusCode)
-	}
-	type item struct {
-		ID   string `json:"id"`
-		Name string `json:"name"`
-	}
-	var result struct {
-		Data   []item `json:"data"`
-		Models []item `json:"models"`
-	}
-	if json.Unmarshal(raw, &result) != nil {
-		return 0, errors.New("invalid model catalog")
-	}
-	if len(result.Data) == 0 {
-		result.Data = result.Models
 	}
 	now := runtimeTimeString(h.store.now())
 	count := 0
-	for _, m := range result.Data {
-		if m.ID == "" {
-			continue
-		}
+	for _, m := range list {
 		res := h.deps.Gorm.WithContext(ctx).
 			Clauses(clause.OnConflict{
 				Columns: []clause.Column{{Name: "tenant_id"}, {Name: "upstream_id"}, {Name: "native_model"}, {Name: "capability"}},
@@ -282,9 +578,12 @@ func (h *handler) discoverUpstreamModels(ctx context.Context, tenant, id string)
 				}),
 			}).
 			Table("upstream_models").
-			Create(map[string]any{"id": h.store.id(), "tenant_id": tenant, "upstream_id": id, "native_model": m.ID, "canonical_model": m.ID, "display_name": nullString(m.Name), "capability": "chat", "weight": "100", "is_default": false, "options_json": "{}", "meta_json": "{}", "status": "ready", "last_error": nil, "synced_at": now, "created_at": now, "updated_at": now})
+			Create(map[string]any{"id": h.store.id(), "tenant_id": tenant, "upstream_id": id, "native_model": m.ID, "canonical_model": m.ID, "display_name": nullString(m.Name), "capability": firstNonEmpty(m.Capability, "chat"), "weight": "100", "is_default": false, "options_json": "{}", "meta_json": "{}", "status": "ready", "last_error": nil, "synced_at": now, "created_at": now, "updated_at": now})
 		if res.Error != nil {
 			return count, res.Error
+		}
+		if e := h.ensureAutoRoute(ctx, tenant, id, m.ID, m.Name); e != nil {
+			return count, e
 		}
 		count++
 	}
@@ -306,23 +605,20 @@ func (h *handler) matchModelCatalog(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, 200, map[string]any{"models": out})
 }
 func (h *handler) refreshModelCatalog(w http.ResponseWriter, r *http.Request) {
-	tenant := principal(r).TenantID
-	ups, e := h.store.ListUpstreams(r.Context(), tenant)
-	if e != nil {
-		statusErr(w, e)
+	result, err := h.refreshCatalogMetadata(r.Context(), principal(r).TenantID)
+	if err != nil {
+		if len(result.Failed) == len(modelCatalogSources) {
+			details := []string{err.Error()}
+			for _, source := range modelCatalogSources {
+				details = append(details, source.name+": "+result.Failed[source.name])
+			}
+			httpx.Error(w, http.StatusBadGateway, strings.Join(details, "; "))
+		} else {
+			statusErr(w, err)
+		}
 		return
 	}
-	synced := 0
-	failed := map[string]string{}
-	for _, u := range ups {
-		n, e := h.discoverUpstreamModels(r.Context(), tenant, u.ID)
-		if e != nil {
-			failed[u.ID] = e.Error()
-			continue
-		}
-		synced += n
-	}
-	httpx.JSON(w, 200, map[string]any{"synced": synced, "failed": failed})
+	httpx.JSON(w, 200, result)
 }
 func (h *handler) importModelCatalog(w http.ResponseWriter, r *http.Request) {
 	var b struct {
@@ -340,11 +636,23 @@ func (h *handler) importModelCatalog(w http.ResponseWriter, r *http.Request) {
 		if m.CanonicalModel == "" {
 			m.CanonicalModel = m.NativeModel
 		}
+		upstream, err := h.store.GetUpstream(r.Context(), principal(r).TenantID, m.UpstreamID)
+		if err != nil {
+			httpx.Error(w, 400, "invalid upstream reference")
+			return
+		}
 		if m.Capability == "" {
 			m.Capability = "chat"
+			if upstream.Protocol == "typesafe" {
+				m.Capability = "evaluation"
+			}
 		}
-		if m.Weight == "" {
-			m.Weight = "100"
+		if err := validateProviderCapability(upstream.Protocol, m.Capability); err != nil {
+			httpx.Error(w, 400, err.Error())
+			return
+		}
+		if m.Weight == 0 {
+			m.Weight = 100
 		}
 		now := runtimeTimeString(h.store.now())
 		res := h.deps.Gorm.WithContext(r.Context()).
@@ -356,12 +664,56 @@ func (h *handler) importModelCatalog(w http.ResponseWriter, r *http.Request) {
 				}),
 			}).
 			Table("upstream_models").
-			Create(map[string]any{"id": h.store.id(), "tenant_id": principal(r).TenantID, "upstream_id": m.UpstreamID, "native_model": m.NativeModel, "canonical_model": m.CanonicalModel, "display_name": m.DisplayName, "capability": m.Capability, "weight": m.Weight, "is_default": m.IsDefault, "options_json": validJSON(m.Options, "{}"), "meta_json": validJSON(m.Meta, "{}"), "status": "ready", "last_error": nil, "synced_at": now, "created_at": now, "updated_at": now})
+			Create(map[string]any{"id": h.store.id(), "tenant_id": principal(r).TenantID, "upstream_id": m.UpstreamID, "native_model": m.NativeModel, "canonical_model": m.CanonicalModel, "display_name": m.DisplayName, "capability": m.Capability, "weight": strconv.FormatFloat(m.Weight, 'f', -1, 64), "is_default": m.IsDefault, "options_json": validJSON(m.Options, "{}"), "meta_json": validJSON(m.Meta, "{}"), "status": "ready", "last_error": nil, "synced_at": now, "created_at": now, "updated_at": now})
 		if res.Error == nil {
 			count++
 		}
 	}
 	httpx.JSON(w, 201, map[string]any{"imported": count})
+}
+
+func (h *handler) ensureAutoRoute(ctx context.Context, tenant, upstreamID, modelID, displayName string) error {
+	var existing int64
+	if e := h.deps.Gorm.WithContext(ctx).Table("model_routes").Where("tenant_id=? AND capability='chat' AND (alias=? OR model=?)", tenant, modelID, modelID).Count(&existing).Error; e != nil {
+		return e
+	}
+	if existing > 0 {
+		return nil
+	}
+	name := strings.TrimSpace(displayName)
+	if name == "" {
+		name = modelID
+	}
+	slug := slugify(modelID + "-chat")
+	if slug == "" {
+		slug = "model"
+	}
+	now := runtimeTimeString(h.store.now())
+	return h.deps.Gorm.WithContext(ctx).Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "tenant_id"}, {Name: "slug"}}, DoNothing: true}).Table("model_routes").Create(map[string]any{"id": h.store.id(), "tenant_id": tenant, "name": name, "slug": slug, "capability": "chat", "alias": modelID, "upstream_id": upstreamID, "model": modelID, "options_json": "{}", "priority": "100", "weight": "100", "is_default": false, "status": "ready", "last_error": nil, "created_at": now, "updated_at": now}).Error
+}
+
+func lookupUpstreamModelTx(tx *gorm.DB, tenant, id string) (string, string, string, error) {
+	var row struct {
+		UpstreamID     string `gorm:"column:upstream_id"`
+		NativeModel    string `gorm:"column:native_model"`
+		CanonicalModel string `gorm:"column:canonical_model"`
+	}
+	e := tx.Table("upstream_models").Select("upstream_id,native_model,canonical_model").Where("tenant_id=? AND id=?", tenant, id).Take(&row).Error
+	if errors.Is(e, gorm.ErrRecordNotFound) {
+		return "", "", "", ErrNotFound
+	}
+	if e != nil {
+		return "", "", "", e
+	}
+	return row.UpstreamID, row.NativeModel, row.CanonicalModel, nil
+}
+
+func deleteRoutesForModelTx(tx *gorm.DB, tenant, upstreamID, nativeModel, canonicalModel string) error {
+	aliases := []string{nativeModel}
+	if canonicalModel != "" && canonicalModel != nativeModel {
+		aliases = append(aliases, canonicalModel)
+	}
+	return tx.Table("model_routes").Where("tenant_id=? AND upstream_id=? AND (alias IN ? OR model IN ?)", tenant, upstreamID, aliases, aliases).Delete(nil).Error
 }
 
 var _ = sql.ErrNoRows

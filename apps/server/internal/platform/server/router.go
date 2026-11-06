@@ -56,14 +56,18 @@ func Router(cfg config.Config, d *appdeps.Dependencies, log *slog.Logger) http.H
 	admin.RegisterRoutes(r, d)
 	usage.RegisterRoutes(r, d)
 	platformsystem.RegisterRoutes(r, d)
-	runtime.RegisterRoutes(r, d)
-	integrations.RegisterRoutes(r, d)
+	mcpLifecycle := runtime.RegisterRoutes(r, d)
+	integrations.RegisterRoutes(r, d, mcpLifecycle)
 	r.NotFound(func(w http.ResponseWriter, r *http.Request) { httpx.Error(w, 404, "not found") })
 	return r
 }
 
 func NewDependencies(cfg config.Config, db *sql.DB, dialect string, rebind func(string) string, gormDB *gorm.DB) *appdeps.Dependencies {
-	return &appdeps.Dependencies{DB: db, Gorm: gormDB, Dialect: dialect, Rebind: rebind, Clock: time.Now, NewID: newID, Secret: []byte(cfg.Secret), PublicURL: cfg.PublicURL, WebURL: cfg.WebURL, DataDir: cfg.DataDir, Edition: cfg.Edition, MultiTenant: cfg.MultiTenant, VerifyDomain: VerifyDNSDomain}
+	d := &appdeps.Dependencies{DB: db, Gorm: gormDB, Dialect: dialect, Rebind: rebind, Clock: time.Now, NewID: newID, Secret: []byte(cfg.Secret), PublicURL: cfg.PublicURL, WebURL: cfg.WebURL, DataDir: cfg.DataDir, Edition: cfg.Edition, MultiTenant: cfg.MultiTenant, VerifyDomain: VerifyDNSDomain}
+	d.OnTenantCreated = func(ctx context.Context, tenantID string) {
+		_ = admin.SyncManagedWebDefaultsForTenant(ctx, d, tenantID)
+	}
+	return d
 }
 
 func newID() string {

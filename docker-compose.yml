@@ -1,6 +1,6 @@
-# Zakura — OSS quickstart（分服务镜像：server + web）
+# Zakura — OSS quickstart（server + web + 独立 node）
 #
-# 默认 SQLite（持久化到命名卷），server 与 web 两个容器：
+# 默认 SQLite（持久化到命名卷），完成管理员初始化后 node 自动登记：
 #   docker compose up -d
 #
 # 使用 Postgres（内置 pgvector 服务，需把 DATABASE_URL 指过去）：
@@ -12,8 +12,7 @@
 #
 # 健康检查：server 暴露 /livez（liveness）与 /readyz（readiness）。
 # 迁移：默认 AUTO_MIGRATE=true（首启建表）；生产多副本请设 AUTO_MIGRATE=false，
-#       并先用一次 release 任务应用迁移，详见 deploy/README.md。
-# 旧全栈镜像（回滚参考）：deploy/legacy-fullstack-compose.yml
+#       并先用一次 release 任务应用迁移。
 
 services:
   server:
@@ -26,22 +25,18 @@ services:
       # 默认 SQLite；改用 Postgres：postgresql://zakura:zakura@postgres:5432/zakura
       DATABASE_URL: ${DATABASE_URL:-file:/data/zakura.db}
       DATA_DIR: /data
-      ZAKURA_DATA_DIR: /data
       # 必填（>=32 字节）；quickstart 用占位默认值，部署时务必覆盖
       ZAKURA_SECRET: ${ZAKURA_SECRET:-zakura-local-dev-secret-change-me-0123456789abcdef}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8787}
       WEB_PUBLIC_URL: ${WEB_PUBLIC_URL:-http://localhost:3001}
       ZAKURA_EDITION: ${ZAKURA_EDITION:-oss}
       AUTO_MIGRATE: ${AUTO_MIGRATE:-true}
-      # 本机运行工作区容器时 bind 源必须是宿主机路径（详见 docs/deployment.md）
-      ZAKURA_HOST_DATA_DIR: ${ZAKURA_HOST_DATA_DIR:-}
-      # 工作区 / Runner 镜像直通（部署时按需覆盖）
-      ZAKURA_WORKSPACE_IMAGE: ${ZAKURA_WORKSPACE_IMAGE:-sunwuyuan/zakura-workspace-dev:latest}
-      ZAKURA_RUNNER_IMAGE: ${ZAKURA_RUNNER_IMAGE:-sunwuyuan/zakura-runner-dev:latest}
+      ZAKURA_NODE_BOOTSTRAP_DIR: /node-bootstrap
       OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: ${OTEL_EXPORTER_OTLP_LOGS_ENDPOINT:-}
       OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
     volumes:
       - zakura-data:/data
+      - node-bootstrap:/node-bootstrap
     restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -55,6 +50,39 @@ services:
       postgres:
         condition: service_healthy
         required: false
+    networks:
+      - zakura
+
+  node:
+    image: ${ZAKURA_NODE_IMAGE:-sunwuyuan/zakura-agent:latest}
+    environment:
+      ZAKURA_AGENT_SERVER: http://server:8787
+      ZAKURA_AGENT_KIND: server
+      ZAKURA_AGENT_STATE_DIR: /state
+      ZAKURA_AGENT_DATA_DIR: /workspace-data
+      ZAKURA_NODE_BOOTSTRAP_DIR: /node-bootstrap
+      ZAKURA_WORKSPACE_VOLUME: ${COMPOSE_PROJECT_NAME:-recloud}_workspace-data
+    volumes:
+      - node-state:/state
+      - workspace-data:/workspace-data
+      - type: volume
+        source: node-bootstrap
+        target: /node-bootstrap
+        read_only: true
+        volume:
+          nocopy: true
+      # Docker Socket 赋予节点宿主管理权限；控制面不挂载此 Socket。
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      server:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "zakura-agent", "-healthcheck"]
+      interval: 20s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     networks:
       - zakura
 
@@ -118,6 +146,10 @@ services:
 
 volumes:
   zakura-data:
+  node-bootstrap:
+  node-state:
+  workspace-data:
+    name: ${COMPOSE_PROJECT_NAME:-recloud}_workspace-data
   postgres-data:
   redis-data:
 

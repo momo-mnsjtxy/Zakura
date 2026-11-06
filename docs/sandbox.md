@@ -1,6 +1,6 @@
-# Agent execution sandbox
+# Restricted agent execution mode
 
-The Go agent supports an explicit Docker-backed execution mode. Legacy host execution remains available and **is not isolated**. Path validation on a host working directory is not a sandbox.
+Zakura already supports long-lived Docker workspaces with container isolation, writable project files, terminals, browser tools, and ACP. This feature adds an optional, more restrictive per-command Docker execution policy and an agent tool allowlist. It does not replace the existing workspace container or claim that previous container execution lacked isolation. Ordinary host execution remains available without container isolation; host working-directory path validation alone is not a sandbox.
 
 ## Selecting the mode
 
@@ -14,9 +14,9 @@ This is separate from choosing sandbox mode on an individual shell command. Manu
 - `shell_exec` accepts `execution_mode: "sandbox"` or `"host"`. The server checks the runner's `sandbox.policy` capability before requesting sandbox execution, so an older runner cannot silently ignore the mode.
 - Agent RPC `host.exec`, `host.exec.start`, `host.exec.get`, and `host.exec.kill` accept `executionMode: "sandbox"`. Supply the same valid `spaceId` and execution mode when polling or cancelling a job.
 - Setting `ZAKURA_SANDBOX_ENABLED=true` on the agent enforces sandbox mode when its handler is created. A request for host mode cannot disable operator enforcement. Without enforcement, omitted execution mode preserves host compatibility.
-- Results disclose `executionMode` and `isolated`; sandbox execution adds `timedOut`, `cancelled`, and `truncated`. Background jobs also report operational errors.
+- Shell results distinguish `executionMode: host` (no container isolation), `workspace-container` (existing Docker workspace isolation), and `sandbox` (confirmed restricted policy). `restrictedPolicyApplied` is true only for the last mode. `isolated` records container isolation, not a claim of virtual-machine isolation or containment of the entire application. Sandbox execution adds `timedOut`, `cancelled`, and `truncated`; background jobs also report operational errors.
 - `sandbox.policy` describes the configured policy, default mode, and enforcement. Image configuration is not evidence that the Docker daemon or image is usable.
-- Sandbox mode currently supports host workspaces only. Unsupported workspace backends, PTY sessions, and Docker execution/management transports are refused rather than silently downgraded.
+- The restricted execution mode currently supports host workspaces only; it mounts that dedicated workspace into a fresh restricted container. Existing container workspaces retain their normal behavior and cannot opt into this mode yet. Unsupported workspace backends, PTY sessions, and Docker execution/management transports are refused rather than silently downgraded.
 
 ## Operator prerequisites
 
@@ -47,7 +47,7 @@ Read-only workspace means build/install workflows must use `/tmp` and cannot per
 
 ## Failure and lifecycle behavior
 
-The server uses workspace-scoped background start/get/kill RPCs for sandbox commands. Cancelling an agent run sends a scoped kill and waits up to five seconds for a terminal acknowledgment. Cleanup or terminal execution errors are surfaced, and an unconfirmed cancellation is reported as uncertain rather than successful.
+The server uses workspace-scoped background start/get/kill RPCs for sandbox commands. Cancelling an agent run sends a scoped kill and waits up to fifteen seconds for a terminal acknowledgment. Cleanup or terminal execution errors are surfaced, and an unconfirmed cancellation is reported as uncertain rather than successful.
 
 Starting a job uses a separate ten-second deadline so that an agent-run cancellation does not immediately discard the job identity needed for cleanup. If the start response is lost or cannot be confirmed, the server does not retry: the outcome is unknown, and any started job remains bounded by its hard execution timeout. Operator follow-up may still be needed when connectivity or daemon failures prevent cleanup confirmation.
 
@@ -76,3 +76,19 @@ ZAKURA_SANDBOX_INTEGRATION=1 ZAKURA_SANDBOX_IMAGE='<approved-local-image@sha256:
 The image needs `sh`, `cat`, `id`, `pwd`, `touch`, `ls`, `head`, and `sleep`. The test checks workspace readability, non-root user, denied workspace writes, ephemeral scratch, clean parent environment, loopback-only networking, capped output, timeout/cancellation and absence of newly remaining sandbox containers. Run without concurrent sandbox workloads so cleanup assertions are meaningful. Opt-in with missing Docker/image fails rather than skips. Without opt-in it explicitly skips.
 
 The development executor had no Docker CLI or daemon access, so real Docker isolation was **not locally verified**. The dedicated CI integration stage must pass on the exact change before claiming real-backend validation. These tests are defensive behavior checks; they do not constitute a sandbox-escape assessment or production certification.
+
+## Server tool boundary and deadline validation
+
+The server's `shell_exec` invokes `bash -lc`; the configured production image must include **bash**, not only `sh`. The CI image explicitly installs bash before exercising the complete server -> WebSocket runner -> Docker path. This integration uses benign fixture output and sleep commands, and is separate from direct backend tests.
+
+Restricted output uses an in-memory bounded preview only, including when runner policy enforces sandboxing for a legacy request. The server does not spill that output through host filesystem RPCs. The structured `truncated` flag combines the runner byte cap and the server 24,000-byte preview threshold. Ordinary host/container workspace spillover behavior is unchanged.
+
+Command execution timeout is passed separately from the RPC observation budget (up to 30 seconds of transport/cleanup grace). Caller cancellation is still acted upon immediately. Cleanup has an independent 15-second confirmation budget, covering the runner's 10-second cleanup and process wait. Bounded final stdout/stderr and timeout/cancellation flags are preserved only after verified terminal cleanup; unconfirmed cleanup remains an error.
+
+The opt-in `ZAKURA_SERVER_SANDBOX_INTEGRATION=1` test requires `ZAKURA_SANDBOX_AGENT_BINARY` pointing to a built runner and `ZAKURA_SANDBOX_IMAGE` pointing to the bash-capable image. It checks long stdout/stderr without host writes, final output after timeout, caller cancellation, and operator-enforced sandbox output. Missing prerequisites fail rather than skip when opted in.
+
+Internal ACP, cloud, provider and admin-default configuration saves now apply field-scoped compare-and-swap mutations to current JSON, retrying a bounded number of times on concurrent changes. They do not restore an unchanged `executionMode` from an old snapshot. The public full-config replacement API remains deliberate replacement, including intentional policy changes; callers using that API must not submit an unrelated stale whole-object snapshot. Regression tests cover SQLite and an opt-in disposable PostgreSQL service.
+
+RPC write queue acquisition and socket writes are also deadline-bound; an interrupted partial WebSocket frame closes that connection rather than being reused. A failed transport can still make cleanup unconfirmable, which remains an explicit error rather than a containment guarantee.
+
+Runner RPC responses are reassembled from bounded WebSocket fragments before JSON decoding. Real client libraries can fragment ordinary long stdout/stderr responses; the server preserves those responses and handles interleaved control frames rather than silently losing them. The combined message remains limited to 16 MiB.

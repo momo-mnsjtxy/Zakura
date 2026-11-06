@@ -10,6 +10,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -26,27 +28,42 @@ import (
 
 func strPtr(v string) *string { return &v }
 
+type MCPInstanceLifecycle interface {
+	Start(context.Context, string, string) error
+	Stop(context.Context, string, string) error
+}
+
 type handler struct {
+	lifecycle      MCPInstanceLifecycle
 	deps           *appdeps.Dependencies
 	client         *http.Client
 	runtimeStore   *internalruntime.Store
 	runtimeService *internalruntime.Service
 }
 
-func RegisterRoutes(r chi.Router, deps *appdeps.Dependencies) {
+func RegisterRoutes(r chi.Router, deps *appdeps.Dependencies, lifecycle ...MCPInstanceLifecycle) {
 	h := &handler{deps: deps, client: &http.Client{Timeout: 60 * time.Second}}
+	if len(lifecycle) > 0 {
+		h.lifecycle = lifecycle[0]
+	}
 	h.runtimeStore = internalruntime.NewStore(deps)
 	h.runtimeService = internalruntime.NewService(h.runtimeStore)
 	r.Post("/api/connectors/{ref}/events", h.webhook)
 	r.Handle("/api/remote-channels/{tenantId}/{bindingId}/webhook", http.HandlerFunc(h.remoteWebhook))
 	r.Post("/api/email/inbound/{tenantId}", h.emailInbound)
 	r.Post("/api/email/inbound/{tenantId}/{connectorId}", h.emailInbound)
+	r.Post("/api/connectors/oauth/complete", h.oauthComplete)
 	r.Group(func(api chi.Router) {
 		api.Use(httpx.Auth(deps))
 		api.Use(internalruntime.RequireAPIScope)
+		api.Use(h.integrationResourceGuard)
 		h.routes(api)
 	})
 	h.startDeliverer(deps.RunContext())
+	h.startEmailPoller(deps.RunContext())
+	if err := h.seedEmailPackages(deps.RunContext()); err != nil {
+		slog.Error("email package catalogue initialization failed", "error", err)
+	}
 }
 func (h *handler) routes(r chi.Router) {
 	r.Get("/api/connectors", h.listConnectors)
@@ -93,7 +110,7 @@ func (h *handler) id() string {
 }
 func principal(r *http.Request) httpx.Principal { p, _ := httpx.PrincipalFrom(r.Context()); return p }
 func writeErr(w http.ResponseWriter, e error) {
-	if errors.Is(e, sql.ErrNoRows) || errors.Is(e, gorm.ErrRecordNotFound) {
+	if errors.Is(e, sql.ErrNoRows) || errors.Is(e, gorm.ErrRecordNotFound) || errors.Is(e, httpx.ErrResourceScope) {
 		httpx.Error(w, 404, "Not found")
 	} else {
 		httpx.Error(w, 400, e.Error())
@@ -103,15 +120,26 @@ func validRef(ref string) bool { _, ok := provider(ref); return ok }
 
 func (h *handler) listConnectors(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
-	var installs []models.AgentConnectorInstallation
-	if e := h.deps.Gorm.WithContext(r.Context()).Where("tenant_id = ?", p.TenantID).Find(&installs).Error; e != nil {
+	spaces, e := h.allowedSpaces(r)
+	if e != nil {
+		writeErr(w, e)
+		return
+	}
+	for _, space := range spaces {
+		if e = h.migrateSpaceConnectors(r.Context(), p.TenantID, space); e != nil {
+			writeErr(w, e)
+			return
+		}
+	}
+	var installs []spaceConnectorInstallation
+	if e := h.deps.Gorm.WithContext(r.Context()).Where("tenant_id = ? AND space_id IN ?", p.TenantID, spaces).Find(&installs).Error; e != nil {
 		writeErr(w, e)
 		return
 	}
 	installed := map[string]int{}
 	for _, row := range installs {
 		if row.Enabled {
-			installed[row.ConnectorRef]++
+			installed[canonicalRef(row.ConnectorRef)]++
 		}
 	}
 	type profileState struct {
@@ -144,9 +172,26 @@ func (h *handler) listConnectors(w http.ResponseWriter, r *http.Request) {
 			profiles[row.ProfileKey] = profileState{scope: row.ScopeKey, label: row.Label, fields: fields, enabled: row.Enabled}
 		}
 	}
+	settingsByRef := map[string][]string{}
+	for _, row := range installs {
+		cfg, e := h.spaceEnvelope(row)
+		if e != nil {
+			continue
+		}
+		keys := []string{}
+		for k, v := range cfg.Settings {
+			if v != nil && !strings.HasPrefix(k, "oauth") {
+				keys = append(keys, k)
+			}
+		}
+		settingsByRef[row.ConnectorRef] = keys
+	}
 	items := make([]map[string]any, 0, len(providers))
 	for _, x := range providers {
 		st, ok := profiles[x.Auth.Profile]
+		if !ok && strings.HasPrefix(x.Auth.Profile, "email-") {
+			st, ok = profiles["email"]
+		}
 		fields := []string{}
 		profileLabel := x.Auth.ProfileLabel
 		if profileLabel == "" {
@@ -169,25 +214,134 @@ func (h *handler) listConnectors(w http.ResponseWriter, r *http.Request) {
 		if ready {
 			status = "ready"
 		}
+		authSettings := x.Auth.Settings
+		if authSettings == nil {
+			authSettings = []AuthField{}
+		}
+		configuredSettings := settingsByRef[x.Ref]
+		if configuredSettings == nil && strings.HasPrefix(x.Ref, "email-") {
+			configuredSettings = settingsByRef["email"]
+		}
+		if configuredSettings == nil {
+			configuredSettings = []string{}
+		}
+		auth := map[string]any{
+			"kind": x.Auth.Kind, "profile": x.Auth.Profile, "profileLabel": x.Auth.ProfileLabel,
+			"docsUrl": x.Auth.DocsURL, "fields": x.Auth.Fields, "settings": authSettings,
+		}
+		if x.Auth.AuthorizationEndpoint != "" {
+			auth["authorizationEndpoint"] = x.Auth.AuthorizationEndpoint
+		}
+		if x.Auth.TokenEndpoint != "" {
+			auth["tokenEndpoint"] = x.Auth.TokenEndpoint
+		}
+		if len(x.Auth.AuthorizeParams) > 0 {
+			auth["authorizeParams"] = x.Auth.AuthorizeParams
+		}
+		if x.Auth.TokenField != "" {
+			auth["tokenField"] = x.Auth.TokenField
+		}
+		if x.Auth.TokenHeader != "" {
+			auth["tokenHeader"] = x.Auth.TokenHeader
+		}
+		if x.Auth.TokenScheme != "" {
+			auth["tokenScheme"] = x.Auth.TokenScheme
+		}
+		installationViews := []map[string]any{}
+		for _, row := range installs {
+			if row.ConnectorRef == x.Ref {
+				v := connectionView(row)
+				v["enabled"] = row.Enabled
+				v["connectorRef"] = row.ConnectorRef
+				installationViews = append(installationViews, v)
+			}
+		}
 		items = append(items, map[string]any{
 			"id": x.Ref, "ref": x.Ref, "name": x.Name, "description": x.Description,
 			"package": map[string]any{"slug": x.Package.Slug, "name": x.Package.Name, "icon": x.Package.Icon, "accent": x.Package.Accent, "homepage": x.Package.Homepage},
-			"auth":    map[string]any{"kind": x.Auth.Kind, "profile": x.Auth.Profile, "profileLabel": x.Auth.ProfileLabel, "docsUrl": x.Auth.DocsURL, "fields": x.Auth.Fields},
+			"auth":    auth,
 			"status":  status, "ready": ready, "enabled": ready,
 			"lockedByPlatform":   false,
 			"profile":            map[string]any{"key": x.Auth.Profile, "label": profileLabel, "shared": false, "connectorRefs": []string{x.Ref}, "configuredFields": fields, "enabled": profileEnabled},
 			"credentialSource":   credentialSource,
 			"configuredFields":   fields,
-			"configuredSettings": []any{},
-			"authorized":         false, "installations": []any{},
-			"docsUrl": x.Auth.DocsURL, "hasTools": false, "capabilities": []any{},
+			"configuredSettings": configuredSettings,
+			"authorized":         false, "installations": installationViews,
+			"installedSpaces": installed[x.Ref],
+			"docsUrl":         x.Auth.DocsURL, "hasTools": false, "capabilities": []any{},
 			"authKind": x.AuthKind, "installedAgents": installed[x.Ref],
 		})
 	}
 	httpx.JSON(w, 200, map[string]any{"connectors": items})
 }
+func (h *handler) configuredProfileFields(scopeKey, profileKey, configEnc string) []string {
+	fields := []string{}
+	if raw, e := decrypt(h.deps.Secret, scopeKey+":"+profileKey, configEnc); e == nil {
+		var cfg map[string]any
+		if json.Unmarshal(raw, &cfg) == nil {
+			for k, v := range cfg {
+				if v != nil && v != "" {
+					fields = append(fields, k)
+				}
+			}
+		}
+	}
+	return fields
+}
+func (h *handler) platformProfile(row models.ConnectorAuthProfile) map[string]any {
+	refs := []string{}
+	fields := []AuthField{}
+	fieldSeen := map[string]bool{}
+	docsURL := ""
+	for _, x := range providers {
+		if x.Auth.Profile != row.ProfileKey {
+			continue
+		}
+		refs = append(refs, x.Ref)
+		for _, f := range x.Auth.Fields {
+			if fieldSeen[f.Key] {
+				continue
+			}
+			fieldSeen[f.Key] = true
+			fields = append(fields, f)
+		}
+		if docsURL == "" {
+			docsURL = x.Auth.DocsURL
+		}
+	}
+	item := map[string]any{
+		"key": row.ProfileKey, "label": row.Label, "kind": row.Kind,
+		"enabled": row.Enabled, "custom": len(refs) == 0,
+		"fields": fields, "connectorRefs": refs,
+		"configuredFields": h.configuredProfileFields(row.ScopeKey, row.ProfileKey, row.ConfigEnc),
+	}
+	if docsURL != "" {
+		item["docsUrl"] = docsURL
+	}
+	return item
+}
 func (h *handler) listProfiles(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
+	if r.URL.Query().Get("scope") == "platform" {
+		if !p.IsPlatformAdmin {
+			httpx.Error(w, 403, "platform admin only")
+			return
+		}
+		var rows []models.ConnectorAuthProfile
+		if e := h.deps.Gorm.WithContext(r.Context()).
+			Where("scope_key = ?", "platform").
+			Order("profile_key").
+			Find(&rows).Error; e != nil {
+			writeErr(w, e)
+			return
+		}
+		items := make([]map[string]any, 0)
+		for _, row := range rows {
+			items = append(items, h.platformProfile(row))
+		}
+		httpx.JSON(w, 200, map[string]any{"profiles": items})
+		return
+	}
 	var rows []models.ConnectorAuthProfile
 	if e := h.deps.Gorm.WithContext(r.Context()).
 		Where("scope_key IN ?", []string{p.TenantID, "platform"}).
@@ -198,17 +352,7 @@ func (h *handler) listProfiles(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]map[string]any, 0)
 	for _, row := range rows {
-		fields := []string{}
-		if raw, e := decrypt(h.deps.Secret, p.TenantID+":"+row.ProfileKey, row.ConfigEnc); e == nil {
-			var cfg map[string]any
-			if json.Unmarshal(raw, &cfg) == nil {
-				for k, v := range cfg {
-					if v != nil && v != "" {
-						fields = append(fields, k)
-					}
-				}
-			}
-		}
+		fields := h.configuredProfileFields(row.ScopeKey, row.ProfileKey, row.ConfigEnc)
 		items = append(items, map[string]any{"id": *row.ID, "profileKey": row.ProfileKey, "label": row.Label, "kind": row.Kind, "enabled": row.Enabled, "configuredFields": fields, "createdAt": row.CreatedAt, "updatedAt": row.UpdatedAt})
 	}
 	httpx.JSON(w, 200, map[string]any{"profiles": items})
@@ -216,6 +360,11 @@ func (h *handler) listProfiles(w http.ResponseWriter, r *http.Request) {
 func (h *handler) putProfile(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
 	key := chi.URLParam(r, "profileKey")
+	scope := r.URL.Query().Get("scope")
+	if scope == "platform" && !p.IsPlatformAdmin {
+		httpx.Error(w, 403, "platform admin only")
+		return
+	}
 	var b struct {
 		Label, Kind string
 		Enabled     *bool           `json:"enabled"`
@@ -232,13 +381,17 @@ func (h *handler) putProfile(w http.ResponseWriter, r *http.Request) {
 	if len(b.Config) == 0 {
 		b.Config = json.RawMessage(`{}`)
 	}
-	enc, e := encrypt(h.deps.Secret, p.TenantID+":"+key, b.Config)
+	scopeKey := p.TenantID
+	if scope == "platform" {
+		scopeKey = "platform"
+	}
+	enc, e := encrypt(h.deps.Secret, scopeKey+":"+key, b.Config)
 	if e != nil {
 		writeErr(w, e)
 		return
 	}
 	now := h.now().Format(time.RFC3339Nano)
-	row := models.ConnectorAuthProfile{ID: strPtr(h.id()), ScopeKey: p.TenantID, ProfileKey: key, Label: b.Label, Kind: b.Kind, Enabled: enabled, ConfigEnc: enc, CreatedAt: now, UpdatedAt: now}
+	row := models.ConnectorAuthProfile{ID: strPtr(h.id()), ScopeKey: scopeKey, ProfileKey: key, Label: b.Label, Kind: b.Kind, Enabled: enabled, ConfigEnc: enc, CreatedAt: now, UpdatedAt: now}
 	e = h.deps.Gorm.WithContext(r.Context()).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "scope_key"}, {Name: "profile_key"}},
 		DoUpdates: clause.AssignmentColumns([]string{"label", "kind", "enabled", "config_enc", "updated_at"}),
@@ -247,11 +400,24 @@ func (h *handler) putProfile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, e)
 		return
 	}
+	if scope == "platform" {
+		httpx.JSON(w, 200, map[string]any{"profile": h.platformProfile(models.ConnectorAuthProfile{ID: row.ID, ScopeKey: scopeKey, ProfileKey: key, Label: b.Label, Kind: b.Kind, Enabled: enabled, ConfigEnc: enc, CreatedAt: now, UpdatedAt: now})})
+		return
+	}
 	httpx.JSON(w, 200, map[string]any{"profile": map[string]any{"profileKey": key, "label": b.Label, "kind": b.Kind, "enabled": enabled}})
 }
 func (h *handler) deleteProfile(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
-	res := h.deps.Gorm.WithContext(r.Context()).Where("scope_key = ? AND profile_key = ?", p.TenantID, chi.URLParam(r, "profileKey")).Delete(&models.ConnectorAuthProfile{})
+	scope := r.URL.Query().Get("scope")
+	if scope == "platform" && !p.IsPlatformAdmin {
+		httpx.Error(w, 403, "platform admin only")
+		return
+	}
+	scopeKey := p.TenantID
+	if scope == "platform" {
+		scopeKey = "platform"
+	}
+	res := h.deps.Gorm.WithContext(r.Context()).Where("scope_key = ? AND profile_key = ?", scopeKey, chi.URLParam(r, "profileKey")).Delete(&models.ConnectorAuthProfile{})
 	if res.Error != nil {
 		writeErr(w, res.Error)
 		return
@@ -298,10 +464,18 @@ func (h *handler) oauthStart(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, 404, "Unknown connector")
 		return
 	}
-	var b struct{ ProfileKey, AgentID, RedirectURI string }
+	var b struct{ ProfileKey, AgentID, SpaceID, RedirectURI string }
 	if httpx.DecodeJSON(r, &b) != nil || b.ProfileKey == "" {
 		httpx.Error(w, 400, "profileKey required")
 		return
+	}
+	if b.SpaceID != "" || b.AgentID != "" {
+		space, e := h.resourceSpace(r, b.SpaceID, b.AgentID)
+		if e != nil {
+			writeErr(w, e)
+			return
+		}
+		b.SpaceID = space
 	}
 	cfg, e := h.profileConfig(r.Context(), p.TenantID, b.ProfileKey)
 	if e != nil {
@@ -314,7 +488,7 @@ func (h *handler) oauthStart(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, 400, "OAuth profile is incomplete")
 		return
 	}
-	statePayload, _ := json.Marshal(map[string]any{"tenantId": p.TenantID, "userId": p.UserID, "agentId": b.AgentID, "ref": ref, "profileKey": b.ProfileKey, "exp": h.now().Add(10 * time.Minute).Unix()})
+	statePayload, _ := json.Marshal(map[string]any{"tenantId": p.TenantID, "userId": p.UserID, "agentId": b.AgentID, "spaceId": b.SpaceID, "ref": ref, "profileKey": b.ProfileKey, "redirectUri": b.RedirectURI, "exp": h.now().Add(10 * time.Minute).Unix()})
 	sig := hmac.New(sha256.New, h.deps.Secret)
 	sig.Write(statePayload)
 	state := base64.RawURLEncoding.EncodeToString(statePayload) + "." + base64.RawURLEncoding.EncodeToString(sig.Sum(nil))
@@ -340,32 +514,151 @@ func (h *handler) oauthStart(w http.ResponseWriter, r *http.Request) {
 	u.RawQuery = q.Encode()
 	httpx.JSON(w, 200, map[string]any{"authorizeUrl": u.String(), "state": state, "expiresAt": h.now().Add(10 * time.Minute)})
 }
+func (h *handler) oauthComplete(w http.ResponseWriter, r *http.Request) {
+	var b struct{ Code, State string }
+	if httpx.DecodeJSON(r, &b) != nil || b.Code == "" || b.State == "" {
+		httpx.Error(w, 400, "code and state required")
+		return
+	}
+	parts := strings.Split(b.State, ".")
+	if len(parts) != 2 {
+		httpx.Error(w, 400, "invalid state")
+		return
+	}
+	payload, e := base64.RawURLEncoding.DecodeString(parts[0])
+	if e != nil {
+		httpx.Error(w, 400, "invalid state")
+		return
+	}
+	sig, e := base64.RawURLEncoding.DecodeString(parts[1])
+	if e != nil {
+		httpx.Error(w, 400, "invalid state")
+		return
+	}
+	mac := hmac.New(sha256.New, h.deps.Secret)
+	mac.Write(payload)
+	if !hmac.Equal(sig, mac.Sum(nil)) {
+		httpx.Error(w, 400, "invalid state")
+		return
+	}
+	var sp struct {
+		TenantID    string `json:"tenantId"`
+		UserID      string `json:"userId"`
+		AgentID     string `json:"agentId"`
+		SpaceID     string `json:"spaceId"`
+		Ref         string `json:"ref"`
+		ProfileKey  string `json:"profileKey"`
+		RedirectURI string `json:"redirectUri"`
+		Exp         int64  `json:"exp"`
+	}
+	if e = json.Unmarshal(payload, &sp); e != nil {
+		httpx.Error(w, 400, "invalid state")
+		return
+	}
+	if sp.Exp < h.now().Unix() {
+		httpx.Error(w, 400, "state expired")
+		return
+	}
+	cfg, e := h.profileConfig(r.Context(), sp.TenantID, sp.ProfileKey)
+	if e != nil {
+		httpx.Error(w, 400, "profile unavailable")
+		return
+	}
+	tokenURL, _ := cfg["tokenUrl"].(string)
+	clientID, _ := cfg["clientId"].(string)
+	clientSecret, _ := cfg["clientSecret"].(string)
+	if tokenURL == "" || clientID == "" || clientSecret == "" {
+		httpx.Error(w, 400, "OAuth profile is incomplete")
+		return
+	}
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", b.Code)
+	form.Set("redirect_uri", sp.RedirectURI)
+	form.Set("client_id", clientID)
+	form.Set("client_secret", clientSecret)
+	req, e := http.NewRequestWithContext(r.Context(), http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
+	if e != nil {
+		httpx.Error(w, 400, "token exchange failed")
+		return
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	client := h.deps.HTTPClient
+	if client == nil {
+		client = h.client
+	}
+	resp, e := client.Do(req)
+	if e != nil {
+		httpx.Error(w, 400, "token exchange failed")
+		return
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	var tr map[string]any
+	_ = json.Unmarshal(raw, &tr)
+	accessToken, _ := tr["access_token"].(string)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 || accessToken == "" {
+		msg := "token exchange failed"
+		if desc, _ := tr["error_description"].(string); desc != "" {
+			if len(desc) > 200 {
+				desc = desc[:200]
+			}
+			msg = msg + ": " + desc
+		}
+		httpx.Error(w, 400, msg)
+		return
+	}
+	var row models.ConnectorAuthProfile
+	e = h.deps.Gorm.WithContext(r.Context()).
+		Where("scope_key IN ? AND profile_key = ? AND enabled = true", []string{sp.TenantID, "platform"}, sp.ProfileKey).
+		Order(clause.OrderBy{Expression: clause.Expr{SQL: "CASE WHEN scope_key = ? THEN 0 ELSE 1 END", Vars: []any{sp.TenantID}}}).
+		First(&row).Error
+	if e != nil {
+		httpx.Error(w, 400, "profile unavailable")
+		return
+	}
+	cfg["accessToken"] = accessToken
+	if refreshToken, _ := tr["refresh_token"].(string); refreshToken != "" {
+		cfg["refreshToken"] = refreshToken
+	}
+	merged, _ := json.Marshal(cfg)
+	enc, e := encrypt(h.deps.Secret, row.ScopeKey+":"+row.ProfileKey, merged)
+	if e != nil {
+		writeErr(w, e)
+		return
+	}
+	if e = h.deps.Gorm.WithContext(r.Context()).Model(&models.ConnectorAuthProfile{}).
+		Where("scope_key = ? AND profile_key = ?", row.ScopeKey, row.ProfileKey).
+		Updates(map[string]any{"config_enc": enc, "updated_at": h.now().Format(time.RFC3339Nano)}).Error; e != nil {
+		writeErr(w, e)
+		return
+	}
+	httpx.JSON(w, 200, map[string]any{"ok": true, "ref": sp.Ref, "profileKey": sp.ProfileKey, "agentId": sp.AgentID, "spaceId": sp.SpaceID})
+}
 func (h *handler) install(w http.ResponseWriter, r *http.Request) {
-	p := principal(r)
 	ref := chi.URLParam(r, "ref")
 	if !validRef(ref) {
 		httpx.Error(w, 404, "Unknown connector")
 		return
 	}
 	var b struct {
-		AgentID    string          `json:"agentId"`
-		ProfileKey string          `json:"profileKey"`
-		Config     json.RawMessage `json:"config"`
-		Enabled    *bool           `json:"enabled"`
+		SpaceID    string         `json:"spaceId"`
+		AgentID    string         `json:"agentId"`
+		ProfileKey string         `json:"profileKey"`
+		Config     map[string]any `json:"config"`
+		Enabled    *bool          `json:"enabled"`
 	}
-	if httpx.DecodeJSON(r, &b) != nil || b.AgentID == "" {
-		httpx.Error(w, 400, "agentId required")
+	if httpx.DecodeJSON(r, &b) != nil {
+		httpx.Error(w, 400, "invalid JSON")
 		return
 	}
-	var count int64
-	if e := h.deps.Gorm.WithContext(r.Context()).Model(&models.Agent{}).Where("tenant_id = ? AND id = ?", p.TenantID, b.AgentID).Count(&count).Error; e != nil || count == 0 {
-		httpx.Error(w, 404, "Agent not found")
-		return
-	}
-	data := map[string]any{"profileKey": b.ProfileKey, "config": json.RawMessage(b.Config)}
-	raw, _ := json.Marshal(data)
-	enc, e := encrypt(h.deps.Secret, p.TenantID+":"+b.AgentID+":"+ref, raw)
+	space, e := h.resourceSpace(r, b.SpaceID, b.AgentID)
 	if e != nil {
+		writeErr(w, e)
+		return
+	}
+	if e = h.migrateSpaceConnectors(r.Context(), principal(r).TenantID, space); e != nil {
 		writeErr(w, e)
 		return
 	}
@@ -373,21 +666,24 @@ func (h *handler) install(w http.ResponseWriter, r *http.Request) {
 	if b.Enabled != nil {
 		enabled = *b.Enabled
 	}
-	now := h.now().Format(time.RFC3339Nano)
-	row := models.AgentConnectorInstallation{ID: strPtr(h.id()), TenantID: p.TenantID, AgentID: b.AgentID, ConnectorRef: ref, Enabled: enabled, ConfigEnc: enc, CreatedAt: now, UpdatedAt: now}
-	e = h.deps.Gorm.WithContext(r.Context()).Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "agent_id"}, {Name: "connector_ref"}},
-		DoUpdates: clause.AssignmentColumns([]string{"enabled", "config_enc", "updated_at"}),
-	}).Create(&row).Error
+	row, e := h.saveSpaceConnector(r.Context(), principal(r).TenantID, space, ref, connectorEnvelope{ProfileKey: b.ProfileKey, Config: b.Config}, enabled)
 	if e != nil {
 		writeErr(w, e)
 		return
 	}
-	httpx.JSON(w, 201, map[string]any{"installation": map[string]any{"agentId": b.AgentID, "connectorRef": ref, "enabled": enabled}})
+	httpx.JSON(w, 201, map[string]any{"installation": connectionView(row)})
 }
 func (h *handler) uninstall(w http.ResponseWriter, r *http.Request) {
-	p := principal(r)
-	res := h.deps.Gorm.WithContext(r.Context()).Where("tenant_id = ? AND agent_id = ? AND connector_ref = ?", p.TenantID, chi.URLParam(r, "agentId"), chi.URLParam(r, "ref")).Delete(&models.AgentConnectorInstallation{})
+	space, e := h.resourceSpace(r, "", chi.URLParam(r, "agentId"))
+	if e != nil {
+		writeErr(w, e)
+		return
+	}
+	if e = h.migrateSpaceConnectors(r.Context(), principal(r).TenantID, space); e != nil {
+		writeErr(w, e)
+		return
+	}
+	res := h.deps.Gorm.WithContext(r.Context()).Where("tenant_id = ? AND space_id = ? AND connector_ref = ?", principal(r).TenantID, space, canonicalRef(chi.URLParam(r, "ref"))).Delete(&spaceConnectorInstallation{})
 	if res.Error != nil {
 		writeErr(w, res.Error)
 		return
@@ -399,71 +695,86 @@ func (h *handler) uninstall(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, 200, map[string]any{"ok": true})
 }
 func (h *handler) listAgentConnectors(w http.ResponseWriter, r *http.Request) {
-	p := principal(r)
-	var rows []models.AgentConnectorInstallation
-	if e := h.deps.Gorm.WithContext(r.Context()).Where("tenant_id = ? AND agent_id = ?", p.TenantID, chi.URLParam(r, "id")).Order("connector_ref").Find(&rows).Error; e != nil {
+	space, e := h.resourceSpace(r, "", chi.URLParam(r, "id"))
+	if e != nil {
 		writeErr(w, e)
 		return
 	}
-	items := make([]map[string]any, 0)
-	for _, row := range rows {
-		pr, _ := provider(row.ConnectorRef)
-		items = append(items, map[string]any{"id": *row.ID, "ref": row.ConnectorRef, "name": pr.Name, "enabled": row.Enabled, "createdAt": row.CreatedAt, "updatedAt": row.UpdatedAt})
+	if e = h.migrateSpaceConnectors(r.Context(), principal(r).TenantID, space); e != nil {
+		writeErr(w, e)
+		return
 	}
-	httpx.JSON(w, 200, map[string]any{"connectors": items})
+	var rows []spaceConnectorInstallation
+	if e = h.deps.Gorm.WithContext(r.Context()).Where("tenant_id = ? AND space_id = ?", principal(r).TenantID, space).Order("connector_ref").Find(&rows).Error; e != nil {
+		writeErr(w, e)
+		return
+	}
+	out := []map[string]any{}
+	for _, row := range rows {
+		v := connectionView(row)
+		v["ref"] = row.ConnectorRef
+		v["enabled"] = row.Enabled
+		out = append(out, v)
+	}
+	httpx.JSON(w, 200, map[string]any{"connectors": out})
 }
 func (h *handler) updateCredentials(w http.ResponseWriter, r *http.Request) {
-	p := principal(r)
-	id := chi.URLParam(r, "id")
 	var b struct {
-		Config json.RawMessage `json:"config"`
+		Config map[string]any `json:"config"`
 	}
 	if httpx.DecodeJSON(r, &b) != nil {
 		httpx.Error(w, 400, "invalid JSON")
 		return
 	}
-	var row models.AgentConnectorInstallation
-	e := h.deps.Gorm.WithContext(r.Context()).Where("tenant_id = ? AND id = ?", p.TenantID, id).First(&row).Error
+	row, e := h.loadConnection(r, chi.URLParam(r, "id"))
 	if e != nil {
 		writeErr(w, e)
 		return
 	}
-	enc, e := encrypt(h.deps.Secret, p.TenantID+":"+row.AgentID+":"+row.ConnectorRef, b.Config)
-	if e == nil {
-		e = h.deps.Gorm.WithContext(r.Context()).Model(&models.AgentConnectorInstallation{}).
-			Where("tenant_id = ? AND id = ?", p.TenantID, id).
-			Updates(map[string]any{"config_enc": enc, "updated_at": h.now().Format(time.RFC3339Nano)}).Error
-	}
+	cfg, e := h.spaceEnvelope(row)
 	if e != nil {
+		writeErr(w, e)
+		return
+	}
+	cfg.Config = b.Config
+	if _, e = h.saveSpaceConnector(r.Context(), row.TenantID, row.SpaceID, row.ConnectorRef, cfg, row.Enabled); e != nil {
 		writeErr(w, e)
 		return
 	}
 	httpx.JSON(w, 200, map[string]any{"ok": true})
 }
 func (h *handler) putSettings(w http.ResponseWriter, r *http.Request) {
-	p := principal(r)
-	ref := chi.URLParam(r, "ref")
+	ref := canonicalRef(chi.URLParam(r, "ref"))
 	if !validRef(ref) {
 		httpx.Error(w, 404, "Unknown connector")
 		return
 	}
-	var b json.RawMessage
-	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 2<<20)).Decode(&b) != nil || !json.Valid(b) {
-		httpx.Error(w, 400, "invalid JSON")
-		return
-	}
-	enc, e := encrypt(h.deps.Secret, p.TenantID+":"+ref, b)
+	space, e := h.resourceSpace(r, r.URL.Query().Get("spaceId"), r.URL.Query().Get("agentId"))
 	if e != nil {
 		writeErr(w, e)
 		return
 	}
-	now := h.now().Format(time.RFC3339Nano)
-	row := models.ConnectorSetting{ID: strPtr(h.id()), ScopeKey: p.TenantID, ConnectorRef: ref, ConfigEnc: enc, CreatedAt: now, UpdatedAt: now}
-	e = h.deps.Gorm.WithContext(r.Context()).Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "scope_key"}, {Name: "connector_ref"}},
-		DoUpdates: clause.AssignmentColumns([]string{"config_enc", "updated_at"}),
-	}).Create(&row).Error
+	var settings map[string]any
+	if httpx.DecodeJSON(r, &settings) != nil || settings == nil {
+		httpx.Error(w, 400, "invalid JSON")
+		return
+	}
+	if e = h.migrateSpaceConnectors(r.Context(), principal(r).TenantID, space); e != nil {
+		writeErr(w, e)
+		return
+	}
+	var row spaceConnectorInstallation
+	if e = h.deps.Gorm.WithContext(r.Context()).Where("tenant_id = ? AND space_id = ? AND connector_ref = ?", principal(r).TenantID, space, ref).First(&row).Error; e != nil {
+		writeErr(w, e)
+		return
+	}
+	cfg, e := h.spaceEnvelope(row)
 	if e != nil {
+		writeErr(w, e)
+		return
+	}
+	cfg.Settings = settings
+	if _, e = h.saveSpaceConnector(r.Context(), row.TenantID, row.SpaceID, ref, cfg, row.Enabled); e != nil {
 		writeErr(w, e)
 		return
 	}

@@ -1,0 +1,257 @@
+package runtime
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/Moonrend/Zakura/apps/server/internal/computers"
+	"github.com/Moonrend/Zakura/apps/server/internal/platform/httpx"
+	"github.com/go-chi/chi/v5"
+	"golang.org/x/crypto/ssh"
+)
+
+func TestComputerSelectionHTTP(t *testing.T) {
+	d := testDeps(t)
+	seedTenant(t, d, "tenant")
+	h := &handler{deps: d, store: NewStore(d)}
+	ctx := context.Background()
+	space, err := h.store.CreateSpace(ctx, "tenant", Space{Name: "S"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent, err := h.store.CreateAgent(ctx, "tenant", Agent{Name: "A", SpaceID: space.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chat, err := h.store.CreateSession(ctx, "tenant", "", agent.ID, Session{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Gorm.Exec(`INSERT INTO computers(id,tenant_id,space_id,name,provider,settings_json,secret_ref,created_at,updated_at) VALUES('one','tenant',?,'One','e2b','{"apiKey":"secret-value"}','secret-ref','now','now')`, space.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	router := chi.NewRouter()
+	h.registerComputers(router)
+	call := func(method, path, body string, p httpx.Principal) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req = req.WithContext(httpx.WithPrincipal(req.Context(), p))
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+	p := httpx.Principal{TenantID: "tenant"}
+	path := "/agents/" + agent.ID + "/cloud/sessions/" + chat.ID + "/computer"
+	for _, body := range []string{`{}`, `{"computerId":""}`, `{"computerId":42}`} {
+		if w := call(http.MethodPut, path, body, p); w.Code != 400 {
+			t.Fatalf("invalid %s: %d %s", body, w.Code, w.Body)
+		}
+	}
+	if w := call(http.MethodPut, path, `{"computerId":"missing"}`, p); w.Code != 404 {
+		t.Fatalf("missing: %d %s", w.Code, w.Body)
+	}
+	server := "server:" + space.ID
+	for _, tc := range []struct{ body, choice, effective string }{
+		{`{"computerId":"one"}`, "one", "one"},
+		{`{"computerId":null}`, "", server},
+		{`{"computerId":"` + server + `"}`, "", server},
+	} {
+		if w := call(http.MethodPut, path, tc.body, p); w.Code != 200 {
+			t.Fatalf("selection: %d %s", w.Code, w.Body)
+		}
+		w := call(http.MethodGet, path, "", p)
+		var got struct {
+			ComputerID          *string `json:"computerId"`
+			EffectiveComputerID string  `json:"effectiveComputerId"`
+			ServerComputerID    string  `json:"serverComputerId"`
+		}
+		if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &got) != nil {
+			t.Fatalf("read selection: %d %s", w.Code, w.Body)
+		}
+		choice := ""
+		if got.ComputerID != nil {
+			choice = *got.ComputerID
+		}
+		if choice != tc.choice || got.EffectiveComputerID != tc.effective || got.ServerComputerID != server {
+			t.Fatalf("selection after %s: %s", tc.body, w.Body)
+		}
+	}
+	w := call(http.MethodGet, "/spaces/"+space.ID+"/computers", "", p)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"id":"one"`) || !strings.Contains(w.Body.String(), `"id":"`+server+`"`) || strings.Contains(w.Body.String(), "secret") || strings.Contains(w.Body.String(), "apiKey") {
+		t.Fatalf("catalog: %d %s", w.Code, w.Body)
+	}
+	var catalog []map[string]any
+	if json.Unmarshal(w.Body.Bytes(), &catalog) != nil || len(catalog) != 2 || catalog[0]["id"] != server || catalog[0]["role"] != "server" {
+		t.Fatalf("server computer must be listed first: %s", w.Body)
+	}
+	if w := call(http.MethodGet, "/spaces/"+space.ID+"/computer-default", "", p); w.Code != 200 || !strings.Contains(w.Body.String(), server) {
+		t.Fatalf("space default: %d %s", w.Code, w.Body)
+	}
+	owner := httpx.Principal{TenantID: "tenant", Role: "owner"}
+	if w := call(http.MethodPut, "/spaces/"+space.ID+"/computer-default", `{"computerId":"one"}`, owner); w.Code != 409 {
+		t.Fatalf("attached space default accepted: %d %s", w.Code, w.Body)
+	}
+	if w := call(http.MethodDelete, "/spaces/"+space.ID+"/computers/"+server, "", owner); w.Code != 409 {
+		t.Fatalf("server computer deleted: %d %s", w.Code, w.Body)
+	}
+	bound := httpx.Principal{TenantID: "tenant", SpaceID: space.ID, AgentID: agent.ID}
+	if w := call(http.MethodGet, path+"s", "", bound); w.Code != 200 || !strings.Contains(w.Body.String(), `"id":"one"`) || strings.Contains(w.Body.String(), "secret") || strings.Contains(w.Body.String(), "apiKey") {
+		t.Fatalf("bound session catalog: %d %s", w.Code, w.Body)
+	}
+	if w := call(http.MethodGet, "/spaces/"+space.ID+"/computers", "", bound); w.Code != 403 {
+		t.Fatalf("agent credential escaped session catalog: %d", w.Code)
+	}
+	if w := call(http.MethodGet, "/agents/"+agent.ID+"/cloud/sessions/missing/computers", "", bound); w.Code != 404 {
+		t.Fatalf("missing session catalog: %d %s", w.Code, w.Body)
+	}
+	for _, p := range []httpx.Principal{{TenantID: "tenant", SpaceID: "foreign"}, {TenantID: "tenant", AgentID: "foreign"}} {
+		if w := call(http.MethodGet, path+"s", "", p); w.Code != 403 {
+			t.Fatalf("catalog scope bypass: %d", w.Code)
+		}
+		if w := call(http.MethodPut, path, `{"computerId":"one"}`, p); w.Code != 403 {
+			t.Fatalf("scope bypass: %d", w.Code)
+		}
+	}
+	if w := call(http.MethodGet, path+"s", "", httpx.Principal{TenantID: "other"}); w.Code == 200 {
+		t.Fatal("cross-tenant catalog leak")
+	}
+	if w := call(http.MethodGet, path, "", httpx.Principal{TenantID: "other"}); w.Code == 200 {
+		t.Fatal("cross-tenant selection leak")
+	}
+}
+
+func TestComputerManagementHTTP(t *testing.T) {
+	d := testDeps(t)
+	seedTenant(t, d, "tenant")
+	h := &handler{deps: d, store: NewStore(d)}
+	space, err := h.store.CreateSpace(context.Background(), "tenant", Space{Name: "S"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := chi.NewRouter()
+	h.registerComputers(router)
+	path := "/spaces/" + space.ID + "/computers"
+	call := func(method, path, body string, p httpx.Principal) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req = req.WithContext(httpx.WithPrincipal(req.Context(), p))
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+	body := `{"name":"E2B","provider":"e2b","config":{"apiKey":"private-key-value","template":"base"}}`
+	for _, p := range []httpx.Principal{{TenantID: "tenant"}, {TenantID: "tenant", Role: "admin", SpaceID: "other"}, {TenantID: "tenant", Role: "admin", APIKey: true, APIKeyScopes: `["api"]`}} {
+		if w := call("POST", path, body, p); w.Code != 403 {
+			t.Fatalf("management bypass: %d %s", w.Code, w.Body)
+		}
+	}
+	p := httpx.Principal{TenantID: "tenant", Role: "owner"}
+	for range 2 {
+		w := call("POST", path, body, p)
+		if w.Code != 201 || strings.Contains(w.Body.String(), "private-key-value") {
+			t.Fatalf("create: %d %s", w.Code, w.Body)
+		}
+	}
+	var ciphertext, computerID string
+	if err := d.DB.QueryRow(`SELECT secret_ref,id FROM computers WHERE space_id=? AND role='attached' LIMIT 1`, space.ID).Scan(&ciphertext, &computerID); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(ciphertext, "private-key-value") {
+		t.Fatal("plaintext credential stored")
+	}
+	plain, err := computers.OpenCredentials(d.Secret, "tenant", space.ID, computerID, ciphertext)
+	if err != nil || !strings.Contains(string(plain), "private-key-value") {
+		t.Fatalf("credential roundtrip: %v", err)
+	}
+	var count int
+	if err := d.DB.QueryRow(`SELECT COUNT(*) FROM computer_runtimes`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("configuration provisioned runtime %d %v", count, err)
+	}
+	if w := call("POST", path, `{"name":"bad","provider":"e2b","config":{}}`, p); w.Code != 400 {
+		t.Fatalf("missing credential: %d", w.Code)
+	}
+}
+
+func TestComputerManagementAcceptsComputerNode(t *testing.T) {
+	d := testDeps(t)
+	seedTenant(t, d, "tenant")
+	h := &handler{deps: d, store: NewStore(d)}
+	space, err := h.store.CreateSpace(context.Background(), "tenant", Space{Name: "S"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte("node-token"))
+	for _, node := range []struct{ id, kind string }{{"cnode", "computer"}, {"lnode", "local"}, {"rnode", "runner"}} {
+		if _, err := d.DB.Exec(`INSERT INTO runtime_nodes(id,tenant_id,name,slug,kind,status,token_hash,capabilities_json,host_info_json,storage_root,labels_json,is_shared,created_at,updated_at) VALUES(?,?,?,?,?,'offline',?,'{}','{}','/srv/zakura','{}',false,'now','now')`, node.id, "tenant", node.id, node.id, node.kind, hex.EncodeToString(sum[:])); err != nil {
+			t.Fatal(err)
+		}
+	}
+	router := chi.NewRouter()
+	h.registerComputers(router)
+	path := "/spaces/" + space.ID + "/computers"
+	call := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", path, strings.NewReader(body))
+		req = req.WithContext(httpx.WithPrincipal(req.Context(), httpx.Principal{TenantID: "tenant", Role: "owner"}))
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+	if w := call(`{"name":"Local","provider":"temporary","runtimeNodeId":"cnode","config":{}}`); w.Code != 201 {
+		t.Fatalf("computer node rejected: %d %s", w.Code, w.Body)
+	}
+	if w := call(`{"name":"LocalRunner","provider":"temporary","runtimeNodeId":"lnode","config":{}}`); w.Code != 201 {
+		t.Fatalf("local node rejected: %d %s", w.Code, w.Body)
+	}
+	if w := call(`{"name":"Bad","provider":"temporary","runtimeNodeId":"rnode","config":{}}`); w.Code != 400 {
+		t.Fatalf("unrelated node kind accepted: %d %s", w.Code, w.Body)
+	}
+	// The Space already owns its server computer; another cannot be added.
+	if w := call(`{"name":"Second","provider":"server","runtimeNodeId":"cnode","config":{}}`); w.Code != 400 {
+		t.Fatalf("second server computer accepted: %d %s", w.Code, w.Body)
+	}
+}
+
+func TestComputerManagementRailwayAutoKey(t *testing.T) {
+	d := testDeps(t)
+	seedTenant(t, d, "tenant")
+	h := &handler{deps: d, store: NewStore(d)}
+	space, err := h.store.CreateSpace(context.Background(), "tenant", Space{Name: "S"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := chi.NewRouter()
+	h.registerComputers(router)
+	req := httptest.NewRequest("POST", "/spaces/"+space.ID+"/computers", strings.NewReader(`{"name":"Railway","provider":"railway","config":{}}`))
+	req = req.WithContext(httpx.WithPrincipal(req.Context(), httpx.Principal{TenantID: "tenant", Role: "owner"}))
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != 201 {
+		t.Fatalf("railway create: %d %s", w.Code, w.Body)
+	}
+	var secret, computerID string
+	if err := d.DB.QueryRow(`SELECT secret_ref,id FROM computers WHERE space_id=? AND role='attached'`, space.ID).Scan(&secret, &computerID); err != nil {
+		t.Fatal(err)
+	}
+	plain, err := computers.OpenCredentials(d.Secret, "tenant", space.ID, computerID, secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored map[string]string
+	if err := json.Unmarshal(plain, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(stored["privateKey"]) == "" {
+		t.Fatal("railway private key was not generated")
+	}
+	if _, ok := stored["hostKeyFingerprint"]; ok {
+		t.Fatalf("unexpected host key fingerprint: %q", stored["hostKeyFingerprint"])
+	}
+	if _, err := ssh.ParsePrivateKey([]byte(stored["privateKey"])); err != nil {
+		t.Fatalf("generated key does not parse: %v", err)
+	}
+}

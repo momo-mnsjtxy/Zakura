@@ -20,14 +20,18 @@ import (
 )
 
 type skillFile struct {
-	Path    string `json:"path"`
-	Content string `json:"content"`
+	Path     string `json:"path"`
+	Content  string `json:"content"`
+	Encoding string `json:"encoding,omitempty"`
+	Size     int    `json:"size"`
 }
 
 func (h *handler) registerSkills(r chi.Router) {
+	h.registerSpaceSkills(r)
 	r.Get("/skills/stores", h.skillStores)
 	r.Get("/skills/repos", h.listSkillRepos)
 	r.Post("/skills/repos/{owner}/{repo}/sync", h.syncSkillRepo)
+	r.Post("/skills/repos/*", h.syncSkillRepoBySlug)
 	r.Get("/skills/cache", h.skillCacheStatus)
 	r.Get("/skills/auto-update", h.skillAutoUpdateStatus)
 	r.Put("/skills/auto-update", h.putSkillAutoUpdate)
@@ -38,7 +42,7 @@ func (h *handler) registerSkills(r chi.Router) {
 	r.Post("/skills/resolve", h.resolveSkill)
 	r.Get("/skills", h.listSkills)
 	r.Post("/skills/install", h.installSkill)
-	r.Get("/skills/search", h.listSkills)
+	r.Get("/skills/search", h.searchSkillStore)
 	r.Get("/skills/{id}", h.getSkill)
 	r.Post("/skills/{id}/update", h.updateSkill)
 	r.Delete("/skills/{id}", h.deleteSkill)
@@ -59,7 +63,7 @@ func (h *handler) registerSkills(r chi.Router) {
 func runtimeTimeString(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
 
 func skillFromModel(m models.Skill) Skill {
-	x := Skill{Name: m.Name, Title: m.Title, Description: m.Description, Version: m.Version, Builtin: m.Builtin, Homepage: m.Homepage, License: m.License, FileCount: int(m.FileCount), SizeBytes: int64(m.SizeBytes), AutoUpdate: m.AutoUpdate}
+	x := Skill{Name: m.Name, Title: m.Title, Description: m.Description, Version: m.Version, Builtin: m.Builtin, Homepage: m.Homepage, License: m.License, FileCount: int(m.FileCount), SizeBytes: int64(m.SizeBytes), RepoKey: m.RepoKey, AutoUpdate: m.AutoUpdate}
 	if m.ID != nil {
 		x.ID = *m.ID
 	}
@@ -81,10 +85,16 @@ func (h *handler) skillByID(r *http.Request, id string) (Skill, error) {
 	if e != nil {
 		return Skill{}, e
 	}
-	return skillFromModel(m), nil
+	out := []Skill{skillFromModel(m)}
+	h.enrichSkillRepoState(r.Context(), out)
+	return out[0], nil
 }
 func (h *handler) listSkills(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.authorizeSkillSpace(w, r); !ok {
+		return
+	}
 	p := principal(r)
+	h.syncBuiltinSkills(r.Context(), p.TenantID)
 	q := h.deps.Gorm.WithContext(r.Context()).Model(&models.Skill{}).Where("tenant_id = ?", p.TenantID)
 	if term := strings.TrimSpace(r.URL.Query().Get("q")); term != "" {
 		x := "%" + strings.ToLower(term) + "%"
@@ -101,14 +111,15 @@ func (h *handler) listSkills(w http.ResponseWriter, r *http.Request) {
 		x.Files = nil
 		out = append(out, x)
 	}
+	h.enrichSkillRepoState(r.Context(), out)
 	httpx.JSON(w, 200, map[string]any{"skills": out, "items": out})
 }
-func validateSkillFiles(files []skillFile) (int64, error) {
+func legacyValidateSkillFiles(files []skillFile) (int64, error) {
 	var size int64
 	seen := map[string]bool{}
 	for _, f := range files {
 		clean := path.Clean(strings.TrimPrefix(f.Path, "/"))
-		if clean == "." || strings.HasPrefix(clean, "../") || strings.Contains(clean, "\\") || seen[clean] {
+		if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") || strings.ContainsAny(clean, "\\\x00") || seen[clean] {
 			return 0, errors.New("invalid or duplicate skill file path")
 		}
 		seen[clean] = true
@@ -119,7 +130,7 @@ func validateSkillFiles(files []skillFile) (int64, error) {
 	}
 	return size, nil
 }
-func (h *handler) installSkill(w http.ResponseWriter, r *http.Request) {
+func (h *handler) legacyInstallSkill(w http.ResponseWriter, r *http.Request) {
 	var b struct {
 		Name           string          `json:"name"`
 		Title          string          `json:"title"`
@@ -139,6 +150,16 @@ func (h *handler) installSkill(w http.ResponseWriter, r *http.Request) {
 	if httpx.DecodeJSON(r, &b) != nil {
 		httpx.Error(w, 400, "invalid JSON")
 		return
+	}
+	if isBuiltin, builtinID := builtinSourceRef(b.Source); isBuiltin {
+		if builtinID == "" {
+			httpx.Error(w, 400, "builtinId required")
+			return
+		}
+		h.syncBuiltinSkills(r.Context(), principal(r).TenantID)
+		if b.SkillID == "" && len(b.Names) == 0 {
+			b.Names = []string{builtinID}
+		}
 	}
 	if b.SkillID != "" || len(b.Names) > 0 {
 		h.installExistingSkills(w, r, b.SkillID, b.Names, b.AgentIDs, b.All)
@@ -171,7 +192,11 @@ func (h *handler) installSkill(w http.ResponseWriter, r *http.Request) {
 	files, _ := json.Marshal(b.Files)
 	now := h.store.now()
 	id := h.store.id()
-	m := models.Skill{ID: &id, TenantID: principal(r).TenantID, Name: b.Name, Title: b.Title, Description: b.Description, Version: b.Version, SourceJSON: validJSON(b.Source, "{}"), Homepage: b.Homepage, License: b.License, FilesJSON: string(files), FileCount: int32(len(b.Files)), SizeBytes: int32(size), AutoUpdate: auto, CreatedAt: runtimeTimeString(now), UpdatedAt: runtimeTimeString(now)}
+	var repoKey *string
+	if rk := repoKeyOfSource(skillSourceFromJSON(b.Source)); rk != "" {
+		repoKey = &rk
+	}
+	m := models.Skill{ID: &id, TenantID: principal(r).TenantID, Name: b.Name, Title: b.Title, Description: b.Description, Version: b.Version, SourceJSON: validJSON(b.Source, "{}"), Homepage: b.Homepage, License: b.License, FilesJSON: string(files), FileCount: int32(len(b.Files)), SizeBytes: int32(size), RepoKey: repoKey, AutoUpdate: auto, CreatedAt: runtimeTimeString(now), UpdatedAt: runtimeTimeString(now)}
 	if e = h.deps.Gorm.WithContext(r.Context()).Create(&m).Error; e != nil {
 		statusErr(w, e)
 		return
@@ -180,7 +205,7 @@ func (h *handler) installSkill(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusCreated, map[string]any{"skills": []Skill{x}, "installs": []any{}, "warnings": []any{}})
 }
 
-func (h *handler) installExistingSkills(w http.ResponseWriter, r *http.Request, skillID string, names, agentIDs []string, all bool) {
+func (h *handler) legacyInstallExistingSkills(w http.ResponseWriter, r *http.Request, skillID string, names, agentIDs []string, all bool) {
 	tenant := principal(r).TenantID
 	q := h.deps.Gorm.WithContext(r.Context()).Model(&models.Skill{}).Where("tenant_id = ?", tenant)
 	if skillID != "" {
@@ -201,6 +226,7 @@ func (h *handler) installExistingSkills(w http.ResponseWriter, r *http.Request, 
 	for _, m := range ms {
 		skills = append(skills, skillFromModel(m))
 	}
+	h.enrichSkillRepoState(r.Context(), skills)
 	if len(skills) == 0 {
 		statusErr(w, ErrNotFound)
 		return
@@ -210,9 +236,20 @@ func (h *handler) installExistingSkills(w http.ResponseWriter, r *http.Request, 
 		_ = h.deps.Gorm.WithContext(r.Context()).Model(&models.Agent{}).Where("tenant_id = ?", tenant).Pluck("id", &agentIDs).Error
 	}
 	installs := []map[string]any{}
+	warnings := []string{}
 	now := runtimeTimeString(h.store.now())
 	for _, agent := range agentIDs {
+		if _, err := h.store.GetAgent(r.Context(), tenant, agent); err != nil {
+			statusErr(w, err)
+			return
+		}
+	}
+	for _, agent := range agentIDs {
 		for _, skill := range skills {
+			if err := h.materializeSkill(r.Context(), tenant, agent, skill.Name, skill.Files); err != nil {
+				warnings = append(warnings, skill.Name+": "+err.Error())
+				continue
+			}
 			id := h.store.id()
 			e := h.deps.Gorm.WithContext(r.Context()).
 				Clauses(clause.OnConflict{
@@ -226,12 +263,17 @@ func (h *handler) installExistingSkills(w http.ResponseWriter, r *http.Request, 
 				Create(map[string]any{"id": id, "tenant_id": tenant, "agent_id": agent, "skill_id": skill.ID, "name": skill.Name, "enabled": true, "path": "/skills/" + skill.Name, "version": skill.Version, "status": "installed", "error": nil, "created_at": now, "updated_at": now}).Error
 			if e == nil {
 				installs = append(installs, map[string]any{"id": id, "agentId": agent, "skillId": skill.ID, "name": skill.Name, "enabled": true, "path": "/skills/" + skill.Name, "version": skill.Version, "status": "installed"})
+			} else {
+				warnings = append(warnings, skill.Name+": "+e.Error())
 			}
 		}
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"skills": skills, "installs": installs, "warnings": []any{}})
+	httpx.JSON(w, http.StatusOK, map[string]any{"skills": skills, "installs": installs, "warnings": warnings})
 }
 func (h *handler) getSkill(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.authorizeSkillSpace(w, r); !ok {
+		return
+	}
 	x, e := h.skillByID(r, chi.URLParam(r, "id"))
 	if e != nil {
 		statusErr(w, e)
@@ -242,6 +284,21 @@ func (h *handler) getSkill(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, 200, map[string]any{"skill": x, "files": files})
 }
 func (h *handler) deleteSkill(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.authorizeSkillSpace(w, r); !ok {
+		return
+	}
+	tenant := principal(r).TenantID
+	var rows []spaceSkill
+	if err := h.deps.Gorm.WithContext(r.Context()).Where("tenant_id=? AND skill_id=?", tenant, chi.URLParam(r, "id")).Find(&rows).Error; err != nil {
+		skillHTTPError(w, err)
+		return
+	}
+	for _, row := range rows {
+		if err := h.replaceSpaceSnapshot(r.Context(), row, nil, nil, true); err != nil {
+			skillHTTPError(w, err)
+			return
+		}
+	}
 	res := h.deps.Gorm.WithContext(r.Context()).Where("tenant_id = ? AND id = ? AND builtin = false", principal(r).TenantID, chi.URLParam(r, "id")).Delete(&models.Skill{})
 	if res.Error != nil {
 		statusErr(w, res.Error)
@@ -254,14 +311,17 @@ func (h *handler) deleteSkill(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, 200, map[string]any{"ok": true})
 }
 func (h *handler) patchSkillAutoUpdate(w http.ResponseWriter, r *http.Request) {
-	var b struct {
-		AutoUpdate bool `json:"autoUpdate"`
-	}
-	if httpx.DecodeJSON(r, &b) != nil {
-		httpx.Error(w, 400, "invalid JSON")
+	if _, ok := h.authorizeSkillSpace(w, r); !ok {
 		return
 	}
-	res := h.deps.Gorm.WithContext(r.Context()).Model(&models.Skill{}).Where("tenant_id = ? AND id = ?", principal(r).TenantID, chi.URLParam(r, "id")).Updates(map[string]any{"auto_update": b.AutoUpdate, "updated_at": runtimeTimeString(h.store.now())})
+	var b struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if httpx.DecodeJSON(r, &b) != nil || b.Enabled == nil {
+		httpx.Error(w, 400, "enabled required")
+		return
+	}
+	res := h.deps.Gorm.WithContext(r.Context()).Model(&models.Skill{}).Where("tenant_id = ? AND id = ?", principal(r).TenantID, chi.URLParam(r, "id")).Updates(map[string]any{"auto_update": *b.Enabled, "updated_at": runtimeTimeString(h.store.now())})
 	if res.Error != nil {
 		statusErr(w, res.Error)
 		return
@@ -274,7 +334,7 @@ func (h *handler) patchSkillAutoUpdate(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, 200, map[string]any{"skill": x})
 }
 
-func (h *handler) listAgentSkills(w http.ResponseWriter, r *http.Request) {
+func (h *handler) legacyListAgentSkills(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
 	agent := chi.URLParam(r, "id")
 	if _, e := h.store.GetAgent(r.Context(), p.TenantID, agent); e != nil {
@@ -330,7 +390,7 @@ func (h *handler) listAgentSkills(w http.ResponseWriter, r *http.Request) {
 	sort.Strings(unregistered)
 	httpx.JSON(w, 200, map[string]any{"skills": out, "unregistered": unregistered})
 }
-func (h *handler) attachSkill(w http.ResponseWriter, r *http.Request) {
+func (h *handler) legacyAttachSkill(w http.ResponseWriter, r *http.Request) {
 	var b struct {
 		SkillID       string   `json:"skillId"`
 		Name          string   `json:"name"`
@@ -383,6 +443,10 @@ func (h *handler) attachSkill(w http.ResponseWriter, r *http.Request) {
 	if b.Enabled != nil {
 		enabled = *b.Enabled
 	}
+	if e = h.materializeSkill(r.Context(), p.TenantID, agent, name, json.RawMessage(sm.FilesJSON)); e != nil {
+		statusErr(w, e)
+		return
+	}
 	now := h.store.now()
 	asID := h.store.id()
 	as := models.AgentSkill{ID: &asID, TenantID: p.TenantID, AgentID: agent, SkillID: b.SkillID, Name: name, Enabled: enabled, Path: "/skills/" + name, Version: version, Status: "installed", CreatedAt: runtimeTimeString(now), UpdatedAt: runtimeTimeString(now)}
@@ -396,6 +460,31 @@ func (h *handler) attachSkill(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusCreated, map[string]any{"skills": []Skill{skill}, "installs": []any{install}, "warnings": []any{}})
 }
 func (h *handler) patchAgentSkill(w http.ResponseWriter, r *http.Request) {
+	a, ok := h.skillAgent(w, r)
+	if !ok {
+		return
+	}
+	var b struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if httpx.DecodeJSON(r, &b) != nil || b.Enabled == nil {
+		httpx.Error(w, 400, "enabled required")
+		return
+	}
+	var row spaceSkill
+	err := h.deps.Gorm.WithContext(r.Context()).Where("tenant_id=? AND space_id=? AND name=?", a.TenantID, a.SpaceID, chi.URLParam(r, "name")).Take(&row).Error
+	if err != nil {
+		skillHTTPError(w, err)
+		return
+	}
+	ref, err := h.enableSpaceSkill(r.Context(), a.TenantID, a.ID, row, *b.Enabled)
+	if err != nil {
+		skillHTTPError(w, err)
+		return
+	}
+	httpx.JSON(w, 200, map[string]any{"skill": ref})
+}
+func (h *handler) legacyPatchAgentSkill(w http.ResponseWriter, r *http.Request) {
 	var b struct {
 		Enabled bool `json:"enabled"`
 	}
@@ -438,6 +527,9 @@ func (h *handler) patchAgentSkill(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"skill": map[string]any{"id": rec.ID, "name": rec.Name, "enabled": rec.Enabled, "path": rec.Path, "version": rec.Version, "status": rec.Status, "error": rec.Error, "skillId": rec.SkillID, "title": rec.Title, "description": rec.Description}})
 }
 func (h *handler) detachSkill(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.skillAgent(w, r); !ok {
+		return
+	}
 	p := principal(r)
 	res := h.deps.Gorm.WithContext(r.Context()).Where("tenant_id = ? AND agent_id = ? AND name = ?", p.TenantID, chi.URLParam(r, "id"), chi.URLParam(r, "name")).Delete(&models.AgentSkill{})
 	if res.Error != nil {
@@ -450,7 +542,7 @@ func (h *handler) detachSkill(w http.ResponseWriter, r *http.Request) {
 	}
 	httpx.JSON(w, 200, map[string]any{"ok": true})
 }
-func (h *handler) getAgentSkillFile(w http.ResponseWriter, r *http.Request) {
+func (h *handler) legacyGetAgentSkillFile(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
 	var row struct {
 		FilesJSON string `gorm:"column:files_json"`

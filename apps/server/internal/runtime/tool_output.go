@@ -62,7 +62,14 @@ func (h *handler) truncateToolText(ctx context.Context, tenant, agent, text, ste
 	return text[:toolOutputFallbackHead] + "\n…" + marker + "…\n" + text[len(text)-toolOutputFallbackTail:], nil
 }
 
+type codemodeContextKey struct{}
+
 func (h *handler) capToolResultJSON(ctx context.Context, tenant, agent string, raw json.RawMessage, stem string) json.RawMessage {
+	// Scripts need the original structure to filter large intermediate results.
+	// Only their explicitly emitted output enters the model context.
+	if active, _ := ctx.Value(codemodeContextKey{}).(bool); active {
+		return raw
+	}
 	if len(raw) <= toolOutputMaxBytes {
 		return raw
 	}
@@ -82,4 +89,13 @@ func (h *handler) capToolResultJSON(ctx context.Context, tenant, agent string, r
 		return raw
 	}
 	return out
+}
+
+// boundedToolTextPreview never writes an artifact. Sandbox results use this
+// instead of the ordinary workspace spillover mechanism.
+func boundedToolTextPreview(text string) string {
+	if len(text) <= toolOutputMaxBytes {
+		return text
+	}
+	return text[:toolOutputFallbackHead] + "\n…[output truncated; not persisted by sandbox policy]…\n" + text[len(text)-toolOutputFallbackTail:]
 }
